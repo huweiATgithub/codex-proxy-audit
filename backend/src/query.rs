@@ -1,0 +1,941 @@
+//! Management projections of immutable audit facts. Collection decisions live elsewhere.
+use std::collections::BTreeMap;
+
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use chrono::{DateTime, Duration, LocalResult, NaiveDate, SecondsFormat, TimeZone, Utc};
+use chrono_tz::Tz;
+use hmac::{Hmac, Mac};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use sqlx::{PgPool, Row};
+
+const MAX_RESPONSE_BYTES: usize = 512 * 1024;
+const MAX_QUERY_BYTES: usize = 8192;
+const CONTENT_CHARACTERS: usize = 1200;
+const CURSOR_LIFETIME_SECONDS: i64 = 24 * 60 * 60;
+const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
+
+type ApiResult<T> = Result<T, ApiError>;
+
+#[derive(Debug)]
+struct ApiError {
+    status: u16,
+    code: &'static str,
+    message: &'static str,
+}
+impl ApiError {
+    fn invalid_query() -> Self {
+        Self {
+            status: 400,
+            code: "invalid_query",
+            message: "筛选条件无效，请检查日期、关键词和分页参数。",
+        }
+    }
+    fn invalid_cursor() -> Self {
+        Self {
+            status: 400,
+            code: "invalid_cursor",
+            message: "分页位置无效或与当前查询不匹配，请重新读取。",
+        }
+    }
+    fn not_found() -> Self {
+        Self {
+            status: 404,
+            code: "not_found",
+            message: "记录或内容不存在或已被清理。",
+        }
+    }
+    fn internal() -> Self {
+        Self {
+            status: 500,
+            code: "internal_error",
+            message: "审计接口内部错误。",
+        }
+    }
+    fn budget() -> Self {
+        Self {
+            status: 503,
+            code: "unavailable",
+            message: "当前宿主响应限制不足以读取记录。",
+        }
+    }
+}
+impl From<sqlx::Error> for ApiError {
+    fn from(error: sqlx::Error) -> Self {
+        let unavailable = match &error {
+            sqlx::Error::Io(_)
+            | sqlx::Error::PoolTimedOut
+            | sqlx::Error::PoolClosed
+            | sqlx::Error::Tls(_) => true,
+            sqlx::Error::Database(error) => error.code().is_some_and(|code| {
+                code.starts_with("08") || code.starts_with("53") || code.starts_with("57")
+            }),
+            _ => false,
+        };
+        if unavailable {
+            Self {
+                status: 503,
+                code: "unavailable",
+                message: "审计数据库暂时不可用，请稍后重试。",
+            }
+        } else {
+            Self::internal()
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct QueryResponse {
+    pub status: u16,
+    pub value: Value,
+}
+
+#[derive(Clone)]
+pub struct QueryService {
+    pool: PgPool,
+    time_zone: Tz,
+    time_zone_name: String,
+    response_budget: usize,
+    cursor_secret: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Cursor {
+    version: u8,
+    scope: String,
+    position: Value,
+    expires: i64,
+}
+
+#[derive(Debug)]
+struct ListQuery {
+    from: Option<NaiveDate>,
+    to: Option<NaiveDate>,
+    key: Option<String>,
+    q: String,
+    limit: i64,
+    cursor: Option<String>,
+}
+
+impl QueryService {
+    /// `time_zone` is supplied by the host's effective deployment configuration.
+    /// The signing secret comes from Store::secret, so restarts preserve cursors.
+    pub fn new(
+        pool: PgPool,
+        time_zone: &str,
+        response_budget: usize,
+        cursor_secret: Vec<u8>,
+    ) -> Result<Self, String> {
+        let parsed = time_zone
+            .parse::<Tz>()
+            .map_err(|_| "宿主部署时区无效。".to_string())?;
+        if time_zone.chars().count() > 128 || cursor_secret.len() < 32 || response_budget < 128 {
+            return Err("查询服务配置无效。".to_string());
+        }
+        Ok(Self {
+            pool,
+            time_zone: parsed,
+            time_zone_name: time_zone.to_string(),
+            response_budget: response_budget.min(MAX_RESPONSE_BYTES),
+            cursor_secret,
+        })
+    }
+
+    pub async fn handle(&self, path: &str, raw_query: &str) -> QueryResponse {
+        let result = self.dispatch(path, raw_query).await.and_then(|value| {
+            if bytes(&value)? > self.response_budget {
+                Err(ApiError::budget())
+            } else {
+                Ok(value)
+            }
+        });
+        match result {
+            Ok(value) => QueryResponse { status: 200, value },
+            Err(error) => QueryResponse {
+                status: error.status,
+                value: json!({"error":{"code":error.code,"message":error.message}}),
+            },
+        }
+    }
+
+    async fn dispatch(&self, path: &str, raw_query: &str) -> ApiResult<Value> {
+        let allowed: &[&str] = match path {
+            "api/view-context" => &[],
+            "api/audits" => &["from", "to", "key", "q", "limit", "cursor"],
+            "api/audit" => &["id"],
+            "api/audit-content" => &["id", "contentId", "cursor"],
+            "api/keys" => &["cursor"],
+            _ => return Err(ApiError::not_found()),
+        };
+        let params = parse_params(raw_query, allowed)?;
+        match path {
+            "api/view-context" => Ok(
+                json!({"timeZone":self.time_zone_name,"today":Utc::now().with_timezone(&self.time_zone).format("%Y-%m-%d").to_string()}),
+            ),
+            "api/audits" => self.list(parse_list(&params)?).await,
+            "api/audit" => self.detail(required_id(&params, "id")?).await,
+            "api/audit-content" => {
+                self.content(
+                    required_id(&params, "id")?,
+                    required_id(&params, "contentId")?,
+                    params.get("cursor").map(String::as_str),
+                )
+                .await
+            }
+            "api/keys" => self.keys(params.get("cursor").map(String::as_str)).await,
+            _ => unreachable!(),
+        }
+    }
+
+    fn sign_cursor(&self, scope: &str, position: Value) -> ApiResult<String> {
+        let cursor = Cursor {
+            version: 1,
+            scope: scope.to_string(),
+            position,
+            expires: Utc::now().timestamp() + CURSOR_LIFETIME_SECONDS,
+        };
+        let payload = serde_json::to_vec(&cursor).map_err(|_| ApiError::internal())?;
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.cursor_secret)
+            .map_err(|_| ApiError::internal())?;
+        mac.update(&payload);
+        let value = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(payload),
+            URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+        );
+        if value.len() > 2048 {
+            return Err(ApiError::internal());
+        }
+        Ok(value)
+    }
+
+    fn read_cursor(&self, value: Option<&str>, scope: &str) -> ApiResult<Option<Value>> {
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        let (payload, signature) = value.split_once('.').ok_or_else(ApiError::invalid_cursor)?;
+        let payload = URL_SAFE_NO_PAD
+            .decode(payload)
+            .map_err(|_| ApiError::invalid_cursor())?;
+        let signature = URL_SAFE_NO_PAD
+            .decode(signature)
+            .map_err(|_| ApiError::invalid_cursor())?;
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.cursor_secret)
+            .map_err(|_| ApiError::internal())?;
+        mac.update(&payload);
+        mac.verify_slice(&signature)
+            .map_err(|_| ApiError::invalid_cursor())?;
+        let cursor: Cursor =
+            serde_json::from_slice(&payload).map_err(|_| ApiError::invalid_cursor())?;
+        if cursor.version != 1 || cursor.scope != scope {
+            return Err(ApiError::invalid_cursor());
+        }
+        if cursor.expires < Utc::now().timestamp() {
+            return Err(ApiError {
+                status: 410,
+                code: "cursor_expired",
+                message: "分页位置已失效，请重新读取。",
+            });
+        }
+        if cursor.expires > Utc::now().timestamp() + CURSOR_LIFETIME_SECONDS + 60 {
+            return Err(ApiError::invalid_cursor());
+        }
+        Ok(Some(cursor.position))
+    }
+
+    async fn list(&self, query: ListQuery) -> ApiResult<Value> {
+        let scope = format!(
+            "audits:{}",
+            scope_hash(
+                &json!({"from":query.from.map(|day|day.to_string()),"to":query.to.map(|day|day.to_string()),"key":query.key,"q":query.q,"limit":query.limit,"timeZone":self.time_zone_name,"order":"first_observed_at DESC,id COLLATE C DESC"})
+            )?
+        );
+        let position = self.read_cursor(query.cursor.as_deref(), &scope)?;
+        let (after_time, after_id) = match position {
+            None => (None, None),
+            Some(value) => {
+                let pair = value
+                    .as_array()
+                    .filter(|pair| pair.len() == 2)
+                    .ok_or_else(ApiError::invalid_cursor)?;
+                let timestamp = pair[0].as_str().ok_or_else(ApiError::invalid_cursor)?;
+                let timestamp = DateTime::parse_from_rfc3339(timestamp)
+                    .map_err(|_| ApiError::invalid_cursor())?
+                    .with_timezone(&Utc);
+                let id = pair[1]
+                    .as_str()
+                    .filter(|id| valid_id(id))
+                    .ok_or_else(ApiError::invalid_cursor)?;
+                (Some(timestamp), Some(id.to_string()))
+            }
+        };
+        let start = query
+            .from
+            .map(|day| day_boundary(day, self.time_zone))
+            .transpose()?;
+        let end = query
+            .to
+            .map(|day| {
+                day.succ_opt()
+                    .ok_or_else(ApiError::invalid_query)
+                    .and_then(|day| day_boundary(day, self.time_zone))
+            })
+            .transpose()?;
+        if query.key.as_deref().is_some_and(|key| key.contains('\0')) {
+            return Ok(json!({"items":[],"total":0,"nextCursor":null}));
+        }
+        let folded = crate::store::search_text(&query.q);
+        // Count and rows share one read-only snapshot within this request. The cursor
+        // deliberately does not promise a snapshot across subsequent requests.
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *transaction)
+            .await?;
+        let total: i64 = sqlx::query_scalar("SELECT count(*) FROM prompt_audit.audits WHERE ($1::timestamptz IS NULL OR first_observed_at >= $1) AND ($2::timestamptz IS NULL OR first_observed_at < $2) AND ($3::text IS NULL OR key_id = $3) AND strpos(input_search,$4)>0")
+            .bind(start).bind(end).bind(&query.key).bind(&folded).fetch_one(&mut *transaction).await?;
+        if !(0..=MAX_SAFE_INTEGER).contains(&total) {
+            return Err(ApiError::internal());
+        }
+        let rows = sqlx::query("SELECT id,key_id,key_name,first_observed_at,context_count, CASE WHEN $4::text='' THEN preview ELSE substring(input_text FROM greatest(strpos(input_search,$4)-245,1) FOR 2786) END AS excerpt, CASE WHEN $4::text='' THEN false ELSE strpos(input_search,$4)>246 END AS prefix, CASE WHEN $4::text='' THEN false ELSE char_length(input_text)>greatest(strpos(input_search,$4)-245,1)+2785 END AS suffix FROM prompt_audit.audits WHERE ($1::timestamptz IS NULL OR first_observed_at >= $1) AND ($2::timestamptz IS NULL OR first_observed_at < $2) AND ($3::text IS NULL OR key_id = $3) AND strpos(input_search,$4)>0 AND ($5::timestamptz IS NULL OR (first_observed_at,id COLLATE \"C\") < ($5,$6::text COLLATE \"C\")) ORDER BY first_observed_at DESC,id COLLATE \"C\" DESC LIMIT $7")
+            .bind(start).bind(end).bind(&query.key).bind(&folded).bind(after_time).bind(after_id).bind(query.limit+1).fetch_all(&mut *transaction).await?;
+        transaction.commit().await?;
+        let mut items = Vec::new();
+        let mut last_position = None;
+        for (index, row) in rows.iter().take(query.limit as usize).enumerate() {
+            let id: String = row.try_get("id")?;
+            let time: DateTime<Utc> = row.try_get("first_observed_at")?;
+            let excerpt: String = row.try_get("excerpt")?;
+            let excerpt = crate::store::decode_text(&excerpt).map_err(|_| ApiError::internal())?;
+            let prefix: bool = row.try_get("prefix")?;
+            let suffix: bool = row.try_get("suffix")?;
+            let preview = format!(
+                "{}{}{}",
+                if prefix { "…" } else { "" },
+                excerpt,
+                if suffix { "…" } else { "" }
+            );
+            let context_count: i64 = row.try_get("context_count")?;
+            if !(0..=MAX_SAFE_INTEGER).contains(&context_count)
+                || !valid_id(&id)
+                || preview.chars().count() > 400
+            {
+                return Err(ApiError::internal());
+            }
+            let item = json!({"id":id,"recordedAt":utc_timestamp(time),"recordedAtDisplay":self.display_time(time),"keyId":row.try_get::<String,_>("key_id")?,"keyName":row.try_get::<Option<String>,_>("key_name")?,"preview":preview,"contextCount":context_count});
+            let position = json!([time.to_rfc3339(), id]);
+            let next = if rows.len() > index + 1 {
+                Some(self.sign_cursor(&scope, position.clone())?)
+            } else {
+                None
+            };
+            items.push(item);
+            if bytes(&json!({"items":items,"total":total,"nextCursor":next}))?
+                > self.response_budget
+            {
+                items.pop();
+                break;
+            }
+            last_position = Some(position);
+        }
+        if items.is_empty() && !rows.is_empty() {
+            return Err(ApiError::budget());
+        }
+        let next_cursor = if rows.len() > items.len() {
+            Some(self.sign_cursor(&scope, last_position.ok_or_else(ApiError::internal)?)?)
+        } else {
+            None
+        };
+        Ok(json!({"items":items,"total":total,"nextCursor":next_cursor}))
+    }
+
+    fn display_time(&self, time: DateTime<Utc>) -> String {
+        time.with_timezone(&self.time_zone)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string()
+    }
+
+    async fn detail(&self, id: &str) -> ApiResult<Value> {
+        if id.contains('\0') {
+            return Err(ApiError::not_found());
+        }
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *transaction)
+            .await?;
+        let audit = sqlx::query("SELECT id,key_id,key_name,first_observed_at,request_id,thread_id,session_id,turn_id,input_kinds,repositories,input_content_id FROM prompt_audit.audits WHERE id=$1").bind(id).fetch_optional(&mut *transaction).await?.ok_or_else(ApiError::not_found)?;
+        let request_id: Option<String> = audit.try_get("request_id")?;
+        let key_id: String = audit.try_get("key_id")?;
+        let request_metadata = if let Some(ref request_id) = request_id {
+            // The fixed host view projects metadata without granting access
+            // to the remaining host request observation JSON.
+            let row = sqlx::query("SELECT user_agent,requested_model_id,reasoning_effort FROM public.model_request_observations WHERE id=$1 AND client_api_key_ref=$2")
+                .bind(request_id).bind(&key_id).fetch_optional(&mut *transaction).await?;
+            row.map(|row| -> ApiResult<Value> { Ok(json!({"userAgent":bounded_optional(row.try_get("user_agent")?,8192),"model":bounded_optional(row.try_get("requested_model_id")?,256),"reasoningEffort":bounded_optional(row.try_get("reasoning_effort")?,80)})) }).transpose()?
+        } else {
+            None
+        };
+        let contents = sqlx::query("SELECT id,ordinal,role,phase,truncated,character_count,block_count FROM prompt_audit.contents WHERE audit_id=$1 ORDER BY ordinal").bind(id).fetch_all(&mut *transaction).await?;
+        transaction.commit().await?;
+        let input_id: String = audit.try_get("input_content_id")?;
+        let mut input = None;
+        let mut context = Vec::new();
+        for row in contents {
+            let content_id: String = row.try_get("id")?;
+            let characters: i64 = row.try_get("character_count")?;
+            let blocks: i64 = row.try_get("block_count")?;
+            if !valid_id(&content_id)
+                || !(0..=MAX_SAFE_INTEGER).contains(&characters)
+                || !(0..=MAX_SAFE_INTEGER).contains(&blocks)
+            {
+                return Err(ApiError::internal());
+            }
+            let descriptor =
+                json!({"id":content_id,"characterCount":characters,"blockCount":blocks});
+            if content_id == input_id {
+                input = Some(descriptor);
+            } else {
+                let role: Option<String> = row.try_get("role")?;
+                if !matches!(role.as_deref(), Some("user" | "assistant")) {
+                    return Err(ApiError::internal());
+                }
+                context.push(json!({"id":content_id,"role":role,"phase":bounded_optional(row.try_get("phase")?,80),"truncated":row.try_get::<bool,_>("truncated")?,"content":descriptor}));
+            }
+        }
+        let input = input.ok_or_else(ApiError::internal)?;
+        let input_kinds: Value = audit.try_get("input_kinds")?;
+        if input_kinds.as_array().map(Vec::len)
+            != input["blockCount"].as_u64().map(|number| number as usize)
+        {
+            return Err(ApiError::internal());
+        }
+        let time: DateTime<Utc> = audit.try_get("first_observed_at")?;
+        Ok(
+            json!({"id":id,"recordedAt":utc_timestamp(time),"recordedAtDisplay":self.display_time(time),"keyId":key_id,"keyName":audit.try_get::<Option<String>,_>("key_name")?,"threadId":audit.try_get::<Option<String>,_>("thread_id")?,"sessionId":audit.try_get::<Option<String>,_>("session_id")?,"requestId":request_id,"turnId":audit.try_get::<Option<String>,_>("turn_id")?,"inputKinds":input_kinds,"repositories":audit.try_get::<Option<Value>,_>("repositories")?,"requestMetadata":request_metadata,"input":input,"context":context}),
+        )
+    }
+
+    async fn content(
+        &self,
+        audit_id: &str,
+        content_id: &str,
+        cursor: Option<&str>,
+    ) -> ApiResult<Value> {
+        let scope = format!("content:{}", scope_hash(&json!([audit_id, content_id]))?);
+        let position = self
+            .read_cursor(cursor, &scope)?
+            .unwrap_or_else(|| json!({"index":0,"offset":0}));
+        let (index, offset) = parse_content_position(&position)?;
+        if audit_id.contains('\0') || content_id.contains('\0') {
+            return Err(ApiError::not_found());
+        }
+        let row =
+            sqlx::query("SELECT blocks FROM prompt_audit.contents WHERE audit_id=$1 AND id=$2")
+                .bind(audit_id)
+                .bind(content_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .ok_or_else(ApiError::not_found)?;
+        let blocks: Value = row.try_get("blocks")?;
+        self.content_page(audit_id, content_id, &scope, &blocks, index, offset)
+    }
+
+    fn content_page(
+        &self,
+        audit_id: &str,
+        content_id: &str,
+        scope: &str,
+        source: &Value,
+        mut index: usize,
+        mut offset: usize,
+    ) -> ApiResult<Value> {
+        let source = source.as_array().ok_or_else(ApiError::internal)?;
+        if index > source.len() || (index == source.len() && offset != 0) {
+            return Err(ApiError::invalid_cursor());
+        }
+        let mut budget = CONTENT_CHARACTERS;
+        let mut segments = Vec::new();
+        while index < source.len() && segments.len() < 32 {
+            let block = &source[index];
+            let next_index;
+            let next_offset;
+            let segment = match block.get("kind").and_then(Value::as_str) {
+                Some("nontext") => {
+                    if offset != 0 {
+                        return Err(ApiError::invalid_cursor());
+                    }
+                    let media_type = block
+                        .get("mediaType")
+                        .and_then(Value::as_str)
+                        .filter(|value| value.chars().count() <= 80)
+                        .ok_or_else(ApiError::internal)?;
+                    let description = block.get("description").cloned().unwrap_or(Value::Null);
+                    if !description.is_null()
+                        && !description
+                            .as_str()
+                            .is_some_and(|value| value.chars().count() <= 512)
+                    {
+                        return Err(ApiError::internal());
+                    }
+                    next_index = index + 1;
+                    next_offset = 0;
+                    json!({"kind":"nontext","index":index,"mediaType":media_type,"description":description})
+                }
+                Some("text") => {
+                    let text = block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .ok_or_else(ApiError::internal)?;
+                    let total = text.chars().count();
+                    if offset > total {
+                        return Err(ApiError::invalid_cursor());
+                    }
+                    if budget == 0 && offset < total {
+                        break;
+                    }
+                    // JSON string escaping can consume six bytes per code point.
+                    // Find the largest segment that also fits the effective host
+                    // budget; do not truncate the persisted original.
+                    let maximum = (total - offset).min(budget);
+                    let mut length = maximum;
+                    let mut segment;
+                    loop {
+                        let part: String = text.chars().skip(offset).take(length).collect();
+                        segment = json!({"kind":"text","index":index,"offset":offset,"text":part,"totalCharacters":total});
+                        let (next_index, next_offset) = if offset + length == total {
+                            (index + 1, 0)
+                        } else {
+                            (index, offset + length)
+                        };
+                        let next = if next_index < source.len() {
+                            Some(self.sign_cursor(
+                                scope,
+                                json!({"index":next_index,"offset":next_offset}),
+                            )?)
+                        } else {
+                            None
+                        };
+                        segments.push(segment.clone());
+                        let fits = bytes(
+                            &json!({"auditId":audit_id,"contentId":content_id,"blocks":segments,"nextCursor":next}),
+                        )? <= self.response_budget;
+                        segments.pop();
+                        if fits {
+                            break;
+                        }
+                        if length == 0 {
+                            break;
+                        }
+                        length /= 2;
+                    }
+                    if length == 0 && maximum > 0 {
+                        break;
+                    }
+                    budget -= length;
+                    (next_index, next_offset) = if offset + length == total {
+                        (index + 1, 0)
+                    } else {
+                        (index, offset + length)
+                    };
+                    segment
+                }
+                _ => return Err(ApiError::internal()),
+            };
+            let next = if next_index < source.len() {
+                Some(self.sign_cursor(scope, json!({"index":next_index,"offset":next_offset}))?)
+            } else {
+                None
+            };
+            segments.push(segment);
+            if bytes(
+                &json!({"auditId":audit_id,"contentId":content_id,"blocks":segments,"nextCursor":next}),
+            )? > self.response_budget
+            {
+                segments.pop();
+                break;
+            }
+            index = next_index;
+            offset = next_offset;
+            if offset > 0 {
+                break;
+            }
+        }
+        if segments.is_empty() && index < source.len() {
+            return Err(ApiError::budget());
+        }
+        let next = if index < source.len() {
+            Some(self.sign_cursor(scope, json!({"index":index,"offset":offset}))?)
+        } else {
+            None
+        };
+        Ok(json!({"auditId":audit_id,"contentId":content_id,"blocks":segments,"nextCursor":next}))
+    }
+
+    async fn keys(&self, cursor: Option<&str>) -> ApiResult<Value> {
+        let scope = "keys:id COLLATE C ASC";
+        let after = self
+            .read_cursor(cursor, scope)?
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|id| valid_id(id))
+                    .map(str::to_string)
+                    .ok_or_else(ApiError::invalid_cursor)
+            })
+            .transpose()?;
+        let rows=sqlx::query("SELECT d.id,NOT d.present AS historical,ARRAY(SELECT n.name FROM prompt_audit.key_names n WHERE n.key_id=d.id ORDER BY n.observed_at DESC,n.name COLLATE \"C\" ASC LIMIT 32) AS names FROM prompt_audit.key_directory d WHERE ($1::text IS NULL OR d.id COLLATE \"C\">$1 COLLATE \"C\") ORDER BY d.id COLLATE \"C\" ASC LIMIT 101").bind(after).fetch_all(&self.pool).await?;
+        let mut items = Vec::new();
+        let mut last = None;
+        for (index, row) in rows.iter().take(100).enumerate() {
+            let id: String = row.try_get("id")?;
+            let names: Vec<String> = row.try_get("names")?;
+            if !valid_id(&id) || names.iter().any(|name| name.chars().count() > 512) {
+                return Err(ApiError::internal());
+            }
+            let next = if rows.len() > index + 1 {
+                Some(self.sign_cursor(scope, json!(id))?)
+            } else {
+                None
+            };
+            items.push(
+                json!({"id":id,"names":names,"historical":row.try_get::<bool,_>("historical")?}),
+            );
+            if bytes(&json!({"items":items,"nextCursor":next}))? > self.response_budget {
+                items.pop();
+                break;
+            }
+            last = Some(id);
+        }
+        if items.is_empty() && !rows.is_empty() {
+            return Err(ApiError::budget());
+        }
+        let next = if rows.len() > items.len() {
+            Some(self.sign_cursor(scope, json!(last.ok_or_else(ApiError::internal)?))?)
+        } else {
+            None
+        };
+        Ok(json!({"items":items,"nextCursor":next}))
+    }
+}
+
+fn parse_params(raw: &str, allowed: &[&str]) -> ApiResult<BTreeMap<String, String>> {
+    if raw.len() > MAX_QUERY_BYTES || raw.starts_with('?') {
+        return Err(ApiError::invalid_query());
+    }
+    let mut values = BTreeMap::new();
+    for (key, value) in url::form_urlencoded::parse(raw.as_bytes()) {
+        if !allowed.contains(&key.as_ref())
+            || values
+                .insert(key.into_owned(), value.into_owned())
+                .is_some()
+        {
+            return Err(ApiError::invalid_query());
+        }
+    }
+    if values
+        .get("cursor")
+        .is_some_and(|value| value.is_empty() || value.chars().count() > 2048)
+    {
+        return Err(ApiError::invalid_query());
+    }
+    Ok(values)
+}
+fn parse_list(params: &BTreeMap<String, String>) -> ApiResult<ListQuery> {
+    let from = params
+        .get("from")
+        .map(|value| parse_date(value))
+        .transpose()?;
+    let to = params
+        .get("to")
+        .map(|value| parse_date(value))
+        .transpose()?;
+    if matches!((from,to),(Some(from),Some(to)) if from>to) {
+        return Err(ApiError::invalid_query());
+    }
+    let key = params
+        .get("key")
+        .map(|value| {
+            if valid_id(value) {
+                Ok(value.clone())
+            } else {
+                Err(ApiError::invalid_query())
+            }
+        })
+        .transpose()?;
+    let q = params.get("q").cloned().unwrap_or_default();
+    if q.chars().count() > 200 || q != q.trim_matches(ecmascript_whitespace) {
+        return Err(ApiError::invalid_query());
+    }
+    let limit = match params.get("limit").map(String::as_str).unwrap_or("50") {
+        "50" => 50,
+        "100" => 100,
+        "200" => 200,
+        _ => return Err(ApiError::invalid_query()),
+    };
+    Ok(ListQuery {
+        from,
+        to,
+        key,
+        q,
+        limit,
+        cursor: params.get("cursor").cloned(),
+    })
+}
+fn parse_date(value: &str) -> ApiResult<NaiveDate> {
+    if value.len() != 10
+        || value.as_bytes()[4] != b'-'
+        || value.as_bytes()[7] != b'-'
+        || value
+            .as_bytes()
+            .iter()
+            .enumerate()
+            .any(|(index, byte)| index != 4 && index != 7 && !byte.is_ascii_digit())
+    {
+        return Err(ApiError::invalid_query());
+    }
+    NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| ApiError::invalid_query())
+}
+fn required_id<'a>(params: &'a BTreeMap<String, String>, field: &str) -> ApiResult<&'a str> {
+    params
+        .get(field)
+        .map(String::as_str)
+        .filter(|value| valid_id(value))
+        .ok_or_else(ApiError::invalid_query)
+}
+fn valid_id(value: &str) -> bool {
+    (1..=256).contains(&value.chars().count())
+}
+fn bounded_optional(value: Option<String>, limit: usize) -> Option<String> {
+    value.filter(|value| value.chars().count() <= limit)
+}
+#[cfg(test)]
+fn ascii_fold(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_uppercase() {
+                character.to_ascii_lowercase()
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+fn utc_timestamp(value: DateTime<Utc>) -> String {
+    value.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+fn bytes(value: &Value) -> ApiResult<usize> {
+    serde_json::to_vec(value)
+        .map(|value| value.len())
+        .map_err(|_| ApiError::internal())
+}
+fn scope_hash(value: &Value) -> ApiResult<String> {
+    Ok(URL_SAFE_NO_PAD.encode(Sha256::digest(
+        serde_json::to_vec(value).map_err(|_| ApiError::internal())?,
+    )))
+}
+fn parse_content_position(value: &Value) -> ApiResult<(usize, usize)> {
+    let object = value
+        .as_object()
+        .filter(|object| {
+            object.len() == 2 && object.contains_key("index") && object.contains_key("offset")
+        })
+        .ok_or_else(ApiError::invalid_cursor)?;
+    let read = |field: &str| {
+        object[field]
+            .as_u64()
+            .filter(|value| *value <= MAX_SAFE_INTEGER as u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(ApiError::invalid_cursor)
+    };
+    Ok((read("index")?, read("offset")?))
+}
+// ECMAScript String.trim is the contract's boundary rule, which differs from
+// Rust's Unicode whitespace (e.g. U+0085 is not trimmed, U+FEFF is trimmed).
+fn ecmascript_whitespace(character: char) -> bool {
+    matches!(character,'\u{0009}'..='\u{000d}'|'\u{0020}'|'\u{00a0}'|'\u{1680}'|'\u{2000}'..='\u{200a}'|'\u{2028}'|'\u{2029}'|'\u{202f}'|'\u{205f}'|'\u{3000}'|'\u{feff}')
+}
+fn day_boundary(day: NaiveDate, time_zone: Tz) -> ApiResult<DateTime<Utc>> {
+    let mut local = day
+        .and_hms_opt(0, 0, 0)
+        .ok_or_else(ApiError::invalid_query)?;
+    // Most dates resolve at midnight. Midnight gaps and entirely skipped local
+    // dates map to the first actual instant after the calendar boundary.
+    for _ in 0..=172800 {
+        match time_zone.from_local_datetime(&local) {
+            LocalResult::Single(value) => return Ok(value.with_timezone(&Utc)),
+            LocalResult::Ambiguous(first, second) => {
+                return Ok(first.min(second).with_timezone(&Utc));
+            }
+            LocalResult::None => {
+                local = local
+                    .checked_add_signed(Duration::seconds(1))
+                    .ok_or_else(ApiError::invalid_query)?
+            }
+        }
+    }
+    Err(ApiError::invalid_query())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn service(budget: usize) -> QueryService {
+        QueryService::new(
+            sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://unused:unused@localhost/unused")
+                .unwrap(),
+            "America/New_York",
+            budget,
+            vec![7; 32],
+        )
+        .unwrap()
+    }
+    #[test]
+    fn strict_queries_match_unicode_and_literal_rules() {
+        for raw in [
+            "q=x&q=y",
+            "unknown=1",
+            "from=2026-02-30",
+            "limit=3",
+            "q=%20x",
+            "q=%EF%BB%BFx",
+        ] {
+            let result = parse_params(raw, &["from", "to", "q", "limit"])
+                .and_then(|params| parse_list(&params));
+            assert!(result.is_err(), "{raw}");
+        }
+        let mut params = BTreeMap::new();
+        params.insert("q".into(), "😀".repeat(200));
+        assert!(parse_list(&params).is_ok());
+        params.insert("q".into(), "😀".repeat(201));
+        assert!(parse_list(&params).is_err());
+        params.insert("q".into(), "\u{0085}x".into());
+        assert!(parse_list(&params).is_ok());
+        assert_eq!(ascii_fold("AÄİΣ_100% \\"), "aÄİΣ_100% \\");
+    }
+    #[tokio::test]
+    async fn cursors_are_authenticated_scoped_persistent_and_expirable() {
+        let service = service(512 * 1024);
+        let cursor = service
+            .sign_cursor("a", json!({"index":1,"offset":3}))
+            .unwrap();
+        assert_eq!(
+            service.read_cursor(Some(&cursor), "a").unwrap().unwrap()["offset"],
+            3
+        );
+        let same = QueryService::new(service.pool.clone(), "UTC", 512 * 1024, vec![7; 32]).unwrap();
+        assert!(same.read_cursor(Some(&cursor), "a").is_ok());
+        assert_eq!(
+            service.read_cursor(Some(&cursor), "b").unwrap_err().code,
+            "invalid_cursor"
+        );
+        let mut tampered = cursor.clone().into_bytes();
+        tampered[3] = if tampered[3] == b'a' { b'b' } else { b'a' };
+        assert_eq!(
+            service
+                .read_cursor(Some(std::str::from_utf8(&tampered).unwrap()), "a")
+                .unwrap_err()
+                .code,
+            "invalid_cursor"
+        );
+        let expired = Cursor {
+            version: 1,
+            scope: "a".into(),
+            position: json!(0),
+            expires: Utc::now().timestamp() - 1,
+        };
+        let payload = serde_json::to_vec(&expired).unwrap();
+        let mut mac = Hmac::<Sha256>::new_from_slice(&service.cursor_secret).unwrap();
+        mac.update(&payload);
+        let expired = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(payload),
+            URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+        );
+        assert_eq!(
+            service.read_cursor(Some(&expired), "a").unwrap_err().code,
+            "cursor_expired"
+        );
+    }
+    #[test]
+    fn calendar_boundaries_account_for_short_long_and_skipped_days() {
+        let zone: Tz = "America/New_York".parse().unwrap();
+        let boundary = |date| day_boundary(parse_date(date).unwrap(), zone).unwrap();
+        assert_eq!(
+            (boundary("2026-03-09") - boundary("2026-03-08")).num_hours(),
+            23
+        );
+        assert_eq!(
+            (boundary("2026-11-02") - boundary("2026-11-01")).num_hours(),
+            25
+        );
+        let apia: Tz = "Pacific/Apia".parse().unwrap();
+        assert_eq!(
+            day_boundary(parse_date("2011-12-30").unwrap(), apia).unwrap(),
+            day_boundary(parse_date("2011-12-31").unwrap(), apia).unwrap()
+        );
+    }
+    #[tokio::test]
+    async fn content_segments_preserve_codepoints_empty_blocks_and_ownership() {
+        let service = service(512 * 1024);
+        let source = json!([{"kind":"text","text":"😀é中".repeat(401)},{"kind":"text","text":""},{"kind":"nontext","mediaType":"image","description":null}]);
+        let page = service
+            .content_page("a", "c", "content-scope", &source, 0, 0)
+            .unwrap();
+        assert_eq!(
+            page["blocks"][0]["text"].as_str().unwrap().chars().count(),
+            1200
+        );
+        assert_eq!(page["blocks"][0]["totalCharacters"], 1203);
+        let position = service
+            .read_cursor(page["nextCursor"].as_str(), "content-scope")
+            .unwrap()
+            .unwrap();
+        let (index, offset) = parse_content_position(&position).unwrap();
+        assert_eq!((index, offset), (0, 1200));
+        let second = service
+            .content_page("a", "c", "content-scope", &source, index, offset)
+            .unwrap();
+        assert_eq!(second["blocks"].as_array().unwrap().len(), 3);
+        assert_eq!(second["blocks"][0]["offset"], 1200);
+        assert_eq!(second["blocks"][1]["text"], "");
+        assert!(second["nextCursor"].is_null());
+        assert_eq!(
+            service
+                .read_cursor(page["nextCursor"].as_str(), "other-owner")
+                .unwrap_err()
+                .code,
+            "invalid_cursor"
+        );
+    }
+    #[tokio::test]
+    async fn small_host_budget_returns_continuous_content_without_losing_text() {
+        let service = service(2000);
+        let source = json!([{"kind":"text","text":"\u{0001}😀".repeat(1800)}]);
+        let mut index = 0;
+        let mut offset = 0;
+        let mut combined = String::new();
+        loop {
+            let page = service
+                .content_page("audit", "content", "scope", &source, index, offset)
+                .unwrap();
+            assert!(bytes(&page).unwrap() <= 2000);
+            for block in page["blocks"].as_array().unwrap() {
+                combined.push_str(block["text"].as_str().unwrap());
+            }
+            if page["nextCursor"].is_null() {
+                break;
+            }
+            (index, offset) = parse_content_position(
+                &service
+                    .read_cursor(page["nextCursor"].as_str(), "scope")
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+        assert_eq!(combined, source[0]["text"].as_str().unwrap());
+    }
+}

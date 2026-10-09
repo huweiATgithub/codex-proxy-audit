@@ -2,7 +2,7 @@
 
 ## 1. 方案与职责
 
-通过独立的 Codex Proxy RS 网关插件实现 Prompt 审计，无需为本方案修改宿主。插件在 `request` 中间件读取输入，在同一中间件的响应返回链观察 Agent 文本，将审计事实写入独立 PG schema，并通过 `management` 能力提供管理员页面。
+通过独立的 Codex Proxy RS 网关插件实现 Prompt 审计。宿主只需接入通用的只读部署上下文能力，提供有效部署时区与管理响应预算；采集、存储与查询语义由插件负责。插件在 `request` 中间件读取输入，在同一中间件的响应返回链观察 Agent 文本，将审计事实写入独立 PG schema，并通过 `management` 能力提供管理员页面。
 
 审计单位是一条用户输入。模型请求只是承载输入与上文的传输事件：一次请求可能包含多条输入，同一输入也可能随 Agent 循环多次经过网关。插件依据[采集行为](collection.md)形成记录，不把每次模型请求直接当作一次用户发言。
 
@@ -34,7 +34,7 @@ flowchart LR
 
 | 来源 | 核实基线 | 用途 |
 | --- | --- | --- |
-| Codex Proxy RS upstream（zyycn/codex-proxy-rs） | `v3.21.1`，`f174320e2ac8987578146d4684e69ad196db0286` | 目标宿主与 SDK 合同 |
+| Codex Proxy RS upstream（zyycn/codex-proxy-rs） | `v3.22.2`，`705f0fad06667ad6aaf0ea162a869d2d3cfe39c2` | 目标宿主与 SDK 合同 |
 | 官方 Codex | `0.160.1`，`d27764b82f7118f674371e6d6e76271d9d606edb` | 输入结构、子代理来源、增量请求及 turn 行为 |
 | codex-proxy-plugins | `cfd37537f99f2c957639c6fa2c14d40dcb0c3368` | 独立插件组织方式与管理页面示例 |
 
@@ -79,7 +79,7 @@ Client Key 代表网关凭据的归属。多人共享一个 Key 时，插件不�
 
 宿主启动插件时执行 `env_clear()`，插件不能假设自动继承宿主的 `DATABASE_URL`。普通 configuration 不允许携带声明为 secret 的字段。插件日志和管理 API 不回显连接串。[进程环境][process-env]、[配置合并][configuration]
 
-独立角色拥有审计 schema 所需的权限，并额外取得宿主 `model_requests` 的 `id`、`client_api_key_ref`、`user_agent`、`requested_model_id`、`reasoning_effort` 五列的只读权限，用于详情关联。这个窄范围依赖固定到 §2 的宿主基线；升级时核对列与语义，不扩展为任意宿主表访问。当前 SDK 没有读取既有请求记录的接口，此处使用后端独立 PG 连接，不借用管理员凭据调用宿主 HTTP API。
+独立角色拥有审计 schema 所需的权限，并额外取得宿主只读视图 `public.model_request_observations` 的 `id`、`client_api_key_ref`、`user_agent`、`requested_model_id`、`reasoning_effort` 五列的只读权限，用于详情关联。v3.22.2 的迁移 `0025_request_observation.sql` 将 UA 与推理强度移入 `model_requests.request_observation_json`，该宿主视图提供同名查询投影；插件不读取完整 JSON 或其他列。这个窄范围依赖固定到 §2 的宿主基线；升级时核对列与语义，不扩展为任意宿主表访问。当前 SDK 没有读取既有请求记录的接口，此处使用后端独立 PG 连接，不借用管理员凭据调用宿主 HTTP API。
 
 ### 4.3 逻辑数据模型
 
@@ -97,13 +97,15 @@ Client Key 代表网关凭据的归属。多人共享一个 Key 时，插件不�
 
 扩展元数据只保存上表的仓库根路径、remote URLs、消息级 turn ID 和逐块输入类型，取值与排除范围由[采集行为 §3.1](collection.md#31-解析元数据)定义。请求用途与来源只参与当次采集判定，不作为审计字段保存。响应 ID 和前驱关联仍仅服务于已有的有限上下文状态，不扩展成请求诊断日志。
 
-宿主已在 `model_requests` 保存 `user_agent`、`requested_model_id`、`reasoning_effort`。[请求建档][request-creation]、[存储映射][request-storage] 详情按 `model_requests.id = requestId AND client_api_key_ref = keyId` 读取，仅投影这三项；使用删除 Key 后仍保留的 `client_api_key_ref`，不依赖可空的 Key 外键。`model` 表示来源请求的请求模型，不是 `upstream_model_id`，UA 是宿主记录的入站 UA。它们描述承载本次观察的模型请求，不能当作请求中每条历史输入最初使用的模型或客户端。
+宿主在 `model_requests` 及其 `request_observation_json` 保存 UA、请求模型与推理强度，由 `model_request_observations` 提供 `user_agent`、`requested_model_id`、`reasoning_effort` 投影。[请求建档][request-creation]、[存储映射][request-storage] 详情按宿主视图的 `id = requestId AND client_api_key_ref = keyId` 关联底层 `model_requests`，仅投影这三项；使用删除 Key 后仍保留的 `client_api_key_ref`，不依赖可空的 Key 外键。`model` 表示来源请求的请求模型，不是 `upstream_model_id`，UA 是宿主记录的入站 UA。它们描述承载本次观察的模型请求，不能当作请求中每条历史输入最初使用的模型或客户端。
 
 来源请求可能尚未建档、未形成记录，或已经按宿主保留期清理，关联缺失不删除或隐藏审计输入，详情返回 `requestMetadata: null`；已存在行内的未知值逐项返回 `null`。数据库查询失败按接口错误返回，不能冒充缺失。宿主清理后不从审计副本恢复这三项，也不设置跨 schema 外键阻止清理。[宿主清理][request-retention]
 
 关联以 Key ID 加会话范围隔离；不能仅凭 turn ID、响应 ID 或文本摘要跨 Key 合并。数据库需要表达已经确定的输入身份与唯一性，不能仅依赖单个插件进程的内存去重。无可靠身份时的观察记录必须保留其不确定性，不把猜测提升成唯一约束。
 
 列表按 `(first_observed_at, audit_id)` 排序并使用稳定游标，建立支持时间、Key 和用户输入正文关键词检索的查询投影与索引。列表读取有限预览或命中片段；完整正文和上下文通过详情接口读取。搜索只针对用户输入文本，不搜索前序对话，也不生成二次模型摘要。
+
+正文与有限状态使用 PostgreSQL `json` 保存，保留包括 U+0000 在内的 Unicode 文本；搜索投影按每个码点编码为固定七字符 token，ASCII 大写字母只在匹配投影中转小写。这使字面子串匹配和有限预览能够在 SQL 中执行，既不使用数据库区域性的大小写转换，也不让 NUL 导致整条输入无法持久化。时间／Key 索引支持范围查询；MVP 正文子串检索扫描筛选范围内的投影，不承诺大规模全文索引性能。
 
 ### 4.4 与宿主数据库管理的关系
 
@@ -163,17 +165,17 @@ Client Key 代表网关凭据的归属。多人共享一个 Key 时，插件不�
 
 `requestMetadata` 为 `{userAgent, model, reasoningEffort}` 或 `null`，对应 §4.3 的宿主关联查询。存在对象时三个字段均必填、各自可空；长度上限分别为 8,192、256、80 码点，超限值返回 `null`。插件存储其来源 `requestId`，不存这三项的副本。宿主行尚未出现或被清理后，详情的这个查询投影可以变化；固定的审计输入、仓库快照与前序对话不随之改变。
 
-时间规则沿用 codex-proxy-rs 的 [`host.timezone`](https://github.com/zyycn/codex-proxy-rs/blob/f174320e2ac8987578146d4684e69ad196db0286/deploy/README.md#部署时区)，缺省为 `Asia/Shanghai`；这是宿主部署配置，不是浏览器、进程 `TZ`、数据库会话或上游 `requestLocation.timezone`。按[宿主页面时间合同](https://github.com/zyycn/codex-proxy-rs/blob/f174320e2ac8987578146d4684e69ad196db0286/docs/api.md#页面时间合同)，后端统一负责时间展示与日期边界。`api/view-context` 的 `today` 由服务端时钟在该时区下生成，`timeZone` 只供页面说明。UI 先读取此接口，以 `today` 初始化起止日期，再请求列表和 Key 目录；初始化失败时显示错误并允许重试，不能回退到浏览器日期或固定时区。
+时间规则沿用 codex-proxy-rs 的 [`host.timezone`](https://github.com/zyycn/codex-proxy-rs/blob/705f0fad06667ad6aaf0ea162a869d2d3cfe39c2/deploy/README.md#部署时区)，缺省为 `Asia/Shanghai`；这是宿主部署配置，不是浏览器、进程 `TZ`、数据库会话或上游 `requestLocation.timezone`。按[宿主页面时间合同](https://github.com/zyycn/codex-proxy-rs/blob/705f0fad06667ad6aaf0ea162a869d2d3cfe39c2/docs/api.md#页面时间合同)，后端统一负责时间展示与日期边界。`api/view-context` 的 `today` 由服务端时钟在该时区下生成，`timeZone` 只供页面说明。UI 先读取此接口，以 `today` 初始化起止日期，再请求列表和 Key 目录；初始化失败时显示错误并允许重试，不能回退到浏览器日期或固定时区。
 
 `from`、`to` 为 `YYYY-MM-DD`，均包含所选宿主当地日期；缺省表示该侧无界。查询不接受客户端 `timeZone` 覆盖。后端将日期转换为当地起始日边界至结束日次日起始边界的半开区间，按宿主日历规则处理跳时及重复时刻，不能固定加 24 小时。时间展示、默认日期与过滤必须使用同一有效部署时区，列表游标也绑定该时区，部署时区变化后旧游标不能复用。起始日期晚于结束日期、无效日期、重复参数、未知参数均返回 `400 invalid_query`。
 
-后端接入前置条件：已核对的宿主 v3.21.1 管理页桥与插件 SDK 尚未提供部署时区读取能力；`settings.load` 中的 `request_location.timezone` 不代表系统时区。宿主侧需为插件提供有效 `host.timezone` 的只读能力，插件后端取得后执行上述投影与过滤；不能额外维护一份可能漂移的插件时区配置。该宿主扩展属于后端集成待办，本仓库的 Demo 仅模拟这一事实，不代表宿主接口已经存在。
+后端接入前置条件：固定的宿主 v3.22.2 管理页桥与插件 SDK 尚未提供部署时区读取能力；`settings.load` 中的 `request_location.timezone` 不代表系统时区。安装本仓库的[宿主补丁](../host-patches/v3.22.2-deployment-context.patch)后，通用只读回调 `host.deployment_context` 接受 `{}` 与空 payload，返回 `{time_zone, maximum_buffered_body_bytes}` 与空 payload。时区由启动组合根注入已解析的有效 `host.timezone`，预算取自有效 Runtime `RpcLimits`；不接收插件覆盖值，缺少接入时返回错误。插件在管理查询时读取该合同，执行时间投影与过滤，并将响应字节预算取为返回上限与 512 KiB 的较小值；不能额外维护时区或宿主预算配置。此补丁只提供宿主事实，不包含审计策略、数据库或专属页面逻辑；未安装补丁的宿主不满足正式后端接入条件，Demo 仅模拟这些事实。
 
 `key` 精确匹配稳定 Key ID，不匹配名称。`q` 是去除首尾空白后、最多 200 个 Unicode 码点的连续字面片段；缺省或空串不过滤。搜索对象是用户输入的文本块依次用换行连接而成的文本，不含前序对话及非文本块说明。只对 ASCII `A–Z` 忽略大小写，其他字符原样匹配；`%`、`_`、反斜杠及正则元字符均为普通字符。后端须先在完整范围内过滤再分页；`preview` 最多 400 码点，含查询词时取命中附近的原文，可加省略号，不生成摘要或 HTML。高亮由 UI 按相同匹配规则安全渲染。
 
 `limit` 缺省 50，可选 50、100、200，是目标上限。列表按 `(recordedAt DESC, id DESC)` 稳定排序；时间相同按 ID 的确定字节顺序排列。`nextCursor: null` 才表示结束，返回少于 `limit` 条不能推导结束；只要还有下一页，本页必须至少有一项。游标绑定规范化后的全部筛选条件、页大小、排序和当前位置，改变任一条件后不得复用。后端必须检查游标，而不是信任客户端解码值。损坏或不匹配的游标返回 `400 invalid_cursor`；已失效的游标返回 `410 cursor_expired`。
 
-游标提供稳定位置，不承诺跨页数据库快照。`total` 为该次请求时完整筛选范围的准确数量，新增或清理可能使它变化；后端不得用当前页长度冒充总数。UI 只提供前后翻页，保存已访问页的起始游标，不用 `total / limit` 计算可跳转的总页数。刷新或修改筛选后从第一页重新读取。上下方向键可跨页审阅，只有当前结果页中的记录支持相邻导航。详情按审计 ID 独立读取。记录已被清理时返回 404，不与空列表混同。
+游标提供稳定位置，不承诺跨页数据库快照。`total` 为该次请求时完整筛选范围的准确数量，新增或清理可能使它变化；后端不得用当前页长度冒充总数。UI 只提供前后翻页，保存已访问页的起始游标，不用 `total / limit` 计算可跳转的总页数。刷新或修改筛选后从第一页重新读取。上下方向键可跨页审阅，只有当前结果页中的记录支持相邻导航。详情按审计 ID 独立读取。记录已被清理时返回 404，不与空列表混同。插件游标使用数据库中持久保存的 HMAC 密钥签名，有效期为 24 小时；进程重启保留有效游标，过期返回 `cursor_expired`。
 
 详情的 `input` 为 `{id, characterCount, blockCount}`；`context` 按前序消息原顺序排列，每项为 `{id, role, phase, truncated, content}`，其中 `content` 与 `input` 使用同一目录结构。`role` 只允许 `user` 或 `assistant`；未知的非空 phase 按原值显示。目录计数只针对已经保存的内容；非文本块说明不计入 `characterCount`。同一记录内的内容 ID 互不重复，消息 ID 也互不重复；内容 ID 必须归属于请求中的审计 ID，不允许跨记录取块。`context: []` 表示没有保存的上文，`truncated: true` 只表示原消息仅保存了末尾，继续读取不会恢复未采集部分。
 
@@ -194,35 +196,35 @@ Key 目录来自审计存储，按 `id` 升序分页，不能只取宿主当前�
 
 插件错误体固定为 `{error: {code, message}}`，message 最多 300 码点且不得包含凭据、SQL 或内部堆栈。宿主的 401、403 和页桥超时可能不符合该 JSON 结构，UI 分别提示重新登录、无权访问或读取失败，不误判为空结果。收到不符合 Schema、内容类型或内容顺序的成功响应时显示契约错误，不继续使用原始数据。
 
-宿主管理请求和响应各最多 1 MiB，且受宿主 `maximum_buffered_body_bytes` 的更小值限制；query 最多 8192 bytes。[宿主管理限制][management-runtime]、[query 校验][management-validation] 本插件另外将每个 JSON 响应限制为 **512 KiB**，按 UTF-8 编码后的实际长度计算；宿主配置更小时，后端须进一步缩小列表和正文分段。目录仅含元数据，不随正文长度增大；不能因传输限制截短已保存的原文。
+宿主管理请求和响应各最多 1 MiB，且受宿主 `maximum_buffered_body_bytes` 的更小值限制；query 最多 8192 bytes。[宿主管理限制][management-runtime]、[query 校验][management-validation] 本插件另外将每个 JSON 响应限制为 **512 KiB**，按 UTF-8 编码后的实际长度计算；宿主配置更小时，后端进一步缩小列表和正文分段。目录仅含元数据，不随正文长度增大；不能因传输限制截短已保存的原文。可选仓库集合与输入分类各预留最多 64 KiB；分类超出预算时逐块返回 `null`。宿主设置的更小预算若无法容纳固定详情目录，返回 `503 unavailable`，不截断正文或伪装为记录缺失。
 
 页桥每页最多 8 个并发管理请求；UI 将全部读取共用一个最多 4 个在途请求的队列。管理请求没有取消协议，失去消费者的在途请求仍占用槽位直至结束，只丢弃其结果；尚未开始的过时请求不发送。[页桥实现][bridge-runtime]
 
 静态资源每项最多 1 MiB、总计最多 8 MiB、最多 128 项。宿主隔离页禁止 ES Module 脚本及直接网络连接，因此 `npm run build` 生成经典 IIFE 脚本和本地 CSS，并输出 `dist/plugin/management.json` 供后端注册上述路由、非公开资源和页面。后端打包还需在插件 manifest 中声明这些资源及摘要。正式构建不含模拟数据或 HTTP 降级入口；主题沿用宿主注入的变量与变更通知，布局使用 `--cp-plugin-viewport-height`。Demo 读取同一份 `dist/plugin/management.json` 和静态资源，在 `sandbox="allow-scripts"` 的 iframe 中加载，应用同样的 CSP 网络限制，并模拟 v2 管理请求、主题及视口消息。模拟数据与 HTTP 请求只存在于外层宿主和模拟服务中，插件页面没有 Demo 分支或 URL 恢复行为。模拟器覆盖本 UI 使用的管理页桥子集，不替代在真实宿主中的集成验收。[隔离页与资源限制][frame-limit]
 
-[host-compat]: https://github.com/zyycn/codex-proxy-rs/blob/f174320e2ac8987578146d4684e69ad196db0286/backend/crates/gateway-plugin/runtime/plugin-host-compatibility.json
-[sdk-cargo]: https://github.com/zyycn/codex-proxy-rs/blob/f174320e2ac8987578146d4684e69ad196db0286/backend/crates/gateway-plugin/sdk/Cargo.toml
+[host-compat]: https://github.com/zyycn/codex-proxy-rs/blob/705f0fad06667ad6aaf0ea162a869d2d3cfe39c2/backend/crates/gateway-plugin/runtime/plugin-host-compatibility.json
+[sdk-cargo]: https://github.com/zyycn/codex-proxy-rs/blob/705f0fad06667ad6aaf0ea162a869d2d3cfe39c2/backend/crates/gateway-plugin/sdk/Cargo.toml
 [workbench]: https://github.com/zyycn/codex-proxy-plugins/tree/cfd37537f99f2c957639c6fa2c14d40dcb0c3368/examples/workbench
-[capabilities]: https://github.com/zyycn/codex-proxy-rs/blob/f174320e2ac8987578146d4684e69ad196db0286/backend/crates/gateway-plugin/sdk/docs/capabilities.md#洋葱中间件
-[binding]: https://github.com/zyycn/codex-proxy-rs/blob/f174320e2ac8987578146d4684e69ad196db0286/backend/crates/gateway-plugin/runtime/src/generation/configuration.rs#L35
-[manifest]: https://github.com/zyycn/codex-proxy-rs/blob/f174320e2ac8987578146d4684e69ad196db0286/backend/crates/gateway-plugin/sdk/docs/manifest.md#完整信任
-[keys]: https://github.com/zyycn/codex-proxy-rs/blob/f174320e2ac8987578146d4684e69ad196db0286/backend/crates/gateway-plugin/sdk/src/call/host.rs#L210
-[state-api]: https://github.com/zyycn/codex-proxy-rs/blob/f174320e2ac8987578146d4684e69ad196db0286/backend/crates/gateway-plugin/sdk/src/call/host.rs#L376
-[state-limits]: https://github.com/zyycn/codex-proxy-rs/blob/f174320e2ac8987578146d4684e69ad196db0286/backend/crates/gateway-plugin/sdk/src/manifest.rs#L380
-[state-schema]: https://github.com/zyycn/codex-proxy-rs/blob/f174320e2ac8987578146d4684e69ad196db0286/backend/migrations/0018_plugins.sql#L86
-[process-env]: https://github.com/zyycn/codex-proxy-rs/blob/f174320e2ac8987578146d4684e69ad196db0286/backend/crates/gateway-host/src/process.rs#L100
-[configuration]: https://github.com/zyycn/codex-proxy-rs/blob/f174320e2ac8987578146d4684e69ad196db0286/backend/crates/gateway-plugin/runtime/src/generation/configuration.rs#L85
-[backup]: https://github.com/zyycn/codex-proxy-rs/blob/f174320e2ac8987578146d4684e69ad196db0286/backend/crates/gateway-store/src/backup/pg_dump.rs#L53
-[management-types]: https://github.com/zyycn/codex-proxy-rs/blob/f174320e2ac8987578146d4684e69ad196db0286/backend/crates/gateway-plugin/sdk/src/call/management.rs#L9
-[management-contract]: https://github.com/zyycn/codex-proxy-rs/blob/f174320e2ac8987578146d4684e69ad196db0286/backend/crates/gateway-plugin/sdk/docs/capabilities.md#管理页面公开入口与-cli
-[sidebar]: https://github.com/zyycn/codex-proxy-rs/blob/f174320e2ac8987578146d4684e69ad196db0286/frontend/src/layout/components/AppSidebar.vue#L143
-[admin-auth]: https://github.com/zyycn/codex-proxy-rs/blob/f174320e2ac8987578146d4684e69ad196db0286/backend/crates/gateway-api/src/admin/plugins/management.rs#L290
-[management-runtime]: https://github.com/zyycn/codex-proxy-rs/blob/f174320e2ac8987578146d4684e69ad196db0286/backend/crates/gateway-plugin/runtime/src/adapter/management/mod.rs#L24
-[management-validation]: https://github.com/zyycn/codex-proxy-rs/blob/f174320e2ac8987578146d4684e69ad196db0286/backend/crates/gateway-plugin/runtime/src/adapter/management/mod.rs#L68
-[bridge-limit]: https://github.com/zyycn/codex-proxy-rs/blob/f174320e2ac8987578146d4684e69ad196db0286/frontend/src/views/plugins/management/bridge-contract.ts#L3
-[frame-limit]: https://github.com/zyycn/codex-proxy-rs/blob/f174320e2ac8987578146d4684e69ad196db0286/frontend/src/views/plugins/management/frame.ts#L17
+[capabilities]: https://github.com/zyycn/codex-proxy-rs/blob/705f0fad06667ad6aaf0ea162a869d2d3cfe39c2/backend/crates/gateway-plugin/sdk/docs/capabilities.md#洋葱中间件
+[binding]: https://github.com/zyycn/codex-proxy-rs/blob/705f0fad06667ad6aaf0ea162a869d2d3cfe39c2/backend/crates/gateway-plugin/runtime/src/generation/configuration.rs#L35
+[manifest]: https://github.com/zyycn/codex-proxy-rs/blob/705f0fad06667ad6aaf0ea162a869d2d3cfe39c2/backend/crates/gateway-plugin/sdk/docs/manifest.md#完整信任
+[keys]: https://github.com/zyycn/codex-proxy-rs/blob/705f0fad06667ad6aaf0ea162a869d2d3cfe39c2/backend/crates/gateway-plugin/sdk/src/call/host.rs#L213
+[state-api]: https://github.com/zyycn/codex-proxy-rs/blob/705f0fad06667ad6aaf0ea162a869d2d3cfe39c2/backend/crates/gateway-plugin/sdk/src/call/host.rs#L379
+[state-limits]: https://github.com/zyycn/codex-proxy-rs/blob/705f0fad06667ad6aaf0ea162a869d2d3cfe39c2/backend/crates/gateway-plugin/sdk/src/manifest.rs#L380
+[state-schema]: https://github.com/zyycn/codex-proxy-rs/blob/705f0fad06667ad6aaf0ea162a869d2d3cfe39c2/backend/migrations/0018_plugins.sql#L86
+[process-env]: https://github.com/zyycn/codex-proxy-rs/blob/705f0fad06667ad6aaf0ea162a869d2d3cfe39c2/backend/crates/gateway-host/src/process.rs#L100
+[configuration]: https://github.com/zyycn/codex-proxy-rs/blob/705f0fad06667ad6aaf0ea162a869d2d3cfe39c2/backend/crates/gateway-plugin/runtime/src/generation/configuration.rs#L85
+[backup]: https://github.com/zyycn/codex-proxy-rs/blob/705f0fad06667ad6aaf0ea162a869d2d3cfe39c2/backend/crates/gateway-store/src/backup/pg_dump.rs#L53
+[management-types]: https://github.com/zyycn/codex-proxy-rs/blob/705f0fad06667ad6aaf0ea162a869d2d3cfe39c2/backend/crates/gateway-plugin/sdk/src/call/management.rs#L9
+[management-contract]: https://github.com/zyycn/codex-proxy-rs/blob/705f0fad06667ad6aaf0ea162a869d2d3cfe39c2/backend/crates/gateway-plugin/sdk/docs/capabilities.md#管理页面公开入口与-cli
+[sidebar]: https://github.com/zyycn/codex-proxy-rs/blob/705f0fad06667ad6aaf0ea162a869d2d3cfe39c2/frontend/src/layout/components/AppSidebar.vue#L143
+[admin-auth]: https://github.com/zyycn/codex-proxy-rs/blob/705f0fad06667ad6aaf0ea162a869d2d3cfe39c2/backend/crates/gateway-api/src/admin/plugins/management.rs#L290
+[management-runtime]: https://github.com/zyycn/codex-proxy-rs/blob/705f0fad06667ad6aaf0ea162a869d2d3cfe39c2/backend/crates/gateway-plugin/runtime/src/adapter/management/mod.rs#L24
+[management-validation]: https://github.com/zyycn/codex-proxy-rs/blob/705f0fad06667ad6aaf0ea162a869d2d3cfe39c2/backend/crates/gateway-plugin/runtime/src/adapter/management/mod.rs#L68
+[bridge-limit]: https://github.com/zyycn/codex-proxy-rs/blob/705f0fad06667ad6aaf0ea162a869d2d3cfe39c2/frontend/src/views/plugins/management/bridge-contract.ts#L3
+[frame-limit]: https://github.com/zyycn/codex-proxy-rs/blob/705f0fad06667ad6aaf0ea162a869d2d3cfe39c2/frontend/src/views/plugins/management/frame.ts#L17
 
-[bridge-runtime]: https://github.com/zyycn/codex-proxy-rs/blob/f174320e2ac8987578146d4684e69ad196db0286/frontend/src/views/plugins/management/bridge-runtime.ts
-[request-creation]: https://github.com/zyycn/codex-proxy-rs/blob/f174320e2ac8987578146d4684e69ad196db0286/backend/crates/gateway-core/src/engine/execution.rs#L1461
-[request-storage]: https://github.com/zyycn/codex-proxy-rs/blob/f174320e2ac8987578146d4684e69ad196db0286/backend/crates/gateway-store/src/postgres/execution.rs#L1394
-[request-retention]: https://github.com/zyycn/codex-proxy-rs/blob/f174320e2ac8987578146d4684e69ad196db0286/backend/crates/gateway-store/src/postgres/retention.rs#L57
+[bridge-runtime]: https://github.com/zyycn/codex-proxy-rs/blob/705f0fad06667ad6aaf0ea162a869d2d3cfe39c2/frontend/src/views/plugins/management/bridge-runtime.ts
+[request-creation]: https://github.com/zyycn/codex-proxy-rs/blob/705f0fad06667ad6aaf0ea162a869d2d3cfe39c2/backend/crates/gateway-core/src/engine/execution/service.rs#L808
+[request-storage]: https://github.com/zyycn/codex-proxy-rs/blob/705f0fad06667ad6aaf0ea162a869d2d3cfe39c2/backend/crates/gateway-store/src/postgres/execution/request_observation.rs#L19
+[request-retention]: https://github.com/zyycn/codex-proxy-rs/blob/705f0fad06667ad6aaf0ea162a869d2d3cfe39c2/backend/crates/gateway-store/src/postgres/retention.rs#L57

@@ -157,9 +157,17 @@ Codex 允许向 active turn 追加输入并返回同一个 turn ID，因此不�
 
 SDK `inspect_frames` 的观察闭包是同步 `FnMut`，且随下游 Credit 拉取正文；只能观察实际被消费的帧，不能据此承诺取得完整输出或独立的 EOF 通知。观察适配层负责提取文本与协议事件，持久化执行方式由 implementer 决定，不能直接在该闭包里假设可 `await` 数据库写入。后续请求若携带更完整的历史，可以为新的审计输入提供上下文，但不改写旧快照。[帧观察合同][inspect-frames]
 
-[http-entry]: https://github.com/zyycn/codex-proxy-rs/blob/f174320e2ac8987578146d4684e69ad196db0286/backend/crates/gateway-api/src/openai/responses/http.rs#L72
-[execution]: https://github.com/zyycn/codex-proxy-rs/blob/f174320e2ac8987578146d4684e69ad196db0286/backend/crates/gateway-core/src/engine/execution.rs#L962
-[ws-entry]: https://github.com/zyycn/codex-proxy-rs/blob/f174320e2ac8987578146d4684e69ad196db0286/backend/crates/gateway-api/src/openai/responses/websocket/mod.rs#L218
+插件使用容量 64 的进程内写入队列和一个异步 worker。输入在调用 `next` 前入队，最多等待 2 秒确认；每次写入也有 2 秒总期限，数据库语句与锁分别限制为 1.5 秒和 1 秒。输入、固定上文与去重状态在同一事务提交，按 Key／会话范围的数据库事务锁串行识别；已确定身份另有数据库唯一索引。不同插件进程也遵守这些约束，重启后读取已持久化的身份和状态。没有可靠身份的观察仍允许重复，不把不确定性提升为唯一约束。
+
+数据库不可用、写入超时或队列满时，采集记入不含正文和凭据的 stderr 诊断，模型请求继续透传；没有磁盘缓冲或自动重放。输入确认超时后，事务可能已提交，但该次响应不再注册续接观察。同步响应观察器只合并实际消费到的文本，在协议完成或观察器释放时尝试入队；取消、后续插件不消费正文或队列满可能使续接状态缺失，不能视为完整输出。明确前驱缺失时只使用下次请求实际携带的历史。输入和旧快照不依赖响应落库成功。
+
+有限状态每个范围保留最多 256 个顺序锚点、64 个协议响应和各自的 12 条／32,000 码点窗口，完整历史的长度与滚动摘要只用于证明有序重传的位置。状态按 7 天不活跃期和最近 10,000 个范围裁剪，启动后及每分钟／64 次写入执行清理；期间最多增加一个清理批次。裁剪不会删除独立审计事实或数据库身份约束，但窗口外缺少可靠位置时可能形成新的不确定观察。Key 目录每分钟按需分页刷新，整次刷新限 1 秒；失败或不完整时保留上一目录，不推断 Key 删除。
+
+启动必须在 4 秒内完成连接、审计迁移和游标签名密钥读取，否则进程退出，配置为 `failurePolicy: delegate` 的 middleware binding 继续原请求。正常 SDK 关闭或 SIGTERM／Ctrl+C 后尽力排空队列，插件最多等待 5 秒；宿主自身的 2 秒关闭宽限可能更早强制终止插件。强杀、进程崩溃和关机可能丢失所有尚未提交的队列项或响应续接状态；已提交的输入和固定上文保留。请求正文超过 16 MiB 的插件采集上限时不建档，不截短本条输入；响应解析缓冲上限为 2 MiB，超限只能保留此前实际观察到的有限文本。上述边界不提供持久审计队列或保证完整输出的承诺。
+
+[http-entry]: https://github.com/zyycn/codex-proxy-rs/blob/705f0fad06667ad6aaf0ea162a869d2d3cfe39c2/backend/crates/gateway-api/src/openai/responses/http.rs#L72
+[execution]: https://github.com/zyycn/codex-proxy-rs/blob/705f0fad06667ad6aaf0ea162a869d2d3cfe39c2/backend/crates/gateway-core/src/engine/execution/service.rs#L306
+[ws-entry]: https://github.com/zyycn/codex-proxy-rs/blob/705f0fad06667ad6aaf0ea162a869d2d3cfe39c2/backend/crates/gateway-api/src/openai/responses/websocket/mod.rs#L324
 [incremental]: https://github.com/openai/codex/blob/d27764b82f7118f674371e6d6e76271d9d606edb/codex-rs/core/src/client.rs#L1994
 [metadata]: https://github.com/openai/codex/blob/d27764b82f7118f674371e6d6e76271d9d606edb/codex-rs/core/src/responses_metadata.rs#L225
 [subagent]: https://github.com/openai/codex/blob/d27764b82f7118f674371e6d6e76271d9d606edb/codex-rs/core/src/responses_metadata.rs#L458
@@ -176,10 +184,10 @@ SDK `inspect_frames` 的观察闭包是同步 `FnMut`，且随下游 Credit 拉�
 [cache-key]: https://github.com/openai/codex/blob/d27764b82f7118f674371e6d6e76271d9d606edb/codex-rs/core/src/client.rs#L575
 [input-preparation]: https://github.com/openai/codex/blob/d27764b82f7118f674371e6d6e76271d9d606edb/codex-rs/core/src/client.rs#L940
 [steering]: https://github.com/openai/codex/blob/d27764b82f7118f674371e6d6e76271d9d606edb/codex-rs/core/src/session/turn_input.rs#L641
-[ws-response]: https://github.com/zyycn/codex-proxy-rs/blob/f174320e2ac8987578146d4684e69ad196db0286/backend/crates/gateway-api/src/openai/responses/websocket/forward.rs#L475
-[ws-outgoing]: https://github.com/zyycn/codex-proxy-rs/blob/f174320e2ac8987578146d4684e69ad196db0286/backend/crates/gateway-api/src/openai/responses/websocket/connection/mod.rs#L730
-[response-handle]: https://github.com/zyycn/codex-proxy-rs/blob/f174320e2ac8987578146d4684e69ad196db0286/backend/crates/gateway-plugin/sdk/src/call/middleware/mod.rs#L148
-[inspect-frames]: https://github.com/zyycn/codex-proxy-rs/blob/f174320e2ac8987578146d4684e69ad196db0286/backend/crates/gateway-plugin/sdk/src/client/middleware/body.rs#L160
+[ws-response]: https://github.com/zyycn/codex-proxy-rs/blob/705f0fad06667ad6aaf0ea162a869d2d3cfe39c2/backend/crates/gateway-api/src/openai/responses/websocket/forward.rs#L473
+[ws-outgoing]: https://github.com/zyycn/codex-proxy-rs/blob/705f0fad06667ad6aaf0ea162a869d2d3cfe39c2/backend/crates/gateway-api/src/openai/responses/websocket/connection/pump.rs#L160
+[response-handle]: https://github.com/zyycn/codex-proxy-rs/blob/705f0fad06667ad6aaf0ea162a869d2d3cfe39c2/backend/crates/gateway-plugin/sdk/src/call/middleware/mod.rs#L148
+[inspect-frames]: https://github.com/zyycn/codex-proxy-rs/blob/705f0fad06667ad6aaf0ea162a869d2d3cfe39c2/backend/crates/gateway-plugin/sdk/src/client/middleware/body.rs#L160
 [workspace-fields]: https://github.com/openai/codex/blob/d27764b82f7118f674371e6d6e76271d9d606edb/codex-rs/core/src/responses_metadata.rs#L187
 [git-enrichment]: https://github.com/openai/codex/blob/d27764b82f7118f674371e6d6e76271d9d606edb/codex-rs/core/src/turn_metadata.rs#L481
 [message-metadata]: https://github.com/openai/codex/blob/d27764b82f7118f674371e6d6e76271d9d606edb/codex-rs/protocol/src/models.rs#L960

@@ -23,7 +23,10 @@ test('dense search, historical Key selection, cursor pages, and plugin-only navi
   await ui.getByRole('option').filter({ hasText: 'ck_platform' }).click();
   await search(ui, '数据库');
   await expect(ui.locator('tbody tr').first().locator('mark')).toHaveText('数据库');
-  for (const row of await ui.locator('tbody tr').all()) await expect(row.locator('.key-cell')).toContainText('ck_platform');
+  for (const row of await ui.locator('tbody tr').all()) {
+    await expect(row.locator('.key-cell')).toHaveText('平台工程');
+    await expect(row.locator('.key-cell')).toHaveAttribute('title', '平台工程');
+  }
   await ui.locator('[data-audit]').first().click();
   await expect(ui.locator('.input-card .body-text')).toContainText('数据库');
   await expect(ui.getByRole('button', { name: '复制审计 ID' })).toBeVisible();

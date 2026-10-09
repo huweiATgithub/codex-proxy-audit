@@ -3,18 +3,23 @@ import { readFileSync } from 'node:fs';
 import { parseArgs } from 'node:util';
 import { resolveTheme, DEFAULT_THEME_COLOR, DEFAULT_CUSTOM_THEME_COLOR } from '@codex-proxy/ui/theme';
 import { createDemoService } from './service.js';
-import { audits } from './fixtures.js';
+import { audits, keys, modelRequests } from './fixtures.js';
 
 const { values } = parseArgs({ options: {
   host: { type: 'string', default: '0.0.0.0' }, port: { type: 'string', default: '4173' },
   'time-zone': { type: 'string', default: 'Asia/Shanghai' },
+  fixtures: { type: 'string' },
 } });
 const port = Number(values.port);
 if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid port');
 const now = process.env.AUDIT_DEMO_NOW ? () => new Date(process.env.AUDIT_DEMO_NOW) : () => new Date();
+const fixtures = values.fixtures ? JSON.parse(readFileSync(values.fixtures, 'utf8')) : { audits, keys, modelRequests };
+if (!['audits', 'keys', 'modelRequests'].every((name) => Array.isArray(fixtures[name])) || !fixtures.audits.length) {
+  throw new Error('Fixture file must contain audits, keys, and modelRequests arrays with at least one audit');
+}
 // Move fixtures together so the newest input is available on the server's current day.
-const shift = now().getTime() - Math.max(...audits.map((audit) => Date.parse(audit.firstObservedAt)));
-const handle = createDemoService({ timeZone: values['time-zone'], now, audits: audits.map((audit) => ({
+const shift = now().getTime() - Math.max(...fixtures.audits.map((audit) => Date.parse(audit.firstObservedAt)));
+const handle = createDemoService({ ...fixtures, timeZone: values['time-zone'], now, audits: fixtures.audits.map((audit) => ({
   ...audit, firstObservedAt: new Date(Date.parse(audit.firstObservedAt) + shift).toISOString(),
 })) });
 const directory = new URL('../dist/plugin/', import.meta.url);

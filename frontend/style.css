@@ -48,8 +48,6 @@ main { display: flex; flex-direction: column; flex: 1; min-height: 0; padding: 1
 .time-heading { display: inline-flex; align-items: center; gap: 5px; }
 .key-cell { display: flex; gap: 9px; align-items: baseline; min-width: 0; overflow: hidden; white-space: nowrap; }
 .key-name { overflow: hidden; text-overflow: ellipsis; }
-.key-id { color: var(--cp-color-text-tertiary); font-size: 10px; }
-.compact-columns .key-id { display: none; }
 .record-preview { scroll-margin-top: 36px; display: block; width: 100%; padding: 0; border: 0; background: transparent; text-align: left; color: var(--cp-color-text); line-height: 20px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .record-preview[aria-expanded="true"] { color: var(--cp-color-primary-text); font-weight: 600; }
 .detail-panel { display: flex; flex-direction: column; outline: none; }

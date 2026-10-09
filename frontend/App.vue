@@ -126,7 +126,7 @@ onUnmounted(() => {
           <BaseTable v-else class="audit-table" :loading="list.kind === 'loading'" :columns="columns" :rows="items" row-key="id" density="compact" :selected-row-keys="selectedId ? [selectedId] : []" :sort="{ key: 'recordedAt', direction: 'desc' }" show-header-when-empty @click="rowClick">
             <template #header-recordedAt><span class="time-heading" title="网关记录这条输入的时间；后续重复请求不更新时间。">记录时间<ArrowDownWideNarrow :size="13" /></span></template>
             <template #recordedAt="{ row }"><time :datetime="row.recordedAt" :title="viewContext.timeZone">{{ row.recordedAtDisplay }}</time></template>
-            <template #keyName="{ row }"><span class="key-cell" :title="`${row.keyName || '名称未知'} · ${row.keyId}`"><span class="key-name">{{ row.keyName || '名称未知' }}</span><code class="key-id">{{ row.keyId }}</code></span></template>
+            <template #keyName="{ row }"><span class="key-cell" :title="row.keyName || '名称未知'"><span class="key-name">{{ row.keyName || '名称未知' }}</span></span></template>
             <template #preview="{ row }"><button class="record-preview" :data-audit="row.id" type="button" :aria-label="`审阅 ${row.id}：${row.preview.slice(0, 100)}`" :aria-expanded="row.id === selectedId" :title="row.preview.slice(0, 800)" @click="selectRecord(row.id)"><HighlightedText :text="row.preview" :query="query.q" /></button></template>
             <template #empty><div class="empty-state"><Search :size="24" /><h2>没有匹配的输入</h2><p>试试更换关键词，或放宽日期和 Key 筛选。</p><BaseButton size="sm" @click="resetFilters">清除筛选</BaseButton></div></template>
           </BaseTable>

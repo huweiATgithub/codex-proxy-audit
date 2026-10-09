@@ -9,6 +9,8 @@
   "scripts": {
     "demo": "npm run build && node demo/server.js",
     "build": "vite build && node scripts/check-build.js",
+    "plugin:build": "npm run build && cargo build --manifest-path backend/Cargo.toml --locked --release",
+    "plugin:package": "node scripts/package-plugin.js",
     "preview": "node demo/server.js",
     "contract:export": "node scripts/export-contract.js",
     "contract:check": "node scripts/export-contract.js --check",
