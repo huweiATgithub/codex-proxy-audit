@@ -1,0 +1,187 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { createDemoService } from '../demo/service.js';
+import { createAuditClient, AuditError } from '../frontend/api/client.js';
+import { appendContent } from '../frontend/api/content.js';
+import { audits } from '../demo/fixtures.js';
+import { CONTENT_CHARACTERS, MAX_RESPONSE_BYTES, parseQuery } from '../contracts/audit.js';
+
+const reply = (value, status = 200) => ({ status, contentType: 'application/json; charset=utf-8', body: new TextEncoder().encode(JSON.stringify(value)).buffer });
+const bridge = (service) => ({ version: 2, async request({ method, path, query }) {
+  assert.equal(method, 'GET'); assert.ok(!path.startsWith('/')); assert.ok(!query.startsWith('?'));
+  const result = service(path, new URLSearchParams(query));
+  const response = reply(result.value, result.status);
+  assert.ok(response.body.byteLength <= MAX_RESPONSE_BYTES);
+  return response;
+} });
+const client = createAuditClient(bridge(createDemoService()));
+
+// A backend can return fewer than the requested number without ending a page chain.
+test('cursor traversal covers variable-size pages once, and binds every filter', async () => {
+  const api = createAuditClient(bridge(createDemoService({ maxListRows: 7, timeZone: 'America/New_York' })));
+  const query = { from: '2026-10-08', to: '2026-10-08', key: 'ck_platform', q: '数据库', limit: '50' };
+  const first = await api.list(query);
+  assert.equal(first.items.length, 7);
+  assert.ok(first.nextCursor);
+  assert.ok(first.items.every((item) => !('input' in item) && !('context' in item) && item.preview.includes('数据库')));
+  const ids = first.items.map((item) => item.id);
+  let cursor = first.nextCursor;
+  while (cursor) { const page = await api.list({ ...query, cursor }); ids.push(...page.items.map((item) => item.id)); cursor = page.nextCursor; }
+  assert.equal(ids.length, first.total);
+  assert.equal(new Set(ids).size, ids.length);
+  await assert.rejects(api.list({ ...query, q: 'CI', cursor: first.nextCursor }), (error) => error.code === 'invalid_cursor');
+  await assert.rejects(api.list({ ...query, cursor: 'malformed' }), (error) => error.code === 'invalid_cursor');
+});
+
+test('search is literal, ASCII-insensitive, covers full input, and excludes context', async () => {
+  assert.equal((await client.list({ q: '我会先核对现有实现与约束' })).total, 0);
+  assert.equal((await client.list({ q: '[.*]' })).total, 0);
+  const upper = await client.list({ q: 'API' }), lower = await client.list({ q: 'api' });
+  assert.equal(upper.total, lower.total);
+  const base = audits.find((audit) => audit.id === 'PA-0009');
+  const extra = { ...base, id: 'tail-record', input: [{ kind: 'text', text: '前'.repeat(4000) + 'SQL 100% _ \\ literal' }] };
+  const api = createAuditClient(bridge(createDemoService({ audits: [extra] })));
+  const result = await api.list({ q: '100% _ \\' });
+  assert.equal(result.total, 1); assert.match(result.items[0].preview, /100% _/); assert.ok(Array.from(result.items[0].preview).length <= 400);
+});
+
+test('local inclusive dates retain both DST repeated hours and sort by the instant', async () => {
+  const source = audits[0];
+  const records = [
+    { ...source, id: 'before', firstObservedAt: '2026-11-01T03:59:59Z' },
+    { ...source, id: 'first-hour', firstObservedAt: '2026-11-01T01:50:00-04:00' },
+    { ...source, id: 'second-hour', firstObservedAt: '2026-11-01T01:10:00-05:00' },
+    { ...source, id: 'end', firstObservedAt: '2026-11-02T04:59:59Z' },
+    { ...source, id: 'after', firstObservedAt: '2026-11-02T05:00:00Z' },
+  ];
+  const api = createAuditClient(bridge(createDemoService({ audits: records, timeZone: 'America/New_York' })));
+  assert.deepEqual((await api.list({ from: '2026-11-01', to: '2026-11-01' })).items.map((item) => item.id), ['end', 'second-hour', 'first-hour']);
+  await assert.rejects(api.list({ from: '2026-11-02', to: '2026-11-01' }), (error) => error.code === 'invalid_query');
+});
+
+test('host timezone owns default date, display text, date filtering and cursor scope', async () => {
+  const records = [{ ...audits[0], firstObservedAt: '2026-10-08T18:42:18.000Z' }];
+  for (const [timeZone, today, display] of [
+    ['Asia/Shanghai', '2026-10-09', '2026-10-09 02:42:18'],
+    ['Asia/Kathmandu', '2026-10-09', '2026-10-09 00:27:18'],
+    ['America/New_York', '2026-10-08', '2026-10-08 14:42:18'],
+    ['UTC', '2026-10-08', '2026-10-08 18:42:18'],
+  ]) {
+    const api = createAuditClient(bridge(createDemoService({ audits: records, timeZone, now: () => new Date('2026-10-08T19:00:00Z') })));
+    assert.deepEqual(await api.viewContext(), { timeZone, today });
+    const page = await api.list({ from: today, to: today });
+    assert.equal(page.total, 1);
+    assert.equal(page.items[0].recordedAtDisplay, display);
+    assert.equal((await api.detail(records[0].id)).recordedAtDisplay, display);
+    assert.equal(page.items[0].recordedAt, '2026-10-08T18:42:18.000Z');
+    const otherDate = today === '2026-10-08' ? '2026-10-09' : '2026-10-08';
+    assert.equal((await api.list({ from: otherDate, to: otherDate })).total, 0);
+    await assert.rejects(api.list({ timeZone: 'UTC' }), (error) => error.code === 'invalid_query');
+  }
+  const shanghai = createAuditClient(bridge(createDemoService({ timeZone: 'Asia/Shanghai' })));
+  const utc = createAuditClient(bridge(createDemoService({ timeZone: 'UTC' })));
+  const first = await shanghai.list({});
+  await assert.rejects(utc.list({ cursor: first.nextCursor }), (error) => error.code === 'invalid_cursor');
+});
+
+test('chunk traversal preserves code points, block order, and metadata independently', async () => {
+  const original = [{ kind: 'text', text: '😀界'.repeat(1000) }, { kind: 'nontext', mediaType: '图片', description: '说明' }, { kind: 'text', text: '' }, { kind: 'text', text: 'END' }];
+  const api = createAuditClient(bridge(createDemoService({ audits: [{ ...audits[0], input: original }] })));
+  const detail = await api.detail(audits[0].id);
+  assert.ok(!JSON.stringify(detail).includes('😀'));
+  assert.equal(detail.threadId, 'thread_web_01'); assert.equal(detail.sessionId, 'session_demo_web_01');
+  let result = { blocks: [], nextCursor: null }, requests = 0;
+  do {
+    const page = await api.content(detail.id, detail.input.id, result.nextCursor);
+    assert.ok(page.blocks.reduce((count, block) => count + (block.kind === 'text' ? Array.from(block.text).length : 0), 0) <= CONTENT_CHARACTERS);
+    result = appendContent(result.blocks, page, detail.input); requests++;
+  } while (result.nextCursor);
+  assert.equal(requests, 2);
+  assert.deepEqual(result.blocks.map(({ kind, text, mediaType, description }) => kind === 'text' ? { kind, text } : { kind, mediaType, description }), original);
+  assert.equal(result.characterCount, 2003);
+  const first = await api.content(detail.id, detail.input.id);
+  await assert.rejects(api.content(detail.id, detail.context[0].content.id, first.nextCursor), (error) => error.code === 'invalid_cursor');
+  await assert.rejects(api.content(detail.id, 'missing'), (error) => error.code === 'not_found');
+});
+
+test('detail preserves message metadata and joins host facts by request and Key without retaining a copy', async () => {
+  const record = { ...audits[0], turnId: 'message-turn', input: [
+    { kind: 'text', text: 'answer', inputKind: 'user.answered_question' },
+    { kind: 'nontext', mediaType: '图片', inputKind: 'future.user_annotation' },
+    { kind: 'text', text: 'unclassified' },
+  ] };
+  const host = { id: record.requestId, keyId: record.keyId, userAgent: 'client/1.0', model: 'requested-model', reasoningEffort: 'high' };
+  const modelRequests = [{ ...host, keyId: 'another-key', model: 'wrong-key-model' }, host];
+  const api = createAuditClient(bridge(createDemoService({ audits: [record], modelRequests })));
+  const detail = await api.detail(record.id);
+  assert.equal(detail.turnId, 'message-turn');
+  assert.deepEqual(detail.inputKinds, ['user.answered_question', 'future.user_annotation', null]);
+  assert.deepEqual(detail.repositories, record.repositories);
+  assert.deepEqual(detail.requestMetadata, { userAgent: 'client/1.0', model: 'requested-model', reasoningEffort: 'high' });
+  // Purging the matching host row leaves the audit and its content readable.
+  modelRequests.splice(1, 1);
+  const after = await api.detail(record.id);
+  assert.equal(after.requestMetadata, null);
+  assert.deepEqual(after.input, detail.input); assert.deepEqual(after.repositories, detail.repositories);
+  assert.equal((await api.content(record.id, detail.input.id)).blocks[0].text, 'answer');
+  assert.equal((await api.list({})).total, 1);
+  const missing = await createAuditClient(bridge(createDemoService({ audits: [{ ...record, turnId: null, repositories: null }] }))).detail(record.id);
+  assert.equal(missing.turnId, null); assert.equal(missing.repositories, null);
+  const bad = { ...detail, inputKinds: ['user.text'] };
+  await assert.rejects(createAuditClient({ version: 2, request: async () => reply(bad) }).detail(record.id), (error) => error.code === 'invalid_response');
+});
+
+test('content rejects overlaps, gaps, changed totals, and a false end', () => {
+  const descriptor = { id: 'input', blockCount: 1, characterCount: 4 };
+  const partial = appendContent([], { blocks: [{ kind: 'text', index: 0, offset: 0, text: 'ab', totalCharacters: 4 }], nextCursor: 'next' }, descriptor);
+  for (const segment of [
+    { index: 0, offset: 1, text: 'cd', totalCharacters: 4 },
+    { index: 1, offset: 0, text: 'cd', totalCharacters: 4 },
+    { index: 0, offset: 2, text: 'cd', totalCharacters: 5 },
+  ]) assert.throws(() => appendContent(partial.blocks, { blocks: [{ kind: 'text', ...segment }], nextCursor: null }, descriptor), AuditError);
+  assert.throws(() => appendContent(partial.blocks, { blocks: [], nextCursor: null }, descriptor), AuditError);
+  assert.equal(partial.blocks[0].text, 'ab');
+  assert.throws(() => appendContent([], { blocks: [{ kind: 'text', index: 0, offset: 0, text: '', totalCharacters: 4 }], nextCursor: 'next' }, descriptor), AuditError);
+  assert.throws(() => appendContent([], { blocks: [{ kind: 'text', index: 0, offset: 0, text: 'ab', totalCharacters: 5 }], nextCursor: 'next' }, descriptor), AuditError);
+});
+
+test('Key pages preserve IDs and historical names; invalid and repeated params fail', async () => {
+  const api = createAuditClient(bridge(createDemoService({ keyPageSize: 1 })));
+  const keys = []; let cursor;
+  do { const page = await api.keys(cursor); keys.push(...page.items); cursor = page.nextCursor; } while (cursor);
+  assert.equal(keys.length, 4);
+  assert.deepEqual(keys.find((key) => key.id === 'ck_platform').names, ['平台工程', 'Web Platform']);
+  assert.ok(keys.find((key) => key.id === 'ck_legacy').historical);
+  const largeKeys = Array.from({ length: 30 }, (_, index) => ({ id: `key-${String(index).padStart(2, '0')}`, names: Array.from({ length: 32 }, (_, name) => String(name) + '界'.repeat(500)) }));
+  const largePage = await createAuditClient(bridge(createDemoService({ keys: largeKeys }))).keys();
+  assert.ok(largePage.items.length > 0 && largePage.items.length < 30 && largePage.nextCursor);
+  for (const value of ['q=x&q=y', 'unknown=1', 'from=2026-02-30', 'limit=3', 'q=' + '😀'.repeat(201)]) assert.throws(() => parseQuery('audits', new URLSearchParams(value)));
+  assert.equal(parseQuery('audits', new URLSearchParams({ q: '😀'.repeat(200) })).q.length, 400);
+});
+
+test('bridge responses are parsed before use; malformed and unauthorized replies are distinct', async () => {
+  const invalid = [
+    { status: 200, contentType: 'text/html', body: new ArrayBuffer(0) },
+    { status: 200, contentType: 'application/json', body: new TextEncoder().encode('bad json').buffer },
+    reply({ items: [], total: 0, nextCursor: 'not-progressing' }),
+    reply({ items: [], total: '0', nextCursor: null }),
+    { status: 200, contentType: 'application/json', body: new ArrayBuffer(MAX_RESPONSE_BYTES + 1) },
+  ];
+  for (const response of invalid) await assert.rejects(createAuditClient({ version: 2, request: async () => response }).list({}), (error) => error.code === 'invalid_response');
+  await assert.rejects(createAuditClient({ version: 2, request: async () => ({ status: 401 }) }).list({}), (error) => error.code === 'unauthorized');
+  await assert.rejects(createAuditClient(undefined).list({}), (error) => error.code === 'host_missing');
+});
+
+test('shared request queue bounds concurrency and skips abandoned queued reads', async () => {
+  let active = 0, maximum = 0, count = 0;
+  const api = createAuditClient({ version: 2, async request() {
+    count++; active++; maximum = Math.max(maximum, active);
+    await new Promise((resolve) => setTimeout(resolve, 8)); active--;
+    return reply({ items: [], total: 0, nextCursor: null });
+  } });
+  const abort = new AbortController();
+  const running = Array.from({ length: 10 }, (_, index) => api.list({}, index === 9 ? abort.signal : undefined));
+  abort.abort();
+  const results = await Promise.allSettled(running);
+  assert.equal(maximum, 4); assert.equal(count, 9); assert.equal(results[9].reason.name, 'AbortError');
+});

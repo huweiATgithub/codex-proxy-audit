@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Prompt 审计 · 插件 Demo</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body { display: flex; flex-direction: column; font: 12px system-ui, sans-serif; color: var(--cp-color-text, #334155); background: var(--cp-color-bg-layout, #f8fafc); }
+    header { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 7px 16px; border-bottom: 1px solid var(--cp-color-border-secondary, #e2e8f0); }
+    button { font: inherit; color: inherit; background: var(--cp-color-bg-container, white); border: 1px solid var(--cp-color-border-secondary, #e2e8f0); border-radius: 5px; padding: 4px 10px; cursor: pointer; }
+    iframe { display: block; width: 100%; flex: 1; min-height: 0; border: 0; }
+    #error { padding: 24px; }
+  </style>
+</head>
+<body>
+  <header><span>Demo · 模拟宿主 · 500 条虚构输入</span><button id="theme" type="button">切换深色主题</button></header>
+  <iframe title="Prompt 审计插件" sandbox="allow-scripts"></iframe>
+  <p id="error" role="alert" hidden></p>
+  <script type="module" src="/shell.js"></script>
+</body>
+</html>
