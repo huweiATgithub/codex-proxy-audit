@@ -37,11 +37,11 @@ flowchart LR
 
 | 来源 | 核实基线 | 用途 |
 | --- | --- | --- |
-| Codex Proxy RS upstream（zyycn/codex-proxy-rs） | `v3.23.0`，`389dc63633a3b24c5b40b0002901371820bc6998` | 目标宿主与 SDK 合同 |
+| Codex Proxy RS upstream（zyycn/codex-proxy-rs） | `v3.23.0`，`389dc63633a3b24c5b40b0002901371820bc6998` | 宿主与 SDK 合同的固定源码基线 |
 | 官方 Codex | `0.160.1`，`d27764b82f7118f674371e6d6e76271d9d606edb` | 输入结构、子代理来源、增量请求及 turn 行为 |
 | codex-proxy-plugins | `cfd37537f99f2c957639c6fa2c14d40dcb0c3368` | 独立插件组织方式与管理页面示例 |
 
-目标宿主支持 manifest v2、进程协议 v2、middleware v4 和 management v1。插件使用 upstream 仓库的 Rust `gateway-plugin-sdk`，Git 依赖固定到上表宿主提交。SDK 当前标记为 `0.1.0`，不能仅凭这个版本号表达兼容性。[宿主兼容表][host-compat]、[SDK 清单][sdk-cargo]
+宿主兼容声明为 `~3.23.0`，接受稳定版 `>=3.23.0, <3.24.0`。目标宿主合同为 manifest v2、进程协议 v2、middleware v4 和 management v1。插件使用 upstream 仓库的 Rust `gateway-plugin-sdk`，Git 依赖固定到上表宿主提交。SDK 当前标记为 `0.1.0`，不能仅凭这个版本号表达兼容性。[宿主兼容表][host-compat]、[SDK 清单][sdk-cargo]
 
 用户提供的 [workbench 示例][workbench] 可以作为工程入口参考，但它使用 middleware v3 及较早的 SDK Git revision。新插件使用 v4 时，应同时选择支持 v4 的 SDK，不能只修改 manifest 的能力版本。
 
@@ -82,7 +82,7 @@ Client Key 代表网关凭据的归属。多人共享一个 Key 时，插件不�
 
 宿主启动插件时执行 `env_clear()`，插件不能假设自动继承宿主的 `DATABASE_URL`。普通 configuration 不允许携带声明为 secret 的字段。插件日志和管理 API 不回显连接串。[进程环境][process-env]、[配置合并][configuration]
 
-独立角色拥有审计 schema 所需的权限，并额外取得宿主只读视图 `public.model_request_observations` 的 `id`、`client_api_key_ref`、`user_agent`、`requested_model_id`、`reasoning_effort` 五列的只读权限，用于详情关联。在 v3.23.0 中，该视图按宿主迁移 `0025_request_observation.sql` 从 `model_requests.request_observation_json` 投影 UA 与推理强度；插件不读取完整 JSON 或其他列。这个窄范围依赖固定到 §2 的宿主基线；升级时核对列与语义，不扩展为任意宿主表访问。当前 SDK 没有读取既有请求记录的接口，此处使用后端独立 PG 连接，不借用管理员凭据调用宿主 HTTP API。
+独立角色拥有审计 schema 所需的权限，并额外取得宿主只读视图 `public.model_request_observations` 的 `id`、`client_api_key_ref`、`user_agent`、`requested_model_id`、`reasoning_effort` 五列的只读权限，用于详情关联。在 v3.23.0 中，该视图按宿主迁移 `0025_request_observation.sql` 从 `model_requests.request_observation_json` 投影 UA 与推理强度；插件不读取完整 JSON 或其他列。这些字段与语义以 §2 的固定源码为基线；宿主升级时核对列与语义，不扩展为任意宿主表访问。当前 SDK 没有读取既有请求记录的接口，此处使用后端独立 PG 连接，不借用管理员凭据调用宿主 HTTP API。
 
 ### 4.3 逻辑数据模型
 
@@ -171,7 +171,7 @@ Client Key 代表网关凭据的归属。多人共享一个 Key 时，插件不�
 
 `from`、`to` 为 `YYYY-MM-DD`，均包含所选宿主当地日期；缺省表示该侧无界。查询不接受客户端 `timeZone` 覆盖。后端将日期转换为当地起始日边界至结束日次日起始边界的半开区间，按宿主日历规则处理跳时及重复时刻，不能固定加 24 小时。时间展示、默认日期与过滤必须使用同一有效部署时区，列表游标也绑定该时区，部署时区变化后旧游标不能复用。起始日期晚于结束日期、无效日期、重复参数、未知参数均返回 `400 invalid_query`。
 
-后端接入前置条件：固定的宿主 v3.23.0 管理页桥与插件 SDK 尚未提供部署时区读取能力；`settings.load` 中的 `request_location.timezone` 不代表系统时区。安装本仓库的[宿主补丁](../host-patches/v3.23.0-deployment-context.patch)后，通用只读回调 `host.deployment_context` 接受 `{}` 与空 payload，返回 `{time_zone, maximum_buffered_body_bytes}` 与空 payload。时区由启动组合根注入已解析的有效 `host.timezone`，预算取自有效 Runtime `RpcLimits`；不接收插件覆盖值，缺少接入时返回错误。插件在管理查询时读取该合同，执行时间投影与过滤，并将响应字节预算取为返回上限与 512 KiB 的较小值；不能额外维护时区或宿主预算配置。此补丁只提供宿主事实，不包含审计策略、数据库或专属页面逻辑；未安装补丁的宿主不满足正式后端接入条件，Demo 仅模拟这些事实。
+后端接入前置条件：宿主 v3.23.0／v3.23.1 管理页桥与插件 SDK 尚未提供部署时区读取能力；`settings.load` 中的 `request_location.timezone` 不代表系统时区。安装本仓库的[宿主补丁](../host-patches/v3.23.0-deployment-context.patch)后，通用只读回调 `host.deployment_context` 接受 `{}` 与空 payload，返回 `{time_zone, maximum_buffered_body_bytes}` 与空 payload。时区由启动组合根注入已解析的有效 `host.timezone`，预算取自有效 Runtime `RpcLimits`；不接收插件覆盖值，缺少接入时返回错误。插件在管理查询时读取该合同，执行时间投影与过滤，并将响应字节预算取为返回上限与 512 KiB 的较小值；不能额外维护时区或宿主预算配置。此补丁只提供宿主事实，不包含审计策略、数据库或专属页面逻辑；未安装补丁的宿主不满足正式后端接入条件，Demo 仅模拟这些事实。
 
 `key` 精确匹配稳定 Key ID，不匹配名称。`q` 是去除首尾空白后、最多 200 个 Unicode 码点的连续字面片段；缺省或空串不过滤。搜索对象是用户输入的文本块依次用换行连接而成的文本，不含前序对话及非文本块说明。只对 ASCII `A–Z` 忽略大小写，其他字符原样匹配；`%`、`_`、反斜杠及正则元字符均为普通字符。后端须先在完整范围内过滤再分页；`preview` 最多 400 码点，含查询词时取命中附近的原文，可加省略号，不生成摘要或 HTML。高亮由 UI 按相同匹配规则安全渲染。
 
