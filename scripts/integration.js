@@ -95,6 +95,30 @@ async function requestModel(key, input, thread, { stream = false, extra = {}, pu
 async function listCount(q, count, key) {
   return until(async () => { const page = await management('audits', { q, ...(key ? { key: key.id } : {}) }); assert.equal(page.total, count); return page; }, `audit count ${q}=${count}`);
 }
+async function withAuditTableLock(action) {
+  const transaction = spawn('docker', [...dockerArguments, 'exec', '-i', pgName, 'psql', '-X', '-qAt', '-v', 'ON_ERROR_STOP=1', '-U', pgUser, '-d', pgDatabase], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const closed = new Promise((done) => transaction.once('close', done));
+  let stderr = ''; transaction.stderr.on('data', (bytes) => { stderr += bytes; });
+  transaction.stdin.on('error', () => {});
+  try {
+    await new Promise((done, reject) => {
+      let output = '';
+      const finish = (error) => { clearTimeout(timer); transaction.stdout.off('data', receive); transaction.off('error', failed); transaction.off('exit', stopped); error ? reject(error) : done(); };
+      const receive = (bytes) => { output += bytes; if (output.includes('audit-lock-ready')) finish(); };
+      const failed = (error) => finish(error), stopped = () => finish(new Error(`Audit lock transaction exited: ${stderr}`));
+      const timer = setTimeout(() => finish(new Error('Audit lock transaction did not become ready')), 20000);
+      transaction.stdout.on('data', receive); transaction.once('error', failed); transaction.once('exit', stopped);
+      transaction.stdin.write("BEGIN; SET LOCAL statement_timeout = '15s'; SET LOCAL idle_in_transaction_session_timeout = '30s'; LOCK TABLE prompt_audit.audits IN ACCESS EXCLUSIVE MODE; SELECT 'audit-lock-ready';\n");
+    });
+    await action();
+    assert.equal(transaction.exitCode, null, 'Audit table remains locked until the model request has completed');
+    assert.equal(transaction.signalCode, null);
+  } finally {
+    transaction.stdin.end('ROLLBACK;\n\\q\n');
+    const timer = setTimeout(() => transaction.kill('SIGKILL'), 3000);
+    try { await closed; } finally { clearTimeout(timer); }
+  }
+}
 async function textContent(auditId, descriptor) {
   let cursor, text = '', offset = 0;
   do {
@@ -138,41 +162,52 @@ async function run() {
   const configured = await json('/api/admin/plugins/instances', { creationId: randomUUID(), name: 'Prompt Audit integration', artifactSha256: install.data.artifact.metadata.sha256, enabled: true, configuration: {}, secrets: { databaseUrl: `postgres://${auditRole}:${auditPassword}@127.0.0.1:${pgPort}/${pgDatabase}` }, bindings: [{ contribution: install.data.artifact.metadata.contributes.middleware.id, stage: 'request', order: -1000000, failurePolicy: 'delegate' }] }, 201);
   instanceId = configured.id; await refreshView();
   const context = await management('viewContext'); assert.equal(context.timeZone, 'America/New_York'); report('installed executable plugin, isolated role and effective host.timezone RPC');
+  await management('keys');
   const first = message('integration-input-1', 'INTEGRATION-first 请拟定数据库迁移方案。😀');
   const response1 = await requestModel(key, [first], 'thread-http');
   await listCount('INTEGRATION-first', 1);
-  await requestModel(key, [first], 'thread-http', { stream: true }); await listCount('INTEGRATION-first', 1); report('HTTP JSON/SSE collection and history retransmission dedup');
+  await requestModel(key, [first], 'thread-http', { stream: true }); await listCount('INTEGRATION-first', 2); report('HTTP JSON/SSE collection records repeated requests separately');
   const next = message('integration-input-2', 'INTEGRATION-continue 请继续。');
-  await requestModel(key, [next], 'thread-http', { stream: true, extra: { previous_response_id: response1.id } });
+  const precedingAssistant = { id: 'integration-assistant-1', type: 'message', role: 'assistant', phase: 'final_answer', content: [{ type: 'output_text', text: 'Agent 方案：先检查数据库，再执行迁移。😀' }] };
+  await requestModel(key, [first, precedingAssistant, next], 'thread-http', { stream: true });
   const continued = await listCount('INTEGRATION-continue', 1), continuation = await management('audit', { id: continued.items[0].id });
   assert.equal(continuation.turnId, 'same-turn'); assert.equal(continuation.keyName, 'Integration primary');
   assert.equal(continuation.repositories[0].remotes[0].url, 'https://example.invalid/repo.git');
-  const assistant = continuation.context.find((item) => item.role === 'assistant'); assert.ok(assistant, 'explicit predecessor response contributes assistant text');
+  const assistant = continuation.context.find((item) => item.role === 'assistant'); assert.ok(assistant, 'the current request supplies its assistant context');
   assert.equal(await textContent(continuation.id, assistant.content), 'Agent 方案：先检查数据库，再执行迁移。😀');
   assert.ok(continuation.requestMetadata, 'host request metadata joins with source request and Key');
-  assert.equal(continuation.requestMetadata.model, 'gpt-5.4'); assert.equal(continuation.requestMetadata.userAgent, 'codex-audit-integration/1.0'); report('explicit predecessor context, delta/final merge and host metadata join');
+  assert.equal(continuation.requestMetadata.model, 'gpt-5.4'); assert.equal(continuation.requestMetadata.userAgent, 'codex-audit-integration/1.0'); report('current-request dialogue context and host metadata join');
+  await requestModel(key, [message('integration-delta', 'INTEGRATION-delta no reconstructed history')], 'thread-http', { extra: { previous_response_id: response1.id } });
+  const delta = await listCount('INTEGRATION-delta', 1);
+  assert.equal((await management('audit', { id: delta.items[0].id })).context.length, 0); report('incremental input keeps only the context present in its request');
   const duplicateText = message('integration-input-3', next.content[0].text);
-  await requestModel(key, [first, next, duplicateText], 'thread-http'); await listCount('INTEGRATION-continue', 2); report('two identical inputs and same-turn additions remain separate');
+  await requestModel(key, [first, next, duplicateText], 'thread-http'); await listCount('INTEGRATION-continue', 2); report('only the newest user input produces a record');
   const noId = message(undefined, 'INTEGRATION-position repeated');
-  await requestModel(key, [noId], 'thread-position'); await requestModel(key, [noId], 'thread-position'); await listCount('INTEGRATION-position', 1);
-  await requestModel(key, [noId, noId], 'thread-position'); await listCount('INTEGRATION-position', 2); report('ordered position identity distinguishes retransmission from repeated input');
+  await requestModel(key, [noId], 'thread-position'); await requestModel(key, [noId], 'thread-position'); await listCount('INTEGRATION-position', 2);
+  await requestModel(key, [noId, noId], 'thread-position'); await listCount('INTEGRATION-position', 3); report('requests without message identities are also recorded separately');
   const multi = [message('integration-multi-1', 'INTEGRATION-multi early'), { id: 'integration-between', type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Visible between two inputs' }] }, message('integration-multi-2', 'INTEGRATION-multi later')];
-  await requestModel(key, multi, 'thread-multi'); const multiples = await listCount('INTEGRATION-multi', 2);
-  const early = multiples.items.find((item) => item.preview.includes('early')), later = multiples.items.find((item) => item.preview.includes('later'));
-  assert.equal((await management('audit', { id: early.id })).context.length, 0);
+  await requestModel(key, multi, 'thread-multi'); const multiples = await listCount('INTEGRATION-multi', 1);
+  const later = multiples.items[0]; assert.ok(later.preview.includes('later'));
+  await listCount('INTEGRATION-multi early', 0);
   const laterDetail = await management('audit', { id: later.id }); assert.equal(laterDetail.context.length, 2);
-  await requestModel(key, multi, 'thread-multi'); assert.equal((await management('audit', { id: early.id })).context.length, 0); report('multiple inputs use individual immutable context boundaries');
-  await requestModel(key, [message('integration-filter', 'INTEGRATION-filter should not exist')], 'thread-filter', { purpose: { subagent_kind: 'thread_spawn' } }); await listCount('INTEGRATION-filter', 0);
-  await requestModel(key, [message('integration-auto', 'INTEGRATION-auto should not exist', 'turn', ['user.heartbeat'])], 'thread-filter'); await listCount('INTEGRATION-auto', 0);
-  await requestModel(key, [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'INTEGRATION-unknown preserved' }] }], 'thread-unknown'); await listCount('INTEGRATION-unknown', 1); report('subagent/automatic filtering and conservative unknown classification');
+  await requestModel(key, multi, 'thread-multi'); await listCount('INTEGRATION-multi', 2);
+  assert.equal((await management('audit', { id: later.id })).context.length, 2); report('one newest input per request with fixed preceding context');
+  const carriedUser = message('integration-tail-user', 'INTEGRATION-tail carried user must not be collected');
+  await requestModel(key, [carriedUser, { type: 'function_call', call_id: 'integration-tool', name: 'inspect', arguments: '{}' }, { type: 'function_call_output', call_id: 'integration-tool', output: 'done' }], 'thread-tool');
+  await requestModel(key, [carriedUser, precedingAssistant], 'thread-tool');
+  await requestModel(key, [message('integration-filter', 'INTEGRATION-filter should not exist')], 'thread-filter', { purpose: { subagent_kind: 'thread_spawn' } });
+  await requestModel(key, [message('integration-auto', 'INTEGRATION-auto should not exist', 'turn', ['user.heartbeat'])], 'thread-filter');
+  await requestModel(key, [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'INTEGRATION-unknown preserved' }] }], 'thread-unknown'); await listCount('INTEGRATION-unknown', 1);
+  await listCount('INTEGRATION-tail', 0); report('tool and assistant tails skip carried historical user inputs');
+  await listCount('INTEGRATION-filter', 0); await listCount('INTEGRATION-auto', 0); report('subagent/automatic filtering and conservative unknown classification');
   await requestModel(otherKey, [first], 'thread-http', { extra: { previous_response_id: response1.id }, expectedStatus: 403 });
   // The host checks continuation ownership after request middleware. A later
   // execution rejection does not undo an input that crossed the audit boundary.
   await listCount('INTEGRATION-first', 1, otherKey);
   await requestModel(otherKey, [first], 'thread-http');
-  const other = await listCount('INTEGRATION-first', 1, otherKey); assert.equal((await management('audit', { id: other.items[0].id })).context.length, 0);
-  await requestModel(key, [first], 'thread-isolated', { extra: { previous_response_id: response1.id } }); await listCount('INTEGRATION-first', 3); report('cross-Key and cross-thread isolation');
-  await Promise.all(Array.from({ length: 6 }, () => requestModel(key, [message('integration-concurrent', 'INTEGRATION-concurrent exactly once')], 'thread-concurrent'))); await listCount('INTEGRATION-concurrent', 1); report('database-backed concurrent established-identity dedup');
+  const other = await listCount('INTEGRATION-first', 2, otherKey); assert.equal((await management('audit', { id: other.items[0].id })).context.length, 0);
+  await requestModel(key, [first], 'thread-isolated', { extra: { previous_response_id: response1.id } }); await listCount('INTEGRATION-first', 5); report('request-stage capture includes later rejection and keeps request-local context');
+  await Promise.all(Array.from({ length: 6 }, () => requestModel(key, [message('integration-concurrent', 'INTEGRATION-concurrent request')], 'thread-concurrent'))); await listCount('INTEGRATION-concurrent', 6); report('concurrent repeated requests each produce one audit');
   // generate=false requires an upstream capable of WebSocket prewarming; the
   // HTTP-only test account intentionally cannot satisfy that transport policy.
   await json('/api/admin/accounts/import', { provider: 'openai', data: { provider: 'openai', authentication_kind: 'api_key', name: 'Integration WebSocket upstream', base_url: `${upstream.url}/v1`, api_key: 'sk-integration-websocket-only', transport: 'prefer_websocket' } }, 201);
@@ -181,14 +216,17 @@ async function run() {
   const warmup = await wsCall([message('integration-warmup', 'INTEGRATION-warmup input')], { generate: false }); await listCount('INTEGRATION-warmup', 1);
   const generated = await wsCall([], { previous_response_id: warmup.id });
   await wsCall([message('integration-ws-next', 'INTEGRATION-ws-next incremental')], { previous_response_id: generated.id });
-  const wsItems = await listCount('INTEGRATION-ws-next', 1), wsDetail = await management('audit', { id: wsItems.items[0].id }); assert.ok(wsDetail.context.some((item) => item.role === 'assistant')); ws.close(); report('real WebSocket generate=false warmup and incremental predecessor collection');
+  const wsItems = await listCount('INTEGRATION-ws-next', 1), wsDetail = await management('audit', { id: wsItems.items[0].id }); assert.equal(wsDetail.context.length, 0); ws.close(); report('real WebSocket warmup and incremental request-local collection');
   const long = 'INTEGRATION-unicode ' + '😀é汉'.repeat(900);
   await requestModel(key, [message('integration-unicode', long)], 'thread-unicode');
   const longItems = await listCount('INTEGRATION-unicode', 1), longDetail = await management('audit', { id: longItems.items[0].id }); assert.equal(await textContent(longDetail.id, longDetail.input), long); report('Unicode code point counts and contiguous lazy content segments');
-  await requestModel(key, Array.from({ length: 52 }, (_, index) => message(`integration-page-${index}`, `INTEGRATION-pagination ${index}`)), 'thread-pagination');
+  await withAuditTableLock(() => requestModel(key, [message('integration-blocked-db', 'INTEGRATION-blocked-db best effort')], 'thread-blocked-db'));
+  report('model request completes while audit database writes are blocked');
+  for (let index = 0; index < 52; index++) await requestModel(key, [message(`integration-page-${index}`, `INTEGRATION-pagination ${index}`)], 'thread-pagination');
   const cursorFirst = await listCount('integration-PAGINATION', 52);
   assert.equal(cursorFirst.items.length, 50); assert.ok(cursorFirst.nextCursor);
   await requestModel(key, [message('integration-page-late', 'INTEGRATION-pagination late insertion')], 'thread-pagination-late');
+  await listCount('integration-PAGINATION', 53);
   const cursorNext = await management('audits', { q: 'integration-PAGINATION', cursor: cursorFirst.nextCursor });
   // The reviewed contract fixes position, while total remains the current
   // complete filtered count; it deliberately promises no cross-page snapshot.
@@ -196,7 +234,8 @@ async function run() {
   assert.equal(new Set([...cursorFirst.items, ...cursorNext.items].map((item) => item.id)).size, 52);
   assert.equal((await management('audits', { q: 'different', cursor: cursorFirst.nextCursor }, 400)).error.code, 'invalid_cursor');
   report('ASCII literal body search, stable cursor position and accurate live total');
-  await requestModel(key, [message('integration-date-start', 'INTEGRATION-timezone start'), message('integration-date-end', 'INTEGRATION-timezone end')], 'thread-dates');
+  await requestModel(key, [message('integration-date-start', 'INTEGRATION-timezone start')], 'thread-dates');
+  await requestModel(key, [message('integration-date-end', 'INTEGRATION-timezone end')], 'thread-dates');
   const dated = await listCount('INTEGRATION-timezone', 2);
   for (const item of dated.items) sql(`UPDATE prompt_audit.audits SET first_observed_at = '${item.preview.endsWith(' start') ? '2026-11-01T04:00:00Z' : '2026-11-02T05:00:00Z'}'::timestamptz WHERE id = '${item.id.replaceAll("'", "''")}'`);
   const day = await management('audits', { q: 'INTEGRATION-timezone', from: '2026-11-01', to: '2026-11-01', key: key.id });
@@ -213,7 +252,7 @@ async function run() {
   await json('/api/admin/client-keys/update', { id: key.id, name: 'Integration renamed', groupIds: [], maxConcurrency: 0, requestsPerMinute: 0 });
   await json('/api/admin/client-keys/delete', { id: otherKey.id });
   await stopHost(); await startHost(); await refreshView();
-  await requestModel(key, [first], 'thread-http'); await listCount('INTEGRATION-first', 3); report('host/plugin restart retains dedup identities');
+  await requestModel(key, [first], 'thread-http'); await listCount('INTEGRATION-first', 6); report('host/plugin restart preserves history and records a repeated request');
   const historical = await management('keys');
   const renamed = historical.items.find((item) => item.id === key.id), deleted = historical.items.find((item) => item.id === otherKey.id);
   assert.ok(renamed.names.includes('Integration primary') && renamed.names.includes('Integration renamed'));
@@ -231,7 +270,7 @@ async function run() {
   await until(async () => { assert.equal(await ui.locator('#result-count').textContent(), '2 条'); }, 'real iframe body search');
   await ui.locator(`[data-audit="${continuation.id}"]`).click();
   await ui.locator('.input-card .body-text').waitFor(); assert.ok((await ui.locator('.input-card .body-text').textContent()).includes('INTEGRATION-continue'));
-  await until(async () => { assert.ok((await ui.locator('.context-section').textContent()).includes('Agent 方案：先检查数据库')); }, 'real iframe reads fixed assistant predecessor');
+  await until(async () => { assert.ok((await ui.locator('.context-section').textContent()).includes('Agent 方案：先检查数据库')); }, 'real iframe reads assistant context supplied in the request');
   assert.equal(await page.locator('iframe').getAttribute('sandbox'), 'allow-scripts');
   assert.equal(await page.locator('iframe').getAttribute('src'), null, 'host owns srcdoc assembly');
   assert.ok(requested.some((url) => url.includes('/api/api/audit-content')), 'actual host page bridge called backend content endpoint');

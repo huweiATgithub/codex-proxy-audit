@@ -1,9 +1,9 @@
-//! Real PostgreSQL contract behavior; run against an isolated host-migrated DB.
+//! 验证审计查询契约、分页和宿主元数据投影，需要隔离的宿主迁移数据库
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use codex_proxy_audit::{
-    collection::RequestObservation,
+    collection::{RequestObservation, collect},
     query::QueryService,
     store::{ObservedKey, Store},
 };
@@ -32,7 +32,6 @@ fn observation(
             .with_timezone(&Utc),
         key_name: Some("Query Test Key".into()),
         key_name_observed_at: Some(Utc::now()),
-        incremental: false,
     }
 }
 async fn ok(service: &QueryService, path: &str, pairs: &[(&str, &str)]) -> Value {
@@ -67,13 +66,14 @@ async fn pg_queries_follow_contract_and_read_host_metadata() {
     for index in 0..53 {
         let input = json!([{"id":format!("input-{index}"),"role":"user","content":format!("API request {index}: 100% _ \\ Ä 😀")}]);
         store
-            .collect_request(&observation(
+            .persist_batch(&[collect(&observation(
                 &key,
                 &Uuid::new_v4().to_string(),
                 &thread,
                 input,
                 "2026-11-01T06:30:00.000Z",
             ))
+            .unwrap()])
             .await
             .unwrap();
     }
@@ -185,17 +185,18 @@ async fn pg_queries_follow_contract_and_read_host_metadata() {
     let long_text = format!("{}TAIL MATCH\0😀{}", "前".repeat(2000), "é".repeat(2000));
     let input = json!([
         {"id":"context-user","role":"user","content":"earlier question"},
-        {"id":"context-assistant","role":"assistant","phase":"analysis","content":[{"type":"output_text","text":"private context search must not match"}]},
+        {"id":"context-assistant","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"private context search must not match"}]},
         {"id":"query-long","role":"user","internal_chat_message_metadata_passthrough":{"turn_id":"message-turn","content_item_kinds":["future.kind","future.empty","user.plain"]},"content":[{"type":"input_text","text":long_text},{"type":"input_text","text":""},{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]}
     ]);
     store
-        .collect_request(&observation(
+        .persist_batch(&[collect(&observation(
             &key,
             &request,
             &thread,
             input,
             "2026-11-01T07:00:00.000Z",
         ))
+        .unwrap()])
         .await
         .unwrap();
     let matching = ok(
@@ -238,7 +239,7 @@ async fn pg_queries_follow_contract_and_read_host_metadata() {
         json!(["future.kind", "future.empty", "user.plain"])
     );
     assert_eq!(detail["context"].as_array().unwrap().len(), 2);
-    assert_eq!(detail["context"][1]["phase"], "analysis");
+    assert_eq!(detail["context"][1]["phase"], "commentary");
     let content = detail["input"]["id"].as_str().unwrap();
     let mut cursor = None::<String>;
     let mut combined = String::new();

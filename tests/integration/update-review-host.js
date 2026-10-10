@@ -86,17 +86,20 @@ for (const resource of view.resources) {
   resourceHashes[resource.path] = digest(actual);
 }
 const first = await management('audits', { key: seed.keyId }), rows = [...first.items];
-assert.equal(first.total, fixture.expectedInputCount);
+assert.equal(first.total, seed.total);
 let cursor = first.nextCursor;
 while (cursor) { const page = await management('audits', { key: seed.keyId, cursor }); rows.push(...page.items); cursor = page.nextCursor; }
-assert.equal(rows.length, fixture.expectedInputCount);
+assert.equal(rows.length, seed.total);
+const selectedIds = seed.verifiedAuditIds ? new Set(seed.verifiedAuditIds) : null;
+const selectedRows = selectedIds ? rows.filter((row) => selectedIds.has(row.id)) : rows;
+if (selectedIds) assert.equal(selectedRows.length, fixture.expectedInputCount, 'The seeded audit batch survives update');
 async function content(detail, descriptor) {
   let state = { blocks: [], characterCount: 0, nextCursor: undefined };
   do { const page = await management('content', { id: detail.id, contentId: descriptor.id, ...(state.nextCursor ? { cursor: state.nextCursor } : {}) }); state = appendContent(state.blocks, page, descriptor); } while (state.nextCursor);
   return state.blocks.map(({ kind, text }) => ({ kind, text }));
 }
 const observations = [];
-for (const row of rows) {
+for (const row of selectedRows) {
   const detail = await management('audit', { id: row.id }), input = await content(detail, detail.input), context = [];
   for (const message of detail.context) { assert.equal(message.truncated, false); context.push({ role: message.role, phase: message.phase, blocks: await content(detail, message.content) }); }
   observations.push({ detail, input, context });

@@ -26,15 +26,24 @@ test('replay preserves message identity and assistant phase across complete hist
   assert.deepEqual(JSON.parse(first.requests[1].body.client_metadata['x-codex-turn-metadata']), { thread_source: 'user', thread_id: 'thread-a', session_id: 'session-thread-a' });
 });
 
-test('previous user messages outside the selected audit list still count, without invented turn metadata', () => {
+test('previous user messages supply context without producing extra audit records or invented turn metadata', () => {
   const { requests, expectedInputCount } = sessionFixtureRequests({ audits: [audit('audit-a', 'user-a', 'thread-a', [
     { id: 'historical-user', role: 'user', blocks: [{ kind: 'text', text: '原先的请求' }] },
     { id: 'agent-a', role: 'assistant', blocks: [block('这是 Agent 的原文')] },
   ], { turnId: null })] });
-  assert.equal(expectedInputCount, 2);
+  assert.equal(expectedInputCount, 1);
   assert.deepEqual(requests[0].body.input[0].internal_chat_message_metadata_passthrough, {});
   assert.equal('turn_id' in requests[0].body.input.at(-1).internal_chat_message_metadata_passthrough, false);
   assert.equal('phase' in requests[0].body.input[1], false);
+});
+
+test('repeated fixture requests count separately even with identical message identities', () => {
+  const repeated = audit('audit-a', 'user-a', 'thread-a');
+  const { requests, expectedInputCount } = sessionFixtureRequests({ audits: [repeated, repeated] });
+  assert.equal(expectedInputCount, 2);
+  assert.equal(requests.length, 2);
+  const observations = requests.map((request, index) => ({ detail: { id: `stored-${index}`, threadId: request.threadId, sessionId: request.sessionId, turnId: request.turnId }, input: request.input, context: request.context }));
+  assert.equal(new Set(matchFixtureTargets(requests, observations).map(({ detail }) => detail.id)).size, 2);
 });
 
 test('missing stable identities and unsupported fixture bodies fail at the replay boundary', () => {

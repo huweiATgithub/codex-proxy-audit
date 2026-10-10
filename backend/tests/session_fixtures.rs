@@ -1,12 +1,8 @@
-//! The UI demo and production collector consume the same anonymized, fixed
-//! multi-turn Codex sessions. No local session files are read by these tests.
-use std::collections::{BTreeMap, BTreeSet};
+//! 使用共享的匿名会话验证最新输入、请求内上下文与多媒体采集
+use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
-use codex_proxy_audit::collection::{
-    AuditDraft, ContentBlock, ContextMessage, RequestObservation, ResponseSnapshot, SessionState,
-    apply_response, collect,
-};
+use codex_proxy_audit::collection::{AuditDraft, ContentBlock, RequestObservation, collect};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -129,15 +125,10 @@ fn observation(audit: &FixtureAudit, request_id: String) -> RequestObservation {
             .with_timezone(&Utc),
         key_name: audit.key_name.clone(),
         key_name_observed_at: None,
-        incremental: false,
     }
 }
 
 fn assert_snapshot(actual: &AuditDraft, expected: &FixtureAudit) {
-    assert_eq!(
-        actual.identity.as_deref(),
-        Some(format!("message:{}", expected.message_id).as_str())
-    );
     assert_eq!(
         actual.blocks,
         expected
@@ -188,142 +179,59 @@ fn assert_snapshot(actual: &AuditDraft, expected: &FixtureAudit) {
 }
 
 #[test]
-fn fixed_codex_sessions_preserve_input_context_and_deduplicate_after_restart() {
+fn fixed_codex_sessions_preserve_latest_input_and_request_context() {
     let fixtures = fixtures();
-    assert!(
-        !fixtures.audits.is_empty(),
-        "shared fixture must exercise real multi-turn data"
-    );
+    assert!(!fixtures.audits.is_empty());
     for audit in &fixtures.audits {
-        let request = observation(audit, format!("fixture:{}:first", audit.id));
-        let prepared = collect(&SessionState::default(), &request);
-        let identity = format!("message:{}", audit.message_id);
-        let target = prepared
-            .audits
-            .iter()
-            .find(|draft| draft.identity.as_deref() == Some(&identity))
-            .unwrap_or_else(|| panic!("fixture input {} must form an audit", audit.id));
-        assert_snapshot(target, audit);
-
-        let mut replay = request.clone();
-        replay.request_id = format!("fixture:{}:replay", audit.id);
-        assert!(
-            collect(&prepared.state, &replay).audits.is_empty(),
-            "history replay {}",
-            audit.id
-        );
-        let restarted: SessionState =
-            serde_json::from_slice(&serde_json::to_vec(&prepared.state).unwrap()).unwrap();
-        replay.request_id = format!("fixture:{}:restart", audit.id);
-        assert!(
-            collect(&restarted, &replay).audits.is_empty(),
-            "restart replay {}",
-            audit.id
-        );
+        let request = observation(audit, format!("fixture:{}", audit.id));
+        let draft =
+            collect(&request).unwrap_or_else(|| panic!("fixture {} must form an audit", audit.id));
+        assert_snapshot(&draft, audit);
     }
 }
 
-fn adjacent_pair(fixtures: &Fixtures) -> (&FixtureAudit, &FixtureAudit) {
-    fixtures
+#[test]
+fn repeating_the_same_fixture_request_produces_another_draft() {
+    let fixtures = fixtures();
+    let audit = &fixtures.audits[0];
+    let mut request = observation(audit, "fixture:first".to_owned());
+    assert_snapshot(&collect(&request).unwrap(), audit);
+    request.request_id = "fixture:repeated".to_owned();
+    let repeated = collect(&request).unwrap();
+    assert_snapshot(&repeated, audit);
+    assert_eq!(repeated.request_id, "fixture:repeated");
+}
+
+#[test]
+fn delta_fixture_does_not_restore_omitted_context() {
+    let fixtures = fixtures();
+    let audit = fixtures
         .audits
         .iter()
-        .find_map(|earlier| {
-            let known_users: BTreeSet<&str> = earlier
-                .context
-                .iter()
-                .filter(|message| message.role == "user")
-                .map(|message| message.id.as_str())
-                .chain(std::iter::once(earlier.message_id.as_str()))
-                .collect();
-            fixtures
-                .audits
-                .iter()
-                .find(|later| {
-                    later.message_id != earlier.message_id
-                        && later.key_id == earlier.key_id
-                        && later.thread_id.is_some()
-                        && later.thread_id == earlier.thread_id
-                        && later.context.iter().any(|message| {
-                            message.role == "user" && message.id == earlier.message_id
-                        })
-                        && later
-                            .context
-                            .iter()
-                            .filter(|message| message.role == "user")
-                            .all(|message| known_users.contains(message.id.as_str()))
-                })
-                .map(|later| (earlier, later))
-        })
-        .expect("shared multi-turn fixture must retain an adjacent pair with stable history IDs")
-}
-
-#[test]
-fn consecutive_fixture_inputs_reuse_history_ids_and_only_add_the_next_input() {
-    let fixtures = fixtures();
-    let pair = adjacent_pair(&fixtures);
-    let first = collect(
-        &SessionState::default(),
-        &observation(pair.0, "fixture:first-round".to_owned()),
-    );
-    let later = collect(
-        &first.state,
-        &observation(pair.1, "fixture:next-round".to_owned()),
-    );
-    assert_eq!(
-        later.audits.len(),
-        1,
-        "the prior round and its context must not become new inputs"
-    );
-    assert_snapshot(&later.audits[0], pair.1);
-}
-
-#[test]
-fn fixture_assistant_response_supplies_the_same_context_to_a_websocket_delta() {
-    let fixtures = fixtures();
-    let (earlier, later) = adjacent_pair(&fixtures);
-    let first = collect(
-        &SessionState::default(),
-        &observation(earlier, "fixture:ws-first".to_owned()),
-    );
-    let position = later
-        .context
-        .iter()
-        .position(|message| message.id == earlier.message_id)
+        .find(|audit| !audit.context.is_empty())
         .unwrap();
-    let response_messages = &later.context[position + 1..];
-    assert!(
-        !response_messages.is_empty(),
-        "the adjacent fixture pair must include the Agent reply"
-    );
-    assert!(
-        response_messages
+    let mut request = observation(audit, "fixture:delta".to_owned());
+    let latest = request.body["input"].as_array_mut().unwrap().pop().unwrap();
+    request.body["input"] = json!([latest]);
+    request.body["previous_response_id"] = json!("previous-response");
+    let draft = collect(&request).unwrap();
+    assert_eq!(
+        draft.blocks,
+        audit
+            .input
             .iter()
-            .all(|message| message.role == "assistant")
+            .map(FixtureBlock::content)
+            .collect::<Vec<_>>()
     );
-    let mut state = first.state;
-    apply_response(
-        &mut state,
-        first.response_context.as_ref().unwrap(),
-        &ResponseSnapshot {
-            response_id: "fixture-protocol-response".to_owned(),
-            messages: response_messages
-                .iter()
-                .map(|message| ContextMessage {
-                    role: message.role.clone(),
-                    phase: message.phase.clone(),
-                    truncated: false,
-                    blocks: message.blocks.iter().map(FixtureBlock::content).collect(),
-                })
-                .collect(),
-            complete: true,
-        },
-    );
-    let mut request = observation(later, "fixture:ws-delta".to_owned());
-    let target = request.body["input"].as_array_mut().unwrap().pop().unwrap();
-    request.body["input"] = json!([target]);
-    request.body["previous_response_id"] = json!("fixture-protocol-response");
-    request.incremental = true;
-    let delta = collect(&state, &request);
-    assert_eq!(delta.audits.len(), 1);
-    assert_snapshot(&delta.audits[0], later);
+    assert!(draft.context.is_empty());
+}
+
+#[test]
+fn fixture_tool_continuation_does_not_collect_the_earlier_user_input() {
+    let fixtures = fixtures();
+    let mut request = observation(&fixtures.audits[0], "fixture:tool".to_owned());
+    request.body["input"].as_array_mut().unwrap().push(json!({
+        "type":"function_call_output", "call_id":"tool-call", "output":"done"
+    }));
+    assert!(collect(&request).is_none());
 }

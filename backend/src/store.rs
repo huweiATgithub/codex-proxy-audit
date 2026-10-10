@@ -1,7 +1,5 @@
-//! PostgreSQL ownership and transactions for immutable audit facts.
-//!
-//! The credential is supplied by the plugin handshake. This module never reads
-//! DATABASE_URL, host Key tables, or host environment variables.
+//! 管理审计数据库迁移、批量写入和查询所需的元数据
+//! 数据库凭据由插件握手提供，用户输入与上下文在同一事务中保存
 
 use std::fmt::Write;
 use std::time::Duration;
@@ -12,10 +10,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgPoolOptions};
 use uuid::Uuid;
 
-use crate::collection::{
-    AuditDraft, ContentBlock, RequestObservation, ResponseContext, ResponseSnapshot, SessionState,
-    apply_response, collect, scope,
-};
+use crate::collection::{AuditDraft, ContentBlock};
 
 #[derive(Clone)]
 pub struct Store {
@@ -137,17 +132,20 @@ impl Store {
         )
         .fetch_one(&mut *tx)
         .await?;
-        match version {
-            0 => {
-                sqlx::raw_sql(include_str!("../migrations/0001_audit.sql"))
-                    .execute(&mut *tx)
-                    .await?;
-                sqlx::query("INSERT INTO prompt_audit.schema_migrations (version) VALUES (1)")
+        if version > 2 {
+            bail!("audit database schema is newer than this plugin");
+        }
+        for (target, migration) in [
+            (1, include_str!("../migrations/0001_audit.sql")),
+            (2, include_str!("../migrations/0002_request_audit.sql")),
+        ] {
+            if version < target {
+                sqlx::raw_sql(migration).execute(&mut *tx).await?;
+                sqlx::query("INSERT INTO prompt_audit.schema_migrations (version) VALUES ($1)")
+                    .bind(target)
                     .execute(&mut *tx)
                     .await?;
             }
-            1 => {}
-            _ => bail!("audit database schema is newer than this plugin"),
         }
         tx.commit().await?;
         Ok(())
@@ -173,37 +171,15 @@ impl Store {
         )
     }
 
-    /// Identify inputs while holding the database scope lock. Facts, bodies,
-    /// and the state used to identify the next request commit together.
-    pub async fn collect_request(
-        &self,
-        observation: &RequestObservation,
-    ) -> Result<crate::collection::PreparedCollection> {
-        let identity_scope = scope(observation);
-        let mut tx = self.pool.begin().await?;
-        lock_scope(&mut tx, &identity_scope).await?;
-        let state = load_state(&mut tx, &identity_scope).await?;
-        let prepared = collect(&state, observation);
-        for draft in &prepared.audits {
-            insert_audit(&mut tx, &identity_scope, observation, draft).await?;
+    /// 同一批次的审计记录与正文原子写入，重复任务各自生成记录
+    pub async fn persist_batch(&self, drafts: &[AuditDraft]) -> Result<()> {
+        if drafts.is_empty() {
+            return Ok(());
         }
-        save_state(&mut tx, &identity_scope, &prepared.state).await?;
-        tx.commit().await?;
-        Ok(prepared)
-    }
-
-    /// Response observations only update the bounded rolling state. Audit
-    /// bodies and input-time context snapshots are never updated here.
-    pub async fn persist_response(
-        &self,
-        context: &ResponseContext,
-        snapshot: &ResponseSnapshot,
-    ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        lock_scope(&mut tx, &context.scope).await?;
-        let mut state = load_state(&mut tx, &context.scope).await?;
-        apply_response(&mut state, context, snapshot);
-        save_state(&mut tx, &context.scope, &state).await?;
+        for draft in drafts {
+            insert_audit(&mut tx, draft).await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -261,64 +237,9 @@ impl Store {
         .transpose()
     }
 
-    /// Rolling state is an optimization with explicit lifetime/count bounds;
-    /// dropping it does not delete the independent audit facts or identities.
-    pub async fn prune_sessions(&self) -> Result<u64> {
-        let result = sqlx::query(
-            "DELETE FROM prompt_audit.sessions \
-             WHERE updated_at < now() - interval '7 days'",
-        )
-        .execute(&self.pool)
-        .await?;
-        let overflow = sqlx::query(
-            "DELETE FROM prompt_audit.sessions WHERE scope IN \
-             (SELECT scope FROM prompt_audit.sessions \
-              ORDER BY updated_at DESC, scope OFFSET 10000)",
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() + overflow.rows_affected())
-    }
-
     pub async fn close(&self) {
         self.pool.close().await;
     }
-}
-
-async fn lock_scope(tx: &mut Transaction<'_, Postgres>, scope: &str) -> Result<()> {
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 728019))")
-        .bind(scope)
-        .execute(&mut **tx)
-        .await?;
-    Ok(())
-}
-
-async fn load_state(tx: &mut Transaction<'_, Postgres>, scope: &str) -> Result<SessionState> {
-    let state: Option<serde_json::Value> =
-        sqlx::query_scalar("SELECT state FROM prompt_audit.sessions WHERE scope = $1")
-            .bind(scope)
-            .fetch_optional(&mut **tx)
-            .await?;
-    match state {
-        Some(state) => Ok(serde_json::from_value(state).context("decode audit session state")?),
-        None => Ok(SessionState::default()),
-    }
-}
-
-async fn save_state(
-    tx: &mut Transaction<'_, Postgres>,
-    scope: &str,
-    state: &SessionState,
-) -> Result<()> {
-    sqlx::query(
-        "INSERT INTO prompt_audit.sessions (scope, state) VALUES ($1, $2::json) \
-         ON CONFLICT (scope) DO UPDATE SET state = EXCLUDED.state, updated_at = now()",
-    )
-    .bind(scope)
-    .bind(serde_json::to_string(state)?)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
 }
 
 async fn save_key(
@@ -354,12 +275,7 @@ async fn save_key(
     Ok(())
 }
 
-async fn insert_audit(
-    tx: &mut Transaction<'_, Postgres>,
-    scope: &str,
-    observation: &RequestObservation,
-    draft: &AuditDraft,
-) -> Result<()> {
+async fn insert_audit(tx: &mut Transaction<'_, Postgres>, draft: &AuditDraft) -> Result<()> {
     let id = Uuid::new_v4().to_string();
     let input_content_id = Uuid::new_v4().to_string();
     let input_text = draft
@@ -384,28 +300,20 @@ async fn insert_audit(
     if preview_source.chars().count() > 398 {
         preview.push('…');
     }
-    let inserted = sqlx::query(
+    sqlx::query(
         "INSERT INTO prompt_audit.audits \
-         (id, identity_scope, identity_key, identity_basis, observation_status, source_position, \
-          policy_version, key_id, key_name, key_name_observed_at, first_observed_at, \
+         (id, key_id, key_name, key_name_observed_at, first_observed_at, \
           request_id, thread_id, session_id, turn_id, input_kinds, repositories, \
-          input_content_id, input_text, input_search, preview, context_count, context_gap) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,date_trunc('milliseconds',$11::timestamptz), \
-                 $12,$13,$14,$15,$16::json,$17::json,$18,$19,$20,$21,$22,$23) \
-         ON CONFLICT (identity_scope, identity_key) WHERE identity_key IS NOT NULL DO NOTHING",
+          input_content_id, input_text, input_search, preview, context_count) \
+         VALUES ($1,$2,$3,$4,date_trunc('milliseconds',$5::timestamptz), \
+                 $6,$7,$8,$9,$10::json,$11::json,$12,$13,$14,$15,$16)",
     )
     .bind(&id)
-    .bind(scope)
-    .bind(&draft.identity)
-    .bind(&draft.identity_basis)
-    .bind(&draft.observation_status)
-    .bind(i64::try_from(draft.source_position)?)
-    .bind(i32::try_from(draft.policy_version)?)
-    .bind(&observation.key_id)
+    .bind(&draft.key_id)
     .bind(&draft.key_name)
     .bind(draft.key_name_observed_at)
-    .bind(observation.observed_at)
-    .bind(&observation.request_id)
+    .bind(draft.observed_at)
+    .bind(&draft.request_id)
     .bind(&draft.thread_id)
     .bind(&draft.session_id)
     .bind(&draft.turn_id)
@@ -422,19 +330,13 @@ async fn insert_audit(
     .bind(encode_search_text(&input_text, true))
     .bind(encode_text(&preview))
     .bind(i64::try_from(draft.context.len())?)
-    .bind(draft.context_gap)
     .execute(&mut **tx)
     .await?;
-    if inserted.rows_affected() == 0 {
-        return Ok(());
-    }
     save_key(
         tx,
-        &observation.key_id,
+        &draft.key_id,
         draft.key_name.as_deref(),
-        draft
-            .key_name_observed_at
-            .unwrap_or(observation.observed_at),
+        draft.key_name_observed_at.unwrap_or(draft.observed_at),
         false,
     )
     .await?;

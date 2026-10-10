@@ -12,20 +12,18 @@ const fixtureAudit = z.object({ id: z.string().min(1), messageId: z.string().min
 const fixtureDocument = z.object({ audits: z.array(fixtureAudit).min(1) });
 const DEFAULT_KEY_NAME = 'Codex Sessions · 脱敏样本';
 
-// Only the checked-in sanitized fixture is consumed. Stable message identities
-// make retransmission safe; each full-history request supplies its own Agent
-// context and never inherits the controlled upstream's generated test reply.
+// Only the checked-in sanitized fixture is consumed. Each request contributes
+// one newest input and supplies its own Agent context. Replaying fixtures adds
+// another batch of audits, without using the controlled upstream's test reply.
 export function sessionFixtureRequests(document) {
   const { audits } = fixtureDocument.parse(document);
   const knownTurns = new Map(audits.map((audit) => [`${audit.threadId}\0${audit.messageId}`, audit.turnId]));
-  const observed = new Set();
   // Fixture timestamps establish source ordering only. The plugin records the
   // new gateway observation time, and no client timestamp is sent or stored.
   const ordered = audits.every((audit) => audit.firstObservedAt) ? [...audits].sort((left, right) => Date.parse(left.firstObservedAt) - Date.parse(right.firstObservedAt) || left.messageId.localeCompare(right.messageId)) : audits;
   const requests = ordered.map((audit) => {
     const messages = [...audit.context, { id: audit.messageId, role: 'user', turnId: audit.turnId, blocks: audit.input }];
     const input = messages.map((message) => {
-      if (message.role === 'user') observed.add(`${audit.threadId}\0${message.id}`);
       const result = {
         id: message.id, type: 'message', role: message.role,
         ...(message.phase ? { phase: message.phase } : {}),
@@ -54,7 +52,7 @@ export function sessionFixtureRequests(document) {
       },
     };
   });
-  return { requests, expectedInputCount: observed.size };
+  return { requests, expectedInputCount: requests.length };
 }
 
 const bodySignature = (blocks) => JSON.stringify(blocks.map(({ kind, text }) => ({ kind, text })));
@@ -129,13 +127,17 @@ export async function seedSessionFixtures({ baseUrl = 'http://127.0.0.1:4180', f
     throw new Error('Dedicated Key snapshot not refreshed yet');
   }, 'Fixture Key snapshot');
   const before = await management('audits', { key: key.id });
+  const previousIds = new Set(before.items.map((row) => row.id));
+  cursor = before.nextCursor;
+  while (cursor) { const page = await management('audits', { key: key.id, cursor }); for (const row of page.items) previousIds.add(row.id); cursor = page.nextCursor; }
   for (const request of requests) await call('/v1/responses', { body: request.body, token: key.plaintextKey });
-  const firstPage = await waitUntil(async () => { const page = await management('audits', { key: key.id }); assert.equal(page.total, expectedInputCount); return page; }, 'Persisted fixture input count');
+  const firstPage = await waitUntil(async () => { const page = await management('audits', { key: key.id }); assert.equal(page.total, before.total + expectedInputCount); return page; }, 'Persisted fixture input count');
   const rows = [...firstPage.items]; cursor = firstPage.nextCursor;
   while (cursor) { const page = await management('audits', { key: key.id, cursor }); rows.push(...page.items); cursor = page.nextCursor; }
-  assert.equal(new Set(rows.map((row) => row.id)).size, expectedInputCount);
+  const addedRows = rows.filter((row) => !previousIds.has(row.id));
+  assert.equal(new Set(addedRows.map((row) => row.id)).size, expectedInputCount);
   const details = [];
-  for (const row of rows) details.push(await management('audit', { id: row.id }));
+  for (const row of addedRows) details.push(await management('audit', { id: row.id }));
   const multiTurn = details.filter((detail) => detail.context.some((message) => message.role === 'assistant'));
   if (!multiTurn.length) throw new Error('No saved multi-turn fixture input has an assistant predecessor');
   const readContent = async (detail, descriptor) => {
@@ -157,7 +159,7 @@ export async function seedSessionFixtures({ baseUrl = 'http://127.0.0.1:4180', f
   const assistant = sample.detail.context.findLast((message) => message.role === 'assistant');
   const verifiedAssistant = { auditId: sample.detail.id, phase: assistant.phase, characterCount: assistant.content.characterCount, threadId: sample.detail.threadId };
   const pageUrl = new URL(`/plugins/${view.target.instanceId}/prompt-audit`, base).href;
-  const result = { keyId: key.id, keyName, fixtureRequests: requests.length, verifiedTargetCount: matched.length, expectedInputCount, previousInputCount: before.total, addedInputCount: firstPage.total - before.total, total: firstPage.total, inputsWithAssistantContext: multiTurn.length, verifiedAssistant, pageUrl };
+  const result = { keyId: key.id, keyName, fixtureRequests: requests.length, verifiedTargetCount: matched.length, verifiedAuditIds: matched.map(({ detail }) => detail.id), expectedInputCount, previousInputCount: before.total, addedInputCount: firstPage.total - before.total, total: firstPage.total, inputsWithAssistantContext: multiTurn.length, verifiedAssistant, pageUrl };
   console.log(JSON.stringify(result, null, 2));
   return result;
 }
