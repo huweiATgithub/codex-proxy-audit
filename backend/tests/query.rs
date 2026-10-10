@@ -41,7 +41,7 @@ async fn ok(service: &QueryService, path: &str, pairs: &[(&str, &str)]) -> Value
 }
 
 #[tokio::test]
-#[ignore = "requires AUDIT_TEST_DATABASE_URL pointing to isolated PostgreSQL with v3.22.2 host migrations"]
+#[ignore = "requires AUDIT_TEST_DATABASE_URL pointing to isolated PostgreSQL with v3.23.0 host migrations"]
 async fn pg_queries_follow_contract_and_read_host_metadata() {
     let url = std::env::var("AUDIT_TEST_DATABASE_URL").expect("set isolated test database URL");
     // This ignored fixture test uses a database administrator credential;

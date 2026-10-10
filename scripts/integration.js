@@ -161,6 +161,8 @@ async function run() {
   const install = await uploaded.json(); assert.equal(uploaded.status, 201, JSON.stringify(install));
   const configured = await json('/api/admin/plugins/instances', { creationId: randomUUID(), name: 'Prompt Audit integration', artifactSha256: install.data.artifact.metadata.sha256, enabled: true, configuration: {}, secrets: { databaseUrl: `postgres://${auditRole}:${auditPassword}@127.0.0.1:${pgPort}/${pgDatabase}` }, bindings: [{ contribution: install.data.artifact.metadata.contributes.middleware.id, stage: 'request', order: -1000000, failurePolicy: 'delegate' }] }, 201);
   instanceId = configured.id; await refreshView();
+  const instance = (await json('/api/admin/plugins/instances')).find((item) => item.id === instanceId);
+  assert.equal(instance.compatibilityWarning, null, 'plugin host range and capability versions match the actual host');
   const context = await management('viewContext'); assert.equal(context.timeZone, 'America/New_York'); report('installed executable plugin, isolated role and effective host.timezone RPC');
   await management('keys');
   const first = message('integration-input-1', 'INTEGRATION-first 请拟定数据库迁移方案。😀');
