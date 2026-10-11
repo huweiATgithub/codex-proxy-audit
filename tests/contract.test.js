@@ -145,18 +145,31 @@ test('content rejects overlaps, gaps, changed totals, and a false end', () => {
   assert.throws(() => appendContent([], { blocks: [{ kind: 'text', index: 0, offset: 0, text: 'ab', totalCharacters: 5 }], nextCursor: 'next' }, descriptor), AuditError);
 });
 
-test('Key pages preserve IDs and historical names; invalid and repeated params fail', async () => {
-  const api = createAuditClient(bridge(createDemoService({ keyPageSize: 1 })));
-  const keys = []; let cursor;
-  do { const page = await api.keys(cursor); keys.push(...page.items); cursor = page.nextCursor; } while (cursor);
-  assert.equal(keys.length, 4);
-  assert.deepEqual(keys.find((key) => key.id === 'ck_platform').names, ['平台工程', 'Web Platform']);
-  assert.ok(keys.find((key) => key.id === 'ck_legacy').historical);
-  const largeKeys = Array.from({ length: 30 }, (_, index) => ({ id: `key-${String(index).padStart(2, '0')}`, names: Array.from({ length: 32 }, (_, name) => String(name) + '界'.repeat(500)) }));
-  const largePage = await createAuditClient(bridge(createDemoService({ keys: largeKeys }))).keys();
-  assert.ok(largePage.items.length > 0 && largePage.items.length < 30 && largePage.nextCursor);
-  for (const value of ['q=x&q=y', 'unknown=1', 'from=2026-02-30', 'limit=3', 'q=' + '😀'.repeat(201)]) assert.throws(() => parseQuery('audits', new URLSearchParams(value)));
-  assert.equal(parseQuery('audits', new URLSearchParams({ q: '😀'.repeat(200) })).q.length, 400);
+test('current host Key names resolve old audits and follow renames and deletions', async () => {
+  const keys = [{ id: 'ck_platform', name: 'Current name' }];
+  const service = createDemoService({ keys });
+  const list = () => service('api/audits', new URLSearchParams({ key: 'ck_platform' })).value;
+  const first = list().items[0];
+  assert.equal(first.keyName, 'Current name');
+  keys[0].name = 'Renamed';
+  assert.ok(list().items.every((item) => item.keyName === 'Renamed'));
+  assert.equal(service('api/audit', new URLSearchParams({ id: first.id })).value.keyName, 'Renamed');
+  assert.deepEqual(service('api/keys', new URLSearchParams()).value.items, [{ id: 'ck_platform', name: 'Renamed' }]);
+  keys.splice(0);
+  assert.ok(list().items.every((item) => item.keyName === null));
+  assert.equal(service('api/audit', new URLSearchParams({ id: first.id })).value.keyName, null);
+  assert.deepEqual(service('api/keys', new URLSearchParams()).value.items, []);
+  assert.ok(list().total > 0);
+});
+
+test('current Key pages preserve IDs and paginate within the fixed response cap', async () => {
+  const keys = Array.from({ length: 250 }, (_, index) => ({ id: `key-${String(index).padStart(3, '0')}`, name: '\u0001'.repeat(512) }));
+  const api = createAuditClient(bridge(createDemoService({ keys })));
+  const found = []; let cursor;
+  do { const page = await api.keys(cursor); found.push(...page.items); cursor = page.nextCursor; } while (cursor);
+  assert.deepEqual(found, keys);
+  assert.equal(createDemoService()('api/keys', new URLSearchParams('extra=1')).status, 400);
+  assert.equal(createDemoService()('api/keys', new URLSearchParams('cursor=a&cursor=b')).status, 400);
 });
 
 test('bridge responses are parsed before use; malformed and unauthorized replies are distinct', async () => {

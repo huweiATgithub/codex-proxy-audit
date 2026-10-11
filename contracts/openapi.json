@@ -617,7 +617,8 @@
                               {
                                 "type": "null"
                               }
-                            ]
+                            ],
+                            "description": "Current host Client Key name; null when the Key is missing or its name cannot be represented."
                           },
                           "preview": {
                             "type": "string",
@@ -928,7 +929,8 @@
                         {
                           "type": "null"
                         }
-                      ]
+                      ],
+                      "description": "Current host Client Key name; null when the Key is missing or its name cannot be represented."
                     },
                     "threadId": {
                       "anyOf": [
@@ -1766,7 +1768,7 @@
     "/api/keys": {
       "get": {
         "operationId": "keys",
-        "summary": "List historical Key identities, ordered by ID.",
+        "summary": "List current host Client Keys with their current names, ordered by ID.",
         "parameters": [
           {
             "name": "cursor",
@@ -1796,22 +1798,22 @@
                             "type": "string",
                             "pattern": "^[\\s\\S]{1,256}$"
                           },
-                          "names": {
-                            "maxItems": 32,
-                            "type": "array",
-                            "items": {
-                              "type": "string",
-                              "pattern": "^[\\s\\S]{0,512}$"
-                            }
-                          },
-                          "historical": {
-                            "type": "boolean"
+                          "name": {
+                            "anyOf": [
+                              {
+                                "type": "string",
+                                "pattern": "^[\\s\\S]{0,512}$"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "description": "Current host Client Key name; null when the Key is missing or its name cannot be represented."
                           }
                         },
                         "required": [
                           "id",
-                          "names",
-                          "historical"
+                          "name"
                         ]
                       }
                     },

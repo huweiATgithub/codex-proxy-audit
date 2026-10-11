@@ -32,7 +32,7 @@ function descriptor(id, blocks) {
 export function createDemoService({ audits = fixtureAudits, keys = fixtureKeys, modelRequests = fixtureRequests, maxListRows = 200, keyPageSize = 100, timeZone = 'UTC', now = () => new Date() } = {}) {
   let dateFormatter = new Intl.DateTimeFormat('sv-SE', { timeZone });
   let timeFormatter = new Intl.DateTimeFormat('sv-SE', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
-  const metadata = (audit) => ({ id: audit.id, recordedAt: audit.firstObservedAt, recordedAtDisplay: timeFormatter.format(new Date(audit.firstObservedAt)), keyId: audit.keyId, keyName: audit.keyName || null });
+  const metadata = (audit) => ({ id: audit.id, recordedAt: audit.firstObservedAt, recordedAtDisplay: timeFormatter.format(new Date(audit.firstObservedAt)), keyId: audit.keyId, keyName: keys.find((key) => key.id === audit.keyId)?.name || null });
   const viewContext = () => ({ timeZone, today: dateFormatter.format(now()) });
   const records = audits.map((audit) => ({ ...audit, firstObservedAt: new Date(audit.firstObservedAt).toISOString() })).sort((a, b) => b.firstObservedAt.localeCompare(a.firstObservedAt) || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
   function list(query) {
@@ -110,11 +110,11 @@ export function createDemoService({ audits = fixtureAudits, keys = fixtureKeys, 
     const directory = [...keys].sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0).filter((key) => after === null || key.id > after);
     const items = [];
     for (const key of directory.slice(0, Math.min(keyPageSize, 100))) {
-      const item = { id: key.id, names: key.names, historical: Boolean(key.historical) };
+      const item = { id: key.id, name: key.name || null };
       if (bytes({ items: [...items, item], nextCursor: 'x'.repeat(2048) }) > MAX_RESPONSE_BYTES) break;
       items.push(item);
     }
-    if (!items.length && directory.length) fail('internal_error', 500, 'Key 目录项超过响应限制。');
+    if (!items.length && directory.length) fail('internal_error', 500, 'Key 列表项超过响应限制。');
     return { items, nextCursor: directory.length > items.length ? encodeCursor({ scope, after: items.at(-1).id }) : null };
   }
   return function handle(path, params, method = 'GET', body) {

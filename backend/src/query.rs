@@ -10,6 +10,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 
+use crate::keys::{CurrentKeys, KeyLookupError};
+
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_QUERY_BYTES: usize = 8192;
 const CONTENT_CHARACTERS: usize = 1200;
@@ -85,6 +87,16 @@ impl From<sqlx::Error> for ApiError {
     }
 }
 
+impl From<KeyLookupError> for ApiError {
+    fn from(_: KeyLookupError) -> Self {
+        Self {
+            status: 503,
+            code: "unavailable",
+            message: "宿主 Client Key 列表暂时不可用，请稍后重试。",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct QueryResponse {
     pub status: u16,
@@ -96,6 +108,7 @@ pub struct QueryService {
     pool: PgPool,
     time_zone: Tz,
     cursor_secret: Vec<u8>,
+    keys: CurrentKeys,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -121,7 +134,12 @@ struct ListQuery {
 impl QueryService {
     /// A query receives one parsed snapshot of the shared setting.
     /// The signing secret comes from Store::secret, so restarts preserve cursors.
-    pub fn new(pool: PgPool, time_zone: Tz, cursor_secret: Vec<u8>) -> Result<Self, String> {
+    pub fn new(
+        pool: PgPool,
+        time_zone: Tz,
+        cursor_secret: Vec<u8>,
+        keys: CurrentKeys,
+    ) -> Result<Self, String> {
         if cursor_secret.len() < 32 {
             return Err("查询服务配置无效。".to_string());
         }
@@ -129,6 +147,7 @@ impl QueryService {
             pool,
             time_zone,
             cursor_secret,
+            keys,
         })
     }
 
@@ -139,6 +158,7 @@ impl QueryService {
         path: &str,
         raw_query: &str,
         body: &[u8],
+        keys: impl std::future::Future<Output = Result<CurrentKeys, KeyLookupError>>,
     ) -> QueryResponse {
         let result = async {
             if method == "PUT" && path == "api/time-zone" {
@@ -151,7 +171,12 @@ impl QueryService {
                 return Err(ApiError::invalid_query());
             }
             let time_zone = store.time_zone().await?;
-            let query = Self::new(store.pool().clone(), time_zone, cursor_secret)
+            let keys = if matches!(path, "api/audits" | "api/audit" | "api/keys") {
+                keys.await?
+            } else {
+                CurrentKeys::default()
+            };
+            let query = Self::new(store.pool().clone(), time_zone, cursor_secret, keys)
                 .map_err(|_| ApiError::internal())?;
             query.dispatch(path, raw_query).await
         }
@@ -305,7 +330,7 @@ impl QueryService {
         if !(0..=MAX_SAFE_INTEGER).contains(&total) {
             return Err(ApiError::internal());
         }
-        let rows = sqlx::query("SELECT id,key_id,key_name,first_observed_at,context_count, CASE WHEN $4::text='' THEN preview ELSE substring(input_text FROM greatest(strpos(input_search,$4)-245,1) FOR 2786) END AS excerpt, CASE WHEN $4::text='' THEN false ELSE strpos(input_search,$4)>246 END AS prefix, CASE WHEN $4::text='' THEN false ELSE char_length(input_text)>greatest(strpos(input_search,$4)-245,1)+2785 END AS suffix FROM prompt_audit.audits WHERE ($1::timestamptz IS NULL OR first_observed_at >= $1) AND ($2::timestamptz IS NULL OR first_observed_at < $2) AND ($3::text IS NULL OR key_id = $3) AND strpos(input_search,$4)>0 AND ($5::timestamptz IS NULL OR (first_observed_at,id COLLATE \"C\") < ($5,$6::text COLLATE \"C\")) ORDER BY first_observed_at DESC,id COLLATE \"C\" DESC LIMIT $7")
+        let rows = sqlx::query("SELECT id,key_id,first_observed_at,context_count, CASE WHEN $4::text='' THEN preview ELSE substring(input_text FROM greatest(strpos(input_search,$4)-245,1) FOR 2786) END AS excerpt, CASE WHEN $4::text='' THEN false ELSE strpos(input_search,$4)>246 END AS prefix, CASE WHEN $4::text='' THEN false ELSE char_length(input_text)>greatest(strpos(input_search,$4)-245,1)+2785 END AS suffix FROM prompt_audit.audits WHERE ($1::timestamptz IS NULL OR first_observed_at >= $1) AND ($2::timestamptz IS NULL OR first_observed_at < $2) AND ($3::text IS NULL OR key_id = $3) AND strpos(input_search,$4)>0 AND ($5::timestamptz IS NULL OR (first_observed_at,id COLLATE \"C\") < ($5,$6::text COLLATE \"C\")) ORDER BY first_observed_at DESC,id COLLATE \"C\" DESC LIMIT $7")
             .bind(start).bind(end).bind(&query.key).bind(&folded).bind(after_time).bind(after_id).bind(query.limit+1).fetch_all(&mut *transaction).await?;
         transaction.commit().await?;
         let mut items = Vec::new();
@@ -330,7 +355,7 @@ impl QueryService {
             {
                 return Err(ApiError::internal());
             }
-            let item = json!({"id":id,"recordedAt":utc_timestamp(time),"recordedAtDisplay":self.display_time(time),"keyId":row.try_get::<String,_>("key_id")?,"keyName":row.try_get::<Option<String>,_>("key_name")?,"preview":preview,"contextCount":context_count});
+            let item = json!({"id":id,"recordedAt":utc_timestamp(time),"recordedAtDisplay":self.display_time(time),"keyId":row.try_get::<String,_>("key_id")?,"keyName":self.keys.name(&row.try_get::<String,_>("key_id")?),"preview":preview,"contextCount":context_count});
             let position = json!([time.to_rfc3339(), id]);
             let next = if rows.len() > index + 1 {
                 Some(self.sign_cursor(&scope, position.clone())?)
@@ -374,7 +399,7 @@ impl QueryService {
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             .execute(&mut *transaction)
             .await?;
-        let audit = sqlx::query("SELECT id,key_id,key_name,first_observed_at,request_id,thread_id,session_id,turn_id,input_kinds,repositories,input_content_id FROM prompt_audit.audits WHERE id=$1").bind(id).fetch_optional(&mut *transaction).await?.ok_or_else(ApiError::not_found)?;
+        let audit = sqlx::query("SELECT id,key_id,first_observed_at,request_id,thread_id,session_id,turn_id,input_kinds,repositories,input_content_id FROM prompt_audit.audits WHERE id=$1").bind(id).fetch_optional(&mut *transaction).await?.ok_or_else(ApiError::not_found)?;
         let request_id: Option<String> = audit.try_get("request_id")?;
         let key_id: String = audit.try_get("key_id")?;
         let request_metadata = if let Some(ref request_id) = request_id {
@@ -422,7 +447,7 @@ impl QueryService {
         }
         let time: DateTime<Utc> = audit.try_get("first_observed_at")?;
         Ok(
-            json!({"timeZone":self.time_zone.name(),"id":id,"recordedAt":utc_timestamp(time),"recordedAtDisplay":self.display_time(time),"keyId":key_id,"keyName":audit.try_get::<Option<String>,_>("key_name")?,"threadId":audit.try_get::<Option<String>,_>("thread_id")?,"sessionId":audit.try_get::<Option<String>,_>("session_id")?,"requestId":request_id,"turnId":audit.try_get::<Option<String>,_>("turn_id")?,"inputKinds":input_kinds,"repositories":audit.try_get::<Option<Value>,_>("repositories")?,"requestMetadata":request_metadata,"input":input,"context":context}),
+            json!({"timeZone":self.time_zone.name(),"id":id,"recordedAt":utc_timestamp(time),"recordedAtDisplay":self.display_time(time),"keyId":key_id,"keyName":self.keys.name(&key_id),"threadId":audit.try_get::<Option<String>,_>("thread_id")?,"sessionId":audit.try_get::<Option<String>,_>("session_id")?,"requestId":request_id,"turnId":audit.try_get::<Option<String>,_>("turn_id")?,"inputKinds":input_kinds,"repositories":audit.try_get::<Option<Value>,_>("repositories")?,"requestMetadata":request_metadata,"input":input,"context":context}),
         )
     }
 
@@ -583,7 +608,7 @@ impl QueryService {
     }
 
     async fn keys(&self, cursor: Option<&str>) -> ApiResult<Value> {
-        let scope = "keys:id COLLATE C ASC";
+        let scope = "keys:host:id ASC";
         let after = self
             .read_cursor(cursor, scope)?
             .map(|value| {
@@ -594,28 +619,28 @@ impl QueryService {
                     .ok_or_else(ApiError::invalid_cursor)
             })
             .transpose()?;
-        let rows=sqlx::query("SELECT d.id,NOT d.present AS historical,ARRAY(SELECT n.name FROM prompt_audit.key_names n WHERE n.key_id=d.id ORDER BY n.observed_at DESC,n.name COLLATE \"C\" ASC LIMIT 32) AS names FROM prompt_audit.key_directory d WHERE ($1::text IS NULL OR d.id COLLATE \"C\">$1 COLLATE \"C\") ORDER BY d.id COLLATE \"C\" ASC LIMIT 101").bind(after).fetch_all(&self.pool).await?;
+        let rows = self
+            .keys
+            .entries()
+            .iter()
+            .filter(|(id, _)| after.as_ref().is_none_or(|after| *id > after))
+            .take(101)
+            .collect::<Vec<_>>();
         let mut items = Vec::new();
         let mut last = None;
         for (index, row) in rows.iter().take(100).enumerate() {
-            let id: String = row.try_get("id")?;
-            let names: Vec<String> = row.try_get("names")?;
-            if !valid_id(&id) || names.iter().any(|name| name.chars().count() > 512) {
-                return Err(ApiError::internal());
-            }
+            let (id, name) = *row;
             let next = if rows.len() > index + 1 {
                 Some(self.sign_cursor(scope, json!(id))?)
             } else {
                 None
             };
-            items.push(
-                json!({"id":id,"names":names,"historical":row.try_get::<bool,_>("historical")?}),
-            );
+            items.push(json!({"id":id,"name":name}));
             if bytes(&json!({"items":items,"nextCursor":next}))? > MAX_RESPONSE_BYTES {
                 items.pop();
                 break;
             }
-            last = Some(id);
+            last = Some(id.clone());
         }
         if items.is_empty() && !rows.is_empty() {
             return Err(ApiError::budget());
@@ -836,6 +861,7 @@ mod tests {
                 .unwrap(),
             "America/New_York".parse().unwrap(),
             vec![7; 32],
+            CurrentKeys::default(),
         )
         .unwrap()
     }
@@ -894,9 +920,21 @@ mod tests {
             service.read_cursor(Some(&cursor), "a").unwrap().unwrap()["offset"],
             3
         );
-        let same = QueryService::new(service.pool.clone(), service.time_zone, vec![7; 32]).unwrap();
+        let same = QueryService::new(
+            service.pool.clone(),
+            service.time_zone,
+            vec![7; 32],
+            CurrentKeys::default(),
+        )
+        .unwrap();
         assert!(same.read_cursor(Some(&cursor), "a").is_ok());
-        let other = QueryService::new(service.pool.clone(), chrono_tz::UTC, vec![7; 32]).unwrap();
+        let other = QueryService::new(
+            service.pool.clone(),
+            chrono_tz::UTC,
+            vec![7; 32],
+            CurrentKeys::default(),
+        )
+        .unwrap();
         assert_eq!(
             other.read_cursor(Some(&cursor), "a").unwrap_err().code,
             "invalid_cursor"

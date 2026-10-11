@@ -55,6 +55,13 @@ async function json(path, body, expected = 200) {
   if (value.code !== undefined) { assert.equal(value.code, 200, `${path}: ${JSON.stringify(value)}`); return value.data; }
   return value;
 }
+async function uploadPackage(path) {
+  const archive = readFileSync(resolve(path));
+  const sha = createHash('sha256').update(archive).digest('hex');
+  const response = await fetch(base + `/api/admin/plugins/artifacts/upload?sha256=${sha}`, { method: 'POST', headers: { cookie, 'content-type': 'application/gzip' }, body: archive });
+  const installed = await response.json(); assert.equal(response.status, 201, JSON.stringify(installed));
+  return installed;
+}
 async function startHost() {
   const log = createWriteStream(join(temporary, 'host.log'), { flags: 'a' });
   const environment = { ...process.env };
@@ -156,10 +163,8 @@ async function run() {
   await json('/api/admin/accounts/import', { provider: 'openai', data: { provider: 'openai', authentication_kind: 'api_key', name: 'Integration controlled upstream', base_url: `${upstream.url}/v1`, api_key: 'sk-integration-only', transport: 'http' } }, 201);
   const makeKey = (name) => json('/api/admin/client-keys/create', { name, groupIds: [], maxConcurrency: 0, requestsPerMinute: 0 }, 201);
   const key = await makeKey('Integration primary'), otherKey = await makeKey('Integration secondary');
-  const archive = readFileSync(resolve(options.package));
-  const sha = createHash('sha256').update(archive).digest('hex');
-  const uploaded = await fetch(base + `/api/admin/plugins/artifacts/upload?sha256=${sha}`, { method: 'POST', headers: { cookie, 'content-type': 'application/gzip' }, body: archive });
-  const install = await uploaded.json(); assert.equal(uploaded.status, 201, JSON.stringify(install));
+  const sha = createHash('sha256').update(readFileSync(resolve(options.package))).digest('hex');
+  const install = await uploadPackage(options['upgrade-from-package'] || options.package);
   const configured = await json('/api/admin/plugins/instances', { creationId: randomUUID(), name: 'Prompt Audit integration', artifactSha256: install.data.artifact.metadata.sha256, enabled: true, configuration: {}, secrets: { databaseUrl: `postgres://${auditRole}:${auditPassword}@127.0.0.1:${pgPort}/${pgDatabase}` }, bindings: [{ contribution: install.data.artifact.metadata.contributes.middleware.id, stage: 'request', order: -1000000, failurePolicy: 'delegate' }] }, 201);
   instanceId = configured.id; await refreshView();
   const instance = (await json('/api/admin/plugins/instances')).find((item) => item.id === instanceId);
@@ -178,10 +183,29 @@ async function run() {
     assert.equal((await management('viewContext')).timeZone, 'America/New_York');
   }
   report('administrator-only strict timezone save preserves setting on invalid input');
-  await management('keys');
   const first = message('integration-input-1', 'INTEGRATION-first 请拟定数据库迁移方案。😀');
   const response1 = await requestModel(key, [first], 'thread-http');
-  await listCount('INTEGRATION-first', 1);
+  if (options['upgrade-from-package']) {
+    await until(() => { assert.equal(sql('SELECT count(*) FROM prompt_audit.audits'), '1'); }, 'old package captures before any Key-directory query');
+    assert.equal(sql('SELECT key_name IS NULL FROM prompt_audit.audits'), 't');
+    const snapshot = () => sql("SELECT md5(jsonb_agg(to_jsonb(a)-'key_name'-'key_name_observed_at' ORDER BY a.id)::text) FROM prompt_audit.audits a") + sql("SELECT md5(jsonb_agg(to_jsonb(c) ORDER BY c.id)::text) FROM prompt_audit.contents c");
+    const before = snapshot(), signingSecret = sql("SELECT encode(value,'hex') FROM prompt_audit.settings WHERE name='query_cursor'");
+    const target = await uploadPackage(options.package);
+    await json('/api/admin/plugins/instances/switch-version', { id: instanceId, target: { artifactSha256: target.data.artifact.metadata.sha256, expectedRevision: instance.revision } });
+    await until(async () => { await refreshView(); assert.equal(view.target.artifactSha256, sha); assert.equal(sql('SELECT max(version) FROM prompt_audit.schema_migrations'), '3'); }, 'new package management registration and schema upgrade');
+    assert.equal(snapshot(), before);
+    assert.equal(sql("SELECT encode(value,'hex') FROM prompt_audit.settings WHERE name='query_cursor'"), signingSecret);
+    assert.equal((await management('viewContext')).timeZone, 'America/New_York');
+    report('real v0.1.6 upgrade preserves audit facts, content, settings and signing secret');
+  }
+  assert.equal(sql("SELECT count(*) FROM information_schema.columns WHERE table_schema='prompt_audit' AND table_name='audits' AND column_name IN ('key_name','key_name_observed_at')"), '0');
+  assert.equal(sql("SELECT count(*) FROM information_schema.tables WHERE table_schema='prompt_audit' AND table_name IN ('key_directory','key_names')"), '0');
+  const cold = await listCount('INTEGRATION-first', 1);
+  assert.equal(cold.items[0].keyName, 'Integration primary');
+  assert.equal((await management('audit', { id: cold.items[0].id })).keyName, 'Integration primary');
+  await requestModel(otherKey, [message('integration-deleted-key', 'INTEGRATION-deleted-key retained record')], 'thread-deleted-key');
+  const deletedAudit = (await listCount('INTEGRATION-deleted-key', 1)).items[0];
+  report('cold capture and old unnamed records resolve current names without a directory cache');
   await requestModel(key, [first], 'thread-http', { stream: true }); await listCount('INTEGRATION-first', 2); report('HTTP JSON/SSE collection records repeated requests separately');
   const next = message('integration-input-2', 'INTEGRATION-continue 请继续。');
   const precedingAssistant = { id: 'integration-assistant-1', type: 'message', role: 'assistant', phase: 'final_answer', content: [{ type: 'output_text', text: 'Agent 方案：先检查数据库，再执行迁移。😀' }] };
@@ -253,14 +277,22 @@ async function run() {
   await requestModel(key, [message('integration-date-start', 'INTEGRATION-timezone start')], 'thread-dates');
   await requestModel(key, [message('integration-date-end', 'INTEGRATION-timezone end')], 'thread-dates');
   const dated = await listCount('INTEGRATION-timezone', 2);
-  for (const item of dated.items) sql(`UPDATE prompt_audit.audits SET first_observed_at = '${item.preview.endsWith(' start') ? '2026-11-01T04:00:00Z' : '2026-11-02T05:00:00Z'}'::timestamptz WHERE id = '${item.id.replaceAll("'", "''")}'`);
-  const day = await management('audits', { q: 'INTEGRATION-timezone', from: '2026-11-01', to: '2026-11-01', key: key.id });
-  assert.equal(day.total, 1); assert.equal(day.items[0].recordedAtDisplay, '2026-11-01 00:00:00');
+  // Keep DST fixtures ahead of the retention window, including across restarts.
+  const dstYear = new Date().getUTCFullYear() + 1;
+  const sunday = (month, earliest, offset = 0) => {
+    const date = new Date(Date.UTC(dstYear, month, earliest));
+    date.setUTCDate(earliest + (7 - date.getUTCDay()) % 7 + offset);
+    return date.toISOString().slice(0, 10);
+  };
+  const longDate = sunday(10, 1), longEnd = sunday(10, 1, 1), shortDate = sunday(2, 8), shortEnd = sunday(2, 8, 1);
+  for (const item of dated.items) sql(`UPDATE prompt_audit.audits SET first_observed_at = '${item.preview.endsWith(' start') ? `${longDate}T04:00:00Z` : `${longEnd}T05:00:00Z`}'::timestamptz WHERE id = '${item.id.replaceAll("'", "''")}'`);
+  const day = await management('audits', { q: 'INTEGRATION-timezone', from: longDate, to: longDate, key: key.id });
+  assert.equal(day.total, 1); assert.equal(day.items[0].recordedAtDisplay, `${longDate} 00:00:00`);
   report('saved plugin timezone inclusive dates across 25-hour DST day');
-  for (const item of dated.items) sql(`UPDATE prompt_audit.audits SET first_observed_at = '${item.preview.endsWith(' start') ? '2026-03-08T05:00:00Z' : '2026-03-09T04:00:00Z'}'::timestamptz WHERE id = '${item.id.replaceAll("'", "''")}'`);
-  const shortDay = await management('audits', { q: 'INTEGRATION-timezone', from: '2026-03-08', to: '2026-03-08', key: key.id });
+  for (const item of dated.items) sql(`UPDATE prompt_audit.audits SET first_observed_at = '${item.preview.endsWith(' start') ? `${shortDate}T05:00:00Z` : `${shortEnd}T04:00:00Z`}'::timestamptz WHERE id = '${item.id.replaceAll("'", "''")}'`);
+  const shortDay = await management('audits', { q: 'INTEGRATION-timezone', from: shortDate, to: shortDate, key: key.id });
   assert.equal(shortDay.total, 1); assert.equal(shortDay.timeZone, 'America/New_York');
-  assert.equal(shortDay.items[0].recordedAtDisplay, '2026-03-08 00:00:00');
+  assert.equal(shortDay.items[0].recordedAtDisplay, `${shortDate} 00:00:00`);
   report('23-hour DST day includes its start and excludes next-day start');
   const auditSnapshot = () => sql("SELECT md5(coalesce(jsonb_agg(to_jsonb(a) ORDER BY a.id)::text,'')) FROM prompt_audit.audits a") + sql("SELECT md5(coalesce(jsonb_agg(to_jsonb(c) ORDER BY c.id)::text,'')) FROM prompt_audit.contents c");
   const factsBefore = auditSnapshot(), secretBefore = sql("SELECT encode(value,'hex') FROM prompt_audit.settings WHERE name='query_cursor'");
@@ -277,8 +309,11 @@ async function run() {
   report('save completes during a blocked query and its response retains its original timezone');
   const contentFirst = await management('content', { id: longDetail.id, contentId: longDetail.input.id });
   assert.ok(contentFirst.nextCursor);
-  // A large directory exercises the Key cursor without changing business credentials.
-  sql("INSERT INTO prompt_audit.key_directory(id,present,observed_at) SELECT 'timezone-cursor-' || lpad(i::text,3,'0'),false,now() FROM generate_series(1,105) i");
+  // Real host Keys exercise host pagination and the plugin Key cursor.
+  const cursorKeys = [];
+  for (let index = 0; index < 105; index += 10) {
+    cursorKeys.push(...await Promise.all(Array.from({ length: Math.min(10, 105 - index) }, (_, offset) => makeKey(`Timezone cursor ${index + offset}`))));
+  }
   const keyFirst = await management('keys'); assert.ok(keyFirst.nextCursor);
   await management('timeZone', { timeZone: 'Asia/Kathmandu' });
   assert.equal((await management('audits', { q: 'integration-PAGINATION', cursor: cursorFirst.nextCursor }, 400)).error.code, 'invalid_cursor');
@@ -289,9 +324,9 @@ async function run() {
   assert.equal(sql("SELECT encode(value,'hex') FROM prompt_audit.settings WHERE name='query_cursor'"), secretBefore);
   await management('timeZone', { timeZone: 'America/New_York' });
   await management('keys', { cursor: keyFirst.nextCursor });
-  sql("DELETE FROM prompt_audit.key_directory WHERE id LIKE 'timezone-cursor-%'");
+  for (let index = 0; index < cursorKeys.length; index += 10) await Promise.all(cursorKeys.slice(index, index + 10).map((key) => json('/api/admin/client-keys/delete', { id: key.id })));
   report('timezone-bound list/content/Key cursors and unchanged facts, bodies and signing secret');
-  const directory = await management('keys'); assert.ok(directory.items.some((item) => item.id === key.id && item.names.includes('Integration primary')));
+  const directory = await management('keys'); assert.ok(directory.items.some((item) => item.id === key.id && item.name === 'Integration primary'));
   const all = await management('audits'); assert.equal(Number(sql('SELECT count(*) FROM prompt_audit.audits')), all.total); assert.ok(upstream.requests.length > 0); report('five contracted management GET routes and real persisted records');
   sql(`DELETE FROM public.model_requests WHERE id = '${continuation.requestId.replaceAll("'", "''")}'`);
   assert.equal((await management('audit', { id: continuation.id })).requestMetadata, null); assert.equal(await textContent(continuation.id, continuation.input), next.content[0].text); report('host request retention yields null metadata and preserves audit body');
@@ -300,17 +335,33 @@ async function run() {
   sql(`GRANT SELECT (id, client_api_key_ref, user_agent, requested_model_id, reasoning_effort) ON public.model_request_observations TO "${auditRole}"`);
   report('host metadata SQL failure is an error rather than false missing record');
   await json('/api/admin/client-keys/update', { id: key.id, name: 'Integration renamed', groupIds: [], maxConcurrency: 0, requestsPerMinute: 0 });
+  assert.equal((await management('audit', { id: continuation.id })).keyName, 'Integration renamed');
+  assert.ok((await management('audits', { key: key.id, q: 'INTEGRATION-continue' })).items.every((item) => item.keyName === 'Integration renamed'));
   await json('/api/admin/client-keys/delete', { id: otherKey.id });
-  await stopHost(); await startHost(); await refreshView();
+  assert.equal((await management('audit', { id: deletedAudit.id })).keyName, null);
+  assert.equal((await management('audits', { key: otherKey.id })).items[0].keyName, null);
+  assert.ok(!(await management('keys')).items.some((item) => item.id === otherKey.id));
+  report('live renames update old rows immediately and deleted Keys retain only their audit IDs');
+  await requestModel(key, [{ role: 'assistant', phase: 'commentary', content: [{ type: 'output_text', text: 'Prior context for retention' }] }, message('integration-expired', 'INTEGRATION-retention expired')], 'thread-retention');
+  const expired = (await listCount('INTEGRATION-retention', 1)).items[0];
+  const expiredId = expired.id.replaceAll("'", "''");
+  assert.equal(sql(`SELECT count(*) FROM prompt_audit.contents WHERE audit_id='${expiredId}'`), '2');
+  await stopHost();
+  sql(`UPDATE prompt_audit.audits SET first_observed_at = now() - interval '96 hours' WHERE id='${expiredId}'`);
+  await startHost(); await refreshView();
+  await until(async () => { assert.equal((await management('audit', { id: expired.id }, 404)).error.code, 'not_found'); }, 'startup retention removes expired audit without a model request');
+  assert.equal(sql(`SELECT count(*) FROM prompt_audit.contents WHERE audit_id='${expiredId}'`), '0');
+  report('startup retention removes expired input and context while retaining recent audits');
   assert.equal((await management('viewContext')).timeZone, 'America/New_York');
   assert.equal(auditSnapshot(), factsBefore);
   assert.equal(sql("SELECT encode(value,'hex') FROM prompt_audit.settings WHERE name='query_cursor'"), secretBefore);
   await requestModel(key, [first], 'thread-http'); await listCount('INTEGRATION-first', 6); report('host/plugin restart preserves history and records a repeated request');
-  const historical = await management('keys');
-  const renamed = historical.items.find((item) => item.id === key.id), deleted = historical.items.find((item) => item.id === otherKey.id);
-  assert.ok(renamed.names.includes('Integration primary') && renamed.names.includes('Integration renamed'));
-  assert.equal(deleted.historical, true); assert.equal((await management('audit', { id: continuation.id })).keyName, 'Integration primary');
-  report('host.keys.list snapshots retain renamed and deleted historical Key directory');
+  const currentKeys = await management('keys');
+  assert.equal(currentKeys.items.find((item) => item.id === key.id).name, 'Integration renamed');
+  assert.ok(!currentKeys.items.some((item) => item.id === otherKey.id));
+  assert.equal((await management('audit', { id: continuation.id })).keyName, 'Integration renamed');
+  assert.equal((await management('audit', { id: deletedAudit.id })).keyName, null);
+  report('restart uses current host names without persisting names or a directory');
   browser = await chromium.launch({ headless: true, ...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE } : {}) });
   const page = await browser.newPage({ viewport: { width: 1600, height: 1050 } });
   const errors = [], requested = []; page.on('pageerror', (error) => errors.push(error.message)); page.on('request', (request) => requested.push(request.url()));
@@ -319,8 +370,11 @@ async function run() {
   const ui = page.frameLocator('iframe');
   await ui.locator('#result-count').waitFor({ timeout: 30000 });
   assert.deepEqual(await ui.locator('thead th').allTextContents(), ['记录时间', 'Client Key', '用户输入']);
+  await ui.getByRole('combobox', { name: 'Client Key', exact: true }).click();
+  await ui.getByRole('option').filter({ hasText: 'Integration renamed' }).click();
   await ui.getByRole('searchbox').fill('INTEGRATION-continue'); await ui.getByRole('button', { name: '检索', exact: true }).click();
   await until(async () => { assert.equal(await ui.locator('#result-count').textContent(), '2 条'); }, 'real iframe body search');
+  assert.deepEqual(await ui.locator('tbody .key-cell').allTextContents(), ['Integration renamed', 'Integration renamed']);
   await ui.locator(`[data-audit="${continuation.id}"]`).click();
   await ui.locator('.input-card .body-text').waitFor(); assert.ok((await ui.locator('.input-card .body-text').textContent()).includes('INTEGRATION-continue'));
   await until(async () => { assert.ok((await ui.locator('.context-section').textContent()).includes('Agent 方案：先检查数据库')); }, 'real iframe reads assistant context supplied in the request');

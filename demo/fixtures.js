@@ -1,9 +1,8 @@
 // Fictional observations for design review. No gateway or user data is loaded.
 export const keys = [
-  { id: 'ck_platform', names: ['平台工程', 'Web Platform'] },
-  { id: 'ck_product', names: ['产品设计'] },
-  { id: 'ck_research', names: ['研究环境'] },
-  { id: 'ck_legacy', names: ['旧版工作区'], historical: true },
+  { id: 'ck_platform', name: '平台工程' },
+  { id: 'ck_product', name: '产品设计' },
+  { id: 'ck_research', name: '研究环境' },
 ];
 
 const text = (value) => ({ kind: 'text', text: value, inputKind: 'user.text' });
@@ -15,7 +14,6 @@ function record(id, time, keyId, threadId, input, context, extra = {}) {
     id: `PA-${String(id).padStart(4, '0')}`,
     firstObservedAt: `${time}-04:00`,
     keyId,
-    keyName: keys.find((key) => key.id === keyId).names[0],
     threadId,
     sessionId: null,
     requestId: `req_demo_${String(id).padStart(4, '0')}`,
@@ -42,7 +40,7 @@ const examples = [
   record(16, '2026-10-08T14:15:42', 'ck_research', null, '按刚才讨论的方案执行。', []),
   record(15, '2026-10-08T13:56:11', 'ck_platform', 'thread_migration_03', '先检查迁移脚本，不要执行生产环境变更。', [user('我们需要审查数据库迁移方案。'), agent('我会检查迁移顺序、约束变化和回滚条件，列出需要确认的问题。')]),
   record(14, '2026-10-08T13:32:09', 'ck_product', 'thread_image_04', '参考这张截图调整布局，保留左右分栏。', [agent('请提供你希望参考的页面，我会先分析信息组织。')], { input: [text('参考这张截图调整布局，保留左右分栏。'), { kind: 'nontext', mediaType: '图片', description: '用户附加的界面截图', inputKind: 'user.image' }] }),
-  record(13, '2026-10-08T12:48:37', 'ck_platform', 'thread_long_05', '可以，按这个拆分继续实现。', [user('请分析页面需要哪些模块。'), agent('……\n\n保留的方案末尾：\n\n四、上下文阅读\n按原顺序保留用户与 Agent 文本，用角色标识区分。较早消息因窗口限制舍弃时，需要解释缺失原因。\n\n五、记录信息\n提供稳定 Key ID、名称快照、记录时间与来源请求 ID。\n\n六、实现顺序\n先验证页面交互，再接入管理 API。', 'final_answer', { truncated: true })]),
+  record(13, '2026-10-08T12:48:37', 'ck_platform', 'thread_long_05', '可以，按这个拆分继续实现。', [user('请分析页面需要哪些模块。'), agent('……\n\n保留的方案末尾：\n\n四、上下文阅读\n按原顺序保留用户与 Agent 文本，用角色标识区分。较早消息因窗口限制舍弃时，需要解释缺失原因。\n\n五、记录信息\n提供稳定 Key ID、当前名称、记录时间与来源请求 ID。\n\n六、实现顺序\n先验证页面交互，再接入管理 API。', 'final_answer', { truncated: true })]),
   record(12, '2026-10-08T12:20:03', 'ck_legacy', 'thread_legacy_06', '请整理这次接口评审中还没有解决的问题。', [agent('接口评审还剩两个问题：长正文如何分段，以及历史 Key 如何在筛选中保留。')]),
   record(11, '2026-10-07T11:54:29', 'ck_platform', 'thread_web_01', initialRequest, []),
   record(10, '2026-10-08T11:32:14', 'ck_research', 'thread_unknown_07', '请检查这个输入是否被正确识别。', [agent('当前客户端没有提供消息内容分类，审计时需要保留这个限制。', undefined)], { input: [{ kind: 'text', text: '请检查这个输入是否被正确识别。' }], turnId: null, repositories: [] }),
@@ -50,11 +48,11 @@ const examples = [
   record(8, '2026-10-08T10:15:10', 'ck_product', 'thread_branch_09', '在这个分支里，我们先只看窄屏阅读体验。', [user('页面需要兼顾大屏与窄屏。'), agent('大屏可以并排展示列表和详情；窄屏建议进入单独的详情视图，并提供返回列表的入口。')]),
   record(7, '2026-10-08T09:35:21', 'ck_platform', 'thread_safe_10', '请把下面的示例当作普通文本展示：\n\n<script>alert("audit")</script>\n<img src=x onerror=alert(1)>\n\n不要执行这些 HTML 标签。', [agent('我会按原文保留示例中的标签与换行。')]),
   record(6, '2026-10-08T09:15:12', 'ck_platform', 'thread_web_01', '请继续。', firstContext),
-  record(5, '2026-10-07T16:45:39', 'ck_platform', 'thread_names_11', '请确认改名后，旧的审计记录还能通过同一个 Key 找到。', [agent('筛选与关联使用稳定 Key ID。每条记录显示采集时可用的名称快照，改名不回写旧记录。')], { keyName: 'Web Platform' }),
+  record(5, '2026-10-07T16:45:39', 'ck_platform', 'thread_names_11', '请确认改名后，旧的审计记录还能通过同一个 Key 找到。', [agent('筛选与关联使用稳定 Key ID。查询时使用宿主当前名称，改名后旧记录也显示新名称。')]),
   record(4, '2026-10-07T15:08:44', 'ck_product', 'thread_design_02', '保留原文，不要自动生成对话摘要。', [agent('为了方便审阅，可以在列表显示输入预览，在详情保留原始对话。')]),
   record(3, '2026-10-06T14:10:30', 'ck_research', 'thread_gap_12', '按上面第二种方案处理。', [agent('我会保留能够观察到的部分。', 'commentary')]),
   record(2, '2026-10-06T10:03:00', 'ck_legacy', 'thread_legacy_06', '先列出接口清单，暂时不要实现。', []),
-  record(1, '2026-10-05T09:12:05', 'ck_platform', 'thread_start_13', '我们开始设计 Prompt 审计页面。', [], { keyName: 'Web Platform' }),
+  record(1, '2026-10-05T09:12:05', 'ck_platform', 'thread_start_13', '我们开始设计 Prompt 审计页面。', []),
 ];
 
 // A deterministic fictional workload for scanning and paging, not gateway throughput.

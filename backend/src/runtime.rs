@@ -1,35 +1,77 @@
 //! request 阶段的透传采集、有界写入调度与宿主管理入口
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::BTreeMap,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use crossbeam_queue::ArrayQueue;
 use gateway_plugin_sdk::{
     PluginFault,
-    call::{
-        host::KeyListRequest,
-        management::{ManagementRegistration, ManagementResponse},
-    },
-    client::{ComposedPlugin, HostClient, PluginBuilder, RequestCall, TypedReply},
+    call::management::{ManagementRegistration, ManagementResponse},
+    client::{ComposedPlugin, PluginBuilder, RequestCall, TypedReply},
 };
-use tokio::sync::{Mutex, Notify, oneshot};
+use tokio::{
+    sync::{Mutex, Notify, oneshot},
+    task::JoinHandle,
+};
 
 use crate::{
     collection::{AuditDraft, RequestObservation, collect},
+    keys::CurrentKeys,
     query::QueryService,
-    store::{ObservedKey, Store},
+    store::{RETENTION_BATCH_SIZE, Store},
 };
 
 const QUEUE_CAPACITY: usize = 64;
 const BATCH_CAPACITY: usize = 32;
 const PERSIST_WAIT: Duration = Duration::from_secs(2);
 const MAX_OBSERVATION_BYTES: usize = 16 * 1024 * 1024;
+const RETENTION_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const RETENTION_BATCH_PAUSE: Duration = Duration::from_millis(100);
+const RETENTION_WAIT: Duration = Duration::from_secs(2);
+
+/// 独立于采集和写入的清理任务；无请求时仍执行，退出时停止。
+pub struct Retention {
+    task: JoinHandle<()>,
+}
+
+impl Retention {
+    pub fn start(store: Store) -> Self {
+        let task = tokio::spawn(async move {
+            loop {
+                let delay = match tokio::time::timeout(
+                    RETENTION_WAIT,
+                    store.delete_expired_batch(Utc::now()),
+                )
+                .await
+                {
+                    Ok(Ok(deleted)) if deleted == RETENTION_BATCH_SIZE as u64 => {
+                        RETENTION_BATCH_PAUSE
+                    }
+                    Ok(Ok(_)) => RETENTION_INTERVAL,
+                    _ => {
+                        eprintln!(
+                            "audit: retention batch failed or timed out; retrying at the next daily sweep"
+                        );
+                        RETENTION_INTERVAL
+                    }
+                };
+                tokio::time::sleep(delay).await;
+            }
+        });
+        Self { task }
+    }
+
+    pub async fn stop(self) {
+        self.task.abort();
+        let _ = self.task.await;
+    }
+}
 
 struct AuditQueue {
     tasks: ArrayQueue<AuditDraft>,
@@ -125,89 +167,19 @@ impl Writer {
     }
 }
 
-#[derive(Default)]
-struct KeyCache {
-    attempted: Option<Instant>,
-    observed_at: Option<DateTime<Utc>>,
-    names: HashMap<String, String>,
-}
-
-impl KeyCache {
-    async fn refresh(&mut self, host: &HostClient, store: &Store) {
-        if self
-            .attempted
-            .is_some_and(|time| time.elapsed() < Duration::from_secs(60))
-        {
-            return;
-        }
-        self.attempted = Some(Instant::now());
-        let mut keys = Vec::new();
-        let mut cursor = None;
-        let mut seen = HashSet::new();
-        loop {
-            let Ok(page) = host.list_keys(KeyListRequest { cursor, limit: 100 }).await else {
-                eprintln!("audit: Key directory unavailable; previous snapshot retained");
-                return;
-            };
-            keys.extend(page.keys);
-            cursor = page.next_cursor;
-            if cursor.is_none() {
-                break;
-            }
-            if !seen.insert(cursor.clone()) || keys.len() > 100_000 {
-                eprintln!(
-                    "audit: Key directory pagination budget exceeded; previous snapshot retained"
-                );
-                return;
-            }
-        }
-        let observed_at = Utc::now();
-        let directory = keys
-            .iter()
-            .map(|key| ObservedKey {
-                id: key.id.clone(),
-                name: (key.name.chars().count() <= 512).then(|| key.name.clone()),
-            })
-            .collect::<Vec<_>>();
-        if store.update_keys(&directory, observed_at).await.is_err() {
-            eprintln!("audit: Key directory persistence failed");
-            return;
-        }
-        self.names = keys
-            .into_iter()
-            .filter(|key| key.name.chars().count() <= 512)
-            .map(|key| (key.id, key.name))
-            .collect();
-        self.observed_at = Some(observed_at);
-    }
-}
-
 pub async fn plugin(store: Store, writer: Writer) -> anyhow::Result<ComposedPlugin> {
     let registration: ManagementRegistration =
         serde_json::from_slice(include_bytes!("../../dist/plugin/management.json"))?;
     let secret = store.secret("query_cursor").await?;
-    let keys = Arc::new(Mutex::new(KeyCache::default()));
-    let middleware_keys = keys.clone();
     let builder = PluginBuilder::from_json(include_bytes!("../../plugin.json"))?
         .middleware(move |call: RequestCall| {
             let writer = writer.clone();
-            let keys = middleware_keys.clone();
             async move {
                 let head = &call.request.head;
                 if head.endpoint == "/v1/responses"
                     && call.request.body.len() <= MAX_OBSERVATION_BYTES
                     && let Ok(body) = serde_json::from_slice(&call.request.body)
                 {
-                    let (key_name, key_name_observed_at) = keys
-                        .try_lock()
-                        .ok()
-                        .map(|cache| {
-                            (
-                                cache.names.get(&head.client_key_id).cloned(),
-                                cache.observed_at,
-                            )
-                        })
-                        .unwrap_or_default();
                     let observation = RequestObservation {
                         key_id: head.client_key_id.clone(),
                         request_id: head.request_id.clone(),
@@ -240,8 +212,6 @@ pub async fn plugin(store: Store, writer: Writer) -> anyhow::Result<ComposedPlug
                             })
                             .collect::<BTreeMap<_, _>>(),
                         observed_at: Utc::now(),
-                        key_name,
-                        key_name_observed_at,
                     };
                     if let Some(draft) = collect(&observation) {
                         writer.submit(draft);
@@ -253,22 +223,7 @@ pub async fn plugin(store: Store, writer: Writer) -> anyhow::Result<ComposedPlug
         .management(registration, move |call| {
             let store = store.clone();
             let secret = secret.clone();
-            let keys = keys.clone();
             async move {
-                if call.request.path == "api/keys" {
-                    let mut cache = keys.lock().await;
-                    if tokio::time::timeout(
-                        Duration::from_secs(1),
-                        cache.refresh(&call.host, &store),
-                    )
-                    .await
-                    .is_err()
-                    {
-                        eprintln!(
-                            "audit: Key directory refresh timed out; previous snapshot retained"
-                        );
-                    }
-                }
                 let result = QueryService::management(
                     &store,
                     secret,
@@ -276,6 +231,7 @@ pub async fn plugin(store: Store, writer: Writer) -> anyhow::Result<ComposedPlug
                     &call.request.path,
                     &call.request.query,
                     &call.payload,
+                    CurrentKeys::fetch(&call.host),
                 )
                 .await;
                 let payload = serde_json::to_vec(&result.value).map_err(|_| {
@@ -303,8 +259,6 @@ mod tests {
     fn draft(index: usize) -> AuditDraft {
         AuditDraft {
             key_id: "key".into(),
-            key_name: None,
-            key_name_observed_at: None,
             observed_at: Utc::now(),
             request_id: index.to_string(),
             thread_id: None,

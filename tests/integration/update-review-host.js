@@ -45,7 +45,6 @@ const management = async (name, query = {}) => endpoints[name].response.parse(aw
 const before = (await call('/api/admin/plugins/instances')).find((instance) => instance.id === instanceId);
 assert.ok(before?.running && before.enabled, 'Existing instance is running');
 const beforeTotal = (await management('audits')).total;
-const beforeKeys = await management('keys');
 if (before.artifactSha256 !== artifactSha256) {
   const uploaded = await fetch(`${base}/api/admin/plugins/artifacts/upload?sha256=${artifactSha256}`, { method: 'POST', headers: { cookie, 'content-type': 'application/gzip' }, body: archive, signal: AbortSignal.timeout(120000) });
   const installed = await uploaded.json();
@@ -72,7 +71,7 @@ assert.equal(view.target.artifactSha256, artifactSha256);
 assert.equal(view.target.revision, after.revision);
 for (const field of ['id', 'name', 'enabled', 'configuration', 'secretFields', 'bindings']) assert.deepEqual(after[field], before[field], `Updated instance preserves ${field}`);
 assert.equal((await management('audits')).total, beforeTotal, 'All existing audit rows survive update');
-assert.deepEqual(await management('keys'), beforeKeys, 'Historical Key directory survives update');
+await management('keys'); // Current names come from the host after the update.
 const time = await management('viewContext');
 new Intl.DateTimeFormat('en', { timeZone: time.timeZone });
 const denied = await fetch(`${base}${managementPrefix()}/api/api/view-context`, { signal: AbortSignal.timeout(15000) });
@@ -105,4 +104,4 @@ for (const row of selectedRows) {
   observations.push({ detail, input, context });
 }
 const matches = matchFixtureTargets(fixture.requests, observations);
-console.log(JSON.stringify({ verified: true, updated: before.artifactSha256 !== artifactSha256, instanceId, previousArtifactSha256: before.artifactSha256, artifactSha256, previousRevision: before.revision, revision: after.revision, allAuditCount: beforeTotal, fixtureInputCount: first.total, verifiedTargetCount: matches.length, fixtureSha256: digest(fixtureBytes), resourceHashes, preserved: ['configuration', 'secretFields', 'bindings', 'audits', 'historicalKeys'], managementGetRoutesVerified: Object.keys(endpoints).filter((name) => !endpoints[name].method || endpoints[name].method === 'GET'), pageUrl: `${base}/plugins/${instanceId}/prompt-audit` }, null, 2));
+console.log(JSON.stringify({ verified: true, updated: before.artifactSha256 !== artifactSha256, instanceId, previousArtifactSha256: before.artifactSha256, artifactSha256, previousRevision: before.revision, revision: after.revision, allAuditCount: beforeTotal, fixtureInputCount: first.total, verifiedTargetCount: matches.length, fixtureSha256: digest(fixtureBytes), resourceHashes, preserved: ['configuration', 'secretFields', 'bindings', 'audits'], managementGetRoutesVerified: Object.keys(endpoints).filter((name) => !endpoints[name].method || endpoints[name].method === 'GET'), pageUrl: `${base}/plugins/${instanceId}/prompt-audit` }, null, 2));

@@ -1,6 +1,6 @@
 //! 独立插件进程入口；数据库连接仅取自宿主 secrets 合并后的握手
 use codex_proxy_audit::{
-    runtime::{Writer, plugin},
+    runtime::{Retention, Writer, plugin},
     store::Store,
 };
 use gateway_plugin_sdk::client::{PluginSession, SessionConfig};
@@ -30,17 +30,19 @@ async fn run() -> anyhow::Result<()> {
     .await?;
     let configuration: Configuration =
         serde_json::from_value(session.handshake().configuration.clone())?;
-    let (writer, handler) = tokio::time::timeout(Duration::from_secs(4), async {
+    let (writer, handler, retention) = tokio::time::timeout(Duration::from_secs(4), async {
         let store = Store::connect(&configuration.database_url).await?;
         let writer = Writer::start(store.clone());
-        let handler = plugin(store, writer.clone()).await?;
-        Ok::<_, anyhow::Error>((writer, handler))
+        let handler = plugin(store.clone(), writer.clone()).await?;
+        let retention = Retention::start(store);
+        Ok::<_, anyhow::Error>((writer, handler, retention))
     })
     .await??;
     let result = tokio::select! {
         result = session.run(handler) => result,
         _ = shutdown_signal() => Ok(()),
     };
+    retention.stop().await;
     writer.drain().await;
     result?;
     Ok(())

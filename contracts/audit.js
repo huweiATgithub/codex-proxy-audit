@@ -13,7 +13,7 @@ const timestamp = z.iso.datetime({ precision: 3 });
 const displayTime = z.string().regex(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/).describe('Server-generated local time text; render verbatim, never parse as an instant.');
 const timeZone = z.string().min(1).max(128).describe('Shared audit IANA timezone, default UTC.');
 export const timeZoneSetting = z.object({ timeZone }).strict();
-const keyName = boundedText(512).nullable();
+const keyName = boundedText(512).nullable().describe('Current host Client Key name; null when the Key is missing or its name cannot be represented.');
 const pageQuery = { cursor: cursor.optional() };
 
 export const auditQuery = z.object({
@@ -82,7 +82,7 @@ export const contentPage = z.object({
   nextCursor: cursor.nullable(),
 });
 export const keyPage = z.object({
-  items: z.array(z.object({ id, names: z.array(boundedText(512)).max(32), historical: z.boolean() })).max(100),
+  items: z.array(z.object({ id, name: keyName })).max(100),
   nextCursor: cursor.nullable(),
 });
 export const errorResponse = z.object({ error: z.object({
@@ -95,7 +95,7 @@ export const endpoints = {
   audits: { path: 'api/audits', query: auditQuery, response: auditPage, summary: 'List input excerpts using a stable descending cursor.' },
   audit: { path: 'api/audit', query: detailQuery, response: auditDetail, summary: 'Get saved audit metadata, associated host request metadata and ordered content descriptors; no full bodies.' },
   content: { path: 'api/audit-content', query: contentQuery, response: contentPage, summary: 'Read ordered stored content in bounded chunks.' },
-  keys: { path: 'api/keys', query: keysQuery, response: keyPage, summary: 'List historical Key identities, ordered by ID.' },
+  keys: { path: 'api/keys', query: keysQuery, response: keyPage, summary: 'List current host Client Keys with their current names, ordered by ID.' },
 };
 
 export function parseQuery(endpoint, params) {

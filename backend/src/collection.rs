@@ -15,8 +15,6 @@ pub struct RequestObservation {
     pub body: Value,
     pub headers: BTreeMap<String, String>,
     pub observed_at: DateTime<Utc>,
-    pub key_name: Option<String>,
-    pub key_name_observed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -57,8 +55,6 @@ pub struct Repository {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AuditDraft {
     pub key_id: String,
-    pub key_name: Option<String>,
-    pub key_name_observed_at: Option<DateTime<Utc>>,
     pub observed_at: DateTime<Utc>,
     pub request_id: String,
     pub thread_id: Option<String>,
@@ -144,8 +140,6 @@ pub fn collect(observation: &RequestObservation) -> Option<AuditDraft> {
     context.reverse();
     Some(AuditDraft {
         key_id: observation.key_id.clone(),
-        key_name: bounded(observation.key_name.as_deref(), 512),
-        key_name_observed_at: observation.key_name_observed_at,
         observed_at: observation.observed_at,
         request_id: observation.request_id.clone(),
         thread_id: metadata.thread_id,
@@ -540,8 +534,6 @@ mod tests {
             observed_at: DateTime::parse_from_rfc3339("2026-10-09T12:00:00.000Z")
                 .unwrap()
                 .with_timezone(&Utc),
-            key_name: Some("name-a".to_owned()),
-            key_name_observed_at: None,
         }
     }
 

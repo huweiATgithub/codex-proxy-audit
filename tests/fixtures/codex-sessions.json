@@ -2,69 +2,47 @@
   "keys": [
     {
       "id": "ck_session_001",
-      "names": [
-        "会话样本 001"
-      ]
+      "name": "会话样本 001"
     },
     {
       "id": "ck_session_002",
-      "names": [
-        "会话样本 002"
-      ]
+      "name": "会话样本 002"
     },
     {
       "id": "ck_session_003",
-      "names": [
-        "会话样本 003"
-      ]
+      "name": "会话样本 003"
     },
     {
       "id": "ck_session_004",
-      "names": [
-        "会话样本 004"
-      ]
+      "name": "会话样本 004"
     },
     {
       "id": "ck_session_005",
-      "names": [
-        "会话样本 005"
-      ]
+      "name": "会话样本 005"
     },
     {
       "id": "ck_session_006",
-      "names": [
-        "会话样本 006"
-      ]
+      "name": "会话样本 006"
     },
     {
       "id": "ck_session_007",
-      "names": [
-        "会话样本 007"
-      ]
+      "name": "会话样本 007"
     },
     {
       "id": "ck_session_009",
-      "names": [
-        "会话样本 009"
-      ]
+      "name": "会话样本 009"
     },
     {
       "id": "ck_session_010",
-      "names": [
-        "会话样本 010"
-      ]
+      "name": "会话样本 010"
     },
     {
       "id": "ck_session_020",
-      "names": [
-        "会话样本 020"
-      ]
+      "name": "会话样本 020"
     },
     {
       "id": "ck_session_021",
-      "names": [
-        "会话样本 021"
-      ]
+      "name": "会话样本 021"
     }
   ],
   "audits": [
@@ -73,7 +51,6 @@
       "messageId": "msg_sample_020_067",
       "firstObservedAt": "2026-10-09T13:49:06.324Z",
       "keyId": "ck_session_020",
-      "keyName": "会话样本 020",
       "threadId": "thread_sample_020",
       "sessionId": "session_sample_020",
       "requestId": "req_sample_065",
@@ -226,7 +203,6 @@
       "messageId": "msg_sample_005_021",
       "firstObservedAt": "2026-10-09T13:44:17.527Z",
       "keyId": "ck_session_005",
-      "keyName": "会话样本 005",
       "threadId": "thread_sample_005",
       "sessionId": "session_sample_005",
       "requestId": "req_sample_014",
@@ -379,7 +355,6 @@
       "messageId": "msg_sample_006_020",
       "firstObservedAt": "2026-10-09T13:40:04.279Z",
       "keyId": "ck_session_006",
-      "keyName": "会话样本 006",
       "threadId": "thread_sample_006",
       "sessionId": "session_sample_006",
       "requestId": "req_sample_019",
@@ -532,7 +507,6 @@
       "messageId": "msg_sample_006_017",
       "firstObservedAt": "2026-10-09T13:36:48.078Z",
       "keyId": "ck_session_006",
-      "keyName": "会话样本 006",
       "threadId": "thread_sample_006",
       "sessionId": "session_sample_006",
       "requestId": "req_sample_018",
@@ -685,7 +659,6 @@
       "messageId": "msg_sample_003_011",
       "firstObservedAt": "2026-10-09T13:35:34.043Z",
       "keyId": "ck_session_003",
-      "keyName": "会话样本 003",
       "threadId": "thread_sample_003",
       "sessionId": "session_sample_003",
       "requestId": "req_sample_005",
@@ -816,7 +789,6 @@
       "messageId": "msg_sample_003_010",
       "firstObservedAt": "2026-10-09T13:35:34.039Z",
       "keyId": "ck_session_003",
-      "keyName": "会话样本 003",
       "threadId": "thread_sample_003",
       "sessionId": "session_sample_003",
       "requestId": "req_sample_004",
@@ -936,7 +908,6 @@
       "messageId": "msg_sample_006_013",
       "firstObservedAt": "2026-10-09T13:34:05.897Z",
       "keyId": "ck_session_006",
-      "keyName": "会话样本 006",
       "threadId": "thread_sample_006",
       "sessionId": "session_sample_006",
       "requestId": "req_sample_017",
@@ -1089,7 +1060,6 @@
       "messageId": "msg_sample_003_008",
       "firstObservedAt": "2026-10-09T13:31:22.985Z",
       "keyId": "ck_session_003",
-      "keyName": "会话样本 003",
       "threadId": "thread_sample_003",
       "sessionId": "session_sample_003",
       "requestId": "req_sample_003",
@@ -1187,7 +1157,6 @@
       "messageId": "msg_sample_006_010",
       "firstObservedAt": "2026-10-09T13:28:58.321Z",
       "keyId": "ck_session_006",
-      "keyName": "会话样本 006",
       "threadId": "thread_sample_006",
       "sessionId": "session_sample_006",
       "requestId": "req_sample_016",
@@ -1307,7 +1276,6 @@
       "messageId": "msg_sample_004_020",
       "firstObservedAt": "2026-10-09T13:21:35.399Z",
       "keyId": "ck_session_004",
-      "keyName": "会话样本 004",
       "threadId": "thread_sample_004",
       "sessionId": "session_sample_004",
       "requestId": "req_sample_009",
@@ -1460,7 +1428,6 @@
       "messageId": "msg_sample_006_005",
       "firstObservedAt": "2026-10-09T13:18:23.273Z",
       "keyId": "ck_session_006",
-      "keyName": "会话样本 006",
       "threadId": "thread_sample_006",
       "sessionId": "session_sample_006",
       "requestId": "req_sample_015",
@@ -1525,7 +1492,6 @@
       "messageId": "msg_sample_001_007",
       "firstObservedAt": "2026-10-09T13:11:06.754Z",
       "keyId": "ck_session_001",
-      "keyName": "会话样本 001",
       "threadId": "thread_sample_001",
       "sessionId": "session_sample_001",
       "requestId": "req_sample_001",
@@ -1612,7 +1578,6 @@
       "messageId": "msg_sample_005_015",
       "firstObservedAt": "2026-10-09T13:07:56.505Z",
       "keyId": "ck_session_005",
-      "keyName": "会话样本 005",
       "threadId": "thread_sample_005",
       "sessionId": "session_sample_005",
       "requestId": "req_sample_013",
@@ -1765,7 +1730,6 @@
       "messageId": "msg_sample_004_014",
       "firstObservedAt": "2026-10-09T13:07:04.468Z",
       "keyId": "ck_session_004",
-      "keyName": "会话样本 004",
       "threadId": "thread_sample_004",
       "sessionId": "session_sample_004",
       "requestId": "req_sample_008",
@@ -1918,7 +1882,6 @@
       "messageId": "msg_sample_020_044",
       "firstObservedAt": "2026-10-09T13:06:16.810Z",
       "keyId": "ck_session_020",
-      "keyName": "会话样本 020",
       "threadId": "thread_sample_020",
       "sessionId": "session_sample_020",
       "requestId": "req_sample_064",
@@ -2071,7 +2034,6 @@
       "messageId": "msg_sample_002_007",
       "firstObservedAt": "2026-10-09T13:03:26.815Z",
       "keyId": "ck_session_002",
-      "keyName": "会话样本 002",
       "threadId": "thread_sample_002",
       "sessionId": "session_sample_002",
       "requestId": "req_sample_002",
@@ -2158,7 +2120,6 @@
       "messageId": "msg_sample_020_041",
       "firstObservedAt": "2026-10-09T13:01:25.169Z",
       "keyId": "ck_session_020",
-      "keyName": "会话样本 020",
       "threadId": "thread_sample_020",
       "sessionId": "session_sample_020",
       "requestId": "req_sample_063",
@@ -2311,7 +2272,6 @@
       "messageId": "msg_sample_020_039",
       "firstObservedAt": "2026-10-09T13:00:45.354Z",
       "keyId": "ck_session_020",
-      "keyName": "会话样本 020",
       "threadId": "thread_sample_020",
       "sessionId": "session_sample_020",
       "requestId": "req_sample_062",
@@ -2464,7 +2424,6 @@
       "messageId": "msg_sample_004_011",
       "firstObservedAt": "2026-10-09T12:54:43.532Z",
       "keyId": "ck_session_004",
-      "keyName": "会话样本 004",
       "threadId": "thread_sample_004",
       "sessionId": "session_sample_004",
       "requestId": "req_sample_007",
@@ -2595,7 +2554,6 @@
       "messageId": "msg_sample_005_011",
       "firstObservedAt": "2026-10-09T12:53:33.773Z",
       "keyId": "ck_session_005",
-      "keyName": "会话样本 005",
       "threadId": "thread_sample_005",
       "sessionId": "session_sample_005",
       "requestId": "req_sample_012",
@@ -2726,7 +2684,6 @@
       "messageId": "msg_sample_005_008",
       "firstObservedAt": "2026-10-09T12:48:44.145Z",
       "keyId": "ck_session_005",
-      "keyName": "会话样本 005",
       "threadId": "thread_sample_005",
       "sessionId": "session_sample_005",
       "requestId": "req_sample_011",
@@ -2824,7 +2781,6 @@
       "messageId": "msg_sample_004_007",
       "firstObservedAt": "2026-10-09T12:46:10.344Z",
       "keyId": "ck_session_004",
-      "keyName": "会话样本 004",
       "threadId": "thread_sample_004",
       "sessionId": "session_sample_004",
       "requestId": "req_sample_006",
@@ -2911,7 +2867,6 @@
       "messageId": "msg_sample_005_006",
       "firstObservedAt": "2026-10-09T12:33:52.659Z",
       "keyId": "ck_session_005",
-      "keyName": "会话样本 005",
       "threadId": "thread_sample_005",
       "sessionId": "session_sample_005",
       "requestId": "req_sample_010",
@@ -2987,7 +2942,6 @@
       "messageId": "msg_sample_010_034",
       "firstObservedAt": "2026-10-09T12:32:10.993Z",
       "keyId": "ck_session_010",
-      "keyName": "会话样本 010",
       "threadId": "thread_sample_010",
       "sessionId": "session_sample_010",
       "requestId": "req_sample_043",
@@ -3140,7 +3094,6 @@
       "messageId": "msg_sample_021_074",
       "firstObservedAt": "2026-10-09T12:30:16.356Z",
       "keyId": "ck_session_021",
-      "keyName": "会话样本 021",
       "threadId": "thread_sample_021",
       "sessionId": "session_sample_021",
       "requestId": "req_sample_080",
@@ -3293,7 +3246,6 @@
       "messageId": "msg_sample_021_070",
       "firstObservedAt": "2026-10-09T12:14:58.063Z",
       "keyId": "ck_session_021",
-      "keyName": "会话样本 021",
       "threadId": "thread_sample_021",
       "sessionId": "session_sample_021",
       "requestId": "req_sample_079",
@@ -3446,7 +3398,6 @@
       "messageId": "msg_sample_021_065",
       "firstObservedAt": "2026-10-09T11:55:44.206Z",
       "keyId": "ck_session_021",
-      "keyName": "会话样本 021",
       "threadId": "thread_sample_021",
       "sessionId": "session_sample_021",
       "requestId": "req_sample_078",
@@ -3599,7 +3550,6 @@
       "messageId": "msg_sample_021_059",
       "firstObservedAt": "2026-10-09T11:38:52.374Z",
       "keyId": "ck_session_021",
-      "keyName": "会话样本 021",
       "threadId": "thread_sample_021",
       "sessionId": "session_sample_021",
       "requestId": "req_sample_077",
@@ -3752,7 +3702,6 @@
       "messageId": "msg_sample_010_025",
       "firstObservedAt": "2026-10-09T11:37:23.749Z",
       "keyId": "ck_session_010",
-      "keyName": "会话样本 010",
       "threadId": "thread_sample_010",
       "sessionId": "session_sample_010",
       "requestId": "req_sample_042",
@@ -3905,7 +3854,6 @@
       "messageId": "msg_sample_020_017",
       "firstObservedAt": "2026-10-09T11:22:58.311Z",
       "keyId": "ck_session_020",
-      "keyName": "会话样本 020",
       "threadId": "thread_sample_020",
       "sessionId": "session_sample_020",
       "requestId": "req_sample_061",
@@ -4058,7 +4006,6 @@
       "messageId": "msg_sample_007_033",
       "firstObservedAt": "2026-10-09T11:21:53.042Z",
       "keyId": "ck_session_007",
-      "keyName": "会话样本 007",
       "threadId": "thread_sample_007",
       "sessionId": "session_sample_007",
       "requestId": "req_sample_026",
@@ -4211,7 +4158,6 @@
       "messageId": "msg_sample_010_019",
       "firstObservedAt": "2026-10-09T11:21:27.208Z",
       "keyId": "ck_session_010",
-      "keyName": "会话样本 010",
       "threadId": "thread_sample_010",
       "sessionId": "session_sample_010",
       "requestId": "req_sample_041",
@@ -4364,7 +4310,6 @@
       "messageId": "msg_sample_021_053",
       "firstObservedAt": "2026-10-09T11:19:48.111Z",
       "keyId": "ck_session_021",
-      "keyName": "会话样本 021",
       "threadId": "thread_sample_021",
       "sessionId": "session_sample_021",
       "requestId": "req_sample_076",
@@ -4517,7 +4462,6 @@
       "messageId": "msg_sample_021_050",
       "firstObservedAt": "2026-10-09T11:06:38.775Z",
       "keyId": "ck_session_021",
-      "keyName": "会话样本 021",
       "threadId": "thread_sample_021",
       "sessionId": "session_sample_021",
       "requestId": "req_sample_075",
@@ -4670,7 +4614,6 @@
       "messageId": "msg_sample_009_040",
       "firstObservedAt": "2026-10-09T11:04:44.112Z",
       "keyId": "ck_session_009",
-      "keyName": "会话样本 009",
       "threadId": "thread_sample_009",
       "sessionId": "session_sample_009",
       "requestId": "req_sample_036",
@@ -4823,7 +4766,6 @@
       "messageId": "msg_sample_007_024",
       "firstObservedAt": "2026-10-09T10:56:43.169Z",
       "keyId": "ck_session_007",
-      "keyName": "会话样本 007",
       "threadId": "thread_sample_007",
       "sessionId": "session_sample_007",
       "requestId": "req_sample_025",
@@ -4976,7 +4918,6 @@
       "messageId": "msg_sample_009_036",
       "firstObservedAt": "2026-10-09T10:55:40.459Z",
       "keyId": "ck_session_009",
-      "keyName": "会话样本 009",
       "threadId": "thread_sample_009",
       "sessionId": "session_sample_009",
       "requestId": "req_sample_035",
@@ -5129,7 +5070,6 @@
       "messageId": "msg_sample_021_044",
       "firstObservedAt": "2026-10-09T10:50:21.050Z",
       "keyId": "ck_session_021",
-      "keyName": "会话样本 021",
       "threadId": "thread_sample_021",
       "sessionId": "session_sample_021",
       "requestId": "req_sample_074",
@@ -5282,7 +5222,6 @@
       "messageId": "msg_sample_007_021",
       "firstObservedAt": "2026-10-09T10:46:28.535Z",
       "keyId": "ck_session_007",
-      "keyName": "会话样本 007",
       "threadId": "thread_sample_007",
       "sessionId": "session_sample_007",
       "requestId": "req_sample_024",
@@ -5435,7 +5374,6 @@
       "messageId": "msg_sample_009_031",
       "firstObservedAt": "2026-10-09T09:12:18.555Z",
       "keyId": "ck_session_009",
-      "keyName": "会话样本 009",
       "threadId": "thread_sample_009",
       "sessionId": "session_sample_009",
       "requestId": "req_sample_034",
@@ -5871,7 +5809,6 @@
     "timestampSemantics": "Session response_item timestamp mapped for mock review; not gateway first observation.",
     "syntheticMetadata": [
       "keyId",
-      "keyName",
       "threadId",
       "sessionId",
       "requestId"

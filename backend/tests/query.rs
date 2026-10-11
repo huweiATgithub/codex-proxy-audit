@@ -4,8 +4,9 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use codex_proxy_audit::{
     collection::{RequestObservation, collect},
+    keys::CurrentKeys,
     query::QueryService,
-    store::{ObservedKey, Store},
+    store::Store,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -30,8 +31,6 @@ fn observation(
         observed_at: DateTime::parse_from_rfc3339(time)
             .unwrap()
             .with_timezone(&Utc),
-        key_name: Some("Query Test Key".into()),
-        key_name_observed_at: Some(Utc::now()),
     }
 }
 async fn ok(service: &QueryService, path: &str, pairs: &[(&str, &str)]) -> Value {
@@ -60,6 +59,7 @@ async fn pg_queries_follow_contract_and_read_host_metadata() {
         store.pool().clone(),
         "America/New_York".parse().unwrap(),
         secret.clone(),
+        CurrentKeys::default(),
     )
     .unwrap();
     for index in 0..53 {
@@ -124,6 +124,7 @@ async fn pg_queries_follow_contract_and_read_host_metadata() {
         store.pool().clone(),
         "America/New_York".parse().unwrap(),
         store.secret("query_cursor").await.unwrap(),
+        CurrentKeys::default(),
     )
     .unwrap();
     assert_eq!(
@@ -162,7 +163,13 @@ async fn pg_queries_follow_contract_and_read_host_metadata() {
         .await["total"],
         0
     );
-    let utc = QueryService::new(store.pool().clone(), chrono_tz::UTC, secret).unwrap();
+    let utc = QueryService::new(
+        store.pool().clone(),
+        chrono_tz::UTC,
+        secret,
+        CurrentKeys::default(),
+    )
+    .unwrap();
     assert_eq!(
         utc.handle(
             "api/audits",
@@ -320,43 +327,6 @@ async fn pg_queries_follow_contract_and_read_host_metadata() {
         1200
     );
 
-    store
-        .update_keys(
-            &[ObservedKey {
-                id: key.clone(),
-                name: Some("Renamed".into()),
-            }],
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-    store.update_keys(&[], Utc::now()).await.unwrap();
-    let mut names = Vec::new();
-    let mut cursor = None::<String>;
-    let mut historical = false;
-    loop {
-        let params = cursor
-            .as_deref()
-            .map(|value| vec![("cursor", value)])
-            .unwrap_or_default();
-        let page = ok(&service, "api/keys", &params).await;
-        if let Some(item) = page["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|item| item["id"] == key)
-        {
-            names = item["names"].as_array().unwrap().clone();
-            historical = item["historical"].as_bool().unwrap();
-        }
-        cursor = page["nextCursor"].as_str().map(str::to_string);
-        if cursor.is_none() {
-            break;
-        }
-    }
-    assert!(historical);
-    assert_eq!(names[0], "Renamed");
-    assert!(names.contains(&json!("Query Test Key")));
     store.close().await;
     assert_eq!(
         service

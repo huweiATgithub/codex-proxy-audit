@@ -17,7 +17,6 @@ struct FixtureAudit {
     id: String,
     message_id: String,
     key_id: String,
-    key_name: Option<String>,
     thread_id: Option<String>,
     session_id: Option<String>,
     turn_id: Option<String>,
@@ -123,8 +122,6 @@ fn observation(audit: &FixtureAudit, request_id: String) -> RequestObservation {
         observed_at: DateTime::parse_from_rfc3339("2026-10-09T12:00:00.000Z")
             .unwrap()
             .with_timezone(&Utc),
-        key_name: audit.key_name.clone(),
-        key_name_observed_at: None,
     }
 }
 

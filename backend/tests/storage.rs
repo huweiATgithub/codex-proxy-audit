@@ -8,8 +8,10 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use codex_proxy_audit::{
     collection::{AuditDraft, RequestObservation, collect},
+    keys::CurrentKeys,
     query::QueryService,
-    store::{ObservedKey, Store, decode_text, search_text},
+    runtime::Retention,
+    store::{RETENTION_BATCH_SIZE, Store, decode_text, search_text},
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
@@ -76,7 +78,7 @@ impl Database {
             .set_password(Some(&password))
             .map_err(|()| anyhow::anyhow!("set test role password"))?;
         let audit_url = database_url.to_string();
-        if version == 1 {
+        if version == 1 || version == 2 {
             let legacy = PgPool::connect(&audit_url).await?;
             sqlx::raw_sql(include_str!("../migrations/0001_audit.sql"))
                 .execute(&legacy)
@@ -112,6 +114,12 @@ impl Database {
             .bind(i64::try_from(text.chars().count())?)
             .execute(&legacy)
             .await?;
+            if version == 2 {
+                sqlx::raw_sql(include_str!("../migrations/0002_request_audit.sql"))
+                    .execute(&legacy)
+                    .await?;
+                sqlx::raw_sql("INSERT INTO prompt_audit.schema_migrations(version) VALUES (2); INSERT INTO prompt_audit.key_directory(id,present,observed_at) VALUES ('key-a',true,now()); INSERT INTO prompt_audit.key_names(key_id,name,observed_at) VALUES ('key-a','obsolete name',now()); INSERT INTO prompt_audit.settings(name,value) VALUES ('timeZone',convert_to('Asia/Tokyo','UTF8')),('query_cursor',decode(repeat('ab',32),'hex')); UPDATE prompt_audit.audits SET key_name_observed_at=now();").execute(&legacy).await?;
+            }
             legacy.close().await;
         }
         let store = Store::connect(&audit_url).await?;
@@ -130,6 +138,7 @@ impl Database {
             self.store.pool().clone(),
             time_zone.parse().map_err(anyhow::Error::msg)?,
             self.store.secret("query_cursor").await?,
+            CurrentKeys::default(),
         )
         .map_err(anyhow::Error::msg)
     }
@@ -160,8 +169,6 @@ fn observation(key: &str, thread: &str, input: Value) -> RequestObservation {
         observed_at: DateTime::parse_from_rfc3339("2026-10-09T03:59:59.123456Z")
             .unwrap()
             .with_timezone(&Utc),
-        key_name: Some("原名称".to_string()),
-        key_name_observed_at: Some(Utc::now()),
     }
 }
 
@@ -248,7 +255,7 @@ async fn failed_body_write_rolls_back_entire_batch_and_contents() -> Result<()> 
     ];
     assert!(database.store.persist_batch(&drafts).await.is_err());
     assert_eq!(audit_count(&database.store).await?, 0);
-    for table in ["contents", "key_directory", "key_names"] {
+    for table in ["contents"] {
         let count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM prompt_audit.{table}"))
             .fetch_one(database.store.pool())
             .await?;
@@ -301,6 +308,199 @@ async fn blocked_database_write_times_out_and_recovers_after_lock_release() -> R
     database.clean().await
 }
 
+fn retention_draft(observed_at: DateTime<Utc>) -> AuditDraft {
+    let mut input = draft(&observation(
+        "key-retention",
+        "thread-retention",
+        json!([{"role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"前序方案"}]},user("input", "请继续")]),
+    ));
+    input.observed_at = observed_at;
+    input
+}
+
+#[tokio::test]
+#[ignore = "requires AUDIT_TEST_DATABASE_URL pointing to isolated PostgreSQL"]
+async fn retention_preserves_the_72_hour_boundary_and_cascades_only_expired_bodies() -> Result<()> {
+    let database = Database::create().await?;
+    // This interval crosses New York's DST change; retention is elapsed UTC time.
+    let now = DateTime::parse_from_rfc3339("2026-11-03T06:30:00.123Z")?.with_timezone(&Utc);
+    let cutoff = now - chrono::TimeDelta::hours(72);
+    let time_zone = "America/New_York".parse()?;
+    database.store.save_time_zone(time_zone).await?;
+    let secret = database.store.secret("query_cursor").await?;
+    let mut inputs = Vec::new();
+    for (request_id, observed_at) in [
+        ("expired", cutoff - chrono::TimeDelta::milliseconds(1)),
+        ("boundary", cutoff),
+        ("recent", now - chrono::TimeDelta::hours(1)),
+        ("future", now + chrono::TimeDelta::hours(1)),
+    ] {
+        let mut input = retention_draft(observed_at);
+        input.request_id = request_id.to_string();
+        inputs.push(input);
+    }
+    database.store.persist_batch(&inputs).await?;
+    sqlx::query("INSERT INTO public.model_requests(id) VALUES ('expired')")
+        .execute(&database.host)
+        .await?;
+    let expired_id: String =
+        sqlx::query_scalar("SELECT id FROM prompt_audit.audits WHERE request_id='expired'")
+            .fetch_one(database.store.pool())
+            .await?;
+    assert_eq!(database.store.delete_expired_batch(now).await?, 1);
+    let retained: Vec<String> =
+        sqlx::query_scalar("SELECT request_id FROM prompt_audit.audits ORDER BY request_id")
+            .fetch_all(database.store.pool())
+            .await?;
+    assert_eq!(retained, ["boundary", "future", "recent"]);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM prompt_audit.contents")
+            .fetch_one(database.store.pool())
+            .await?,
+        6
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM public.model_requests")
+            .fetch_one(&database.host)
+            .await?,
+        1
+    );
+    assert_eq!(database.store.secret("query_cursor").await?, secret);
+    assert_eq!(database.store.time_zone().await?, time_zone);
+    let response = database
+        .query("UTC")
+        .await?
+        .handle("api/audit", &format!("id={expired_id}"))
+        .await;
+    assert_eq!(response.status, 404);
+    assert_eq!(database.store.delete_expired_batch(now).await?, 0);
+    database.clean().await
+}
+
+#[tokio::test]
+#[ignore = "requires AUDIT_TEST_DATABASE_URL pointing to isolated PostgreSQL"]
+async fn retention_batches_skip_locked_rows_and_allow_concurrent_cleanup_and_writes() -> Result<()>
+{
+    let database = Database::create().await?;
+    let now = Utc::now();
+    let expired = retention_draft(now - chrono::TimeDelta::days(4));
+    let inputs = vec![expired; (RETENTION_BATCH_SIZE * 2 + 5) as usize];
+    for batch in inputs.chunks(32) {
+        database.store.persist_batch(batch).await?;
+    }
+    let mut holder = database.host.begin().await?;
+    let locked_id: String = sqlx::query_scalar(
+        "SELECT id FROM prompt_audit.audits ORDER BY first_observed_at, id LIMIT 1 FOR UPDATE",
+    )
+    .fetch_one(&mut *holder)
+    .await?;
+    let recent = [retention_draft(now)];
+    let (first, second, write) = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::join!(
+            database.store.delete_expired_batch(now),
+            database.store.delete_expired_batch(now),
+            database.store.persist_batch(&recent),
+        )
+    })
+    .await
+    .context("cleanup must skip the locked row and allow a concurrent writer")?;
+    assert_eq!(first?, RETENTION_BATCH_SIZE as u64);
+    assert_eq!(second?, RETENTION_BATCH_SIZE as u64);
+    write?;
+    assert_eq!(audit_count(&database.store).await?, 6);
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM prompt_audit.audits WHERE id=$1)"
+        )
+        .bind(locked_id)
+        .fetch_one(database.store.pool())
+        .await?
+    );
+    assert_eq!(database.store.delete_expired_batch(now).await?, 4);
+    holder.rollback().await?;
+    assert_eq!(database.store.delete_expired_batch(now).await?, 1);
+    assert_eq!(database.store.delete_expired_batch(now).await?, 0);
+    assert_eq!(audit_count(&database.store).await?, 1);
+    database.clean().await
+}
+
+#[tokio::test]
+#[ignore = "requires AUDIT_TEST_DATABASE_URL pointing to isolated PostgreSQL"]
+async fn retention_cascade_lock_timeout_rolls_back_the_batch_and_can_retry() -> Result<()> {
+    let database = Database::create().await?;
+    let now = Utc::now();
+    let expired = retention_draft(now - chrono::TimeDelta::days(4));
+    database
+        .store
+        .persist_batch(&[expired.clone(), expired])
+        .await?;
+    let mut holder = database.host.begin().await?;
+    sqlx::query("LOCK TABLE prompt_audit.contents IN SHARE MODE")
+        .execute(&mut *holder)
+        .await?;
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        database.store.delete_expired_batch(now),
+    )
+    .await
+    .context("a blocked cascade must time out")?;
+    assert!(result.is_err());
+    assert_eq!(audit_count(&database.store).await?, 2);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM prompt_audit.contents")
+            .fetch_one(database.store.pool())
+            .await?,
+        4
+    );
+    holder.rollback().await?;
+    assert_eq!(database.store.delete_expired_batch(now).await?, 2);
+    assert_eq!(audit_count(&database.store).await?, 0);
+    database.clean().await
+}
+
+#[tokio::test]
+#[ignore = "requires AUDIT_TEST_DATABASE_URL pointing to isolated PostgreSQL"]
+async fn retention_worker_catches_up_at_startup_and_runs_daily_without_requests() -> Result<()> {
+    let database = Database::create().await?;
+    let now = Utc::now();
+    let expired = retention_draft(now - chrono::TimeDelta::days(4));
+    let inputs = vec![expired.clone(); (RETENTION_BATCH_SIZE * 2 + 1) as usize];
+    for batch in inputs.chunks(32) {
+        database.store.persist_batch(batch).await?;
+    }
+    database
+        .store
+        .persist_batch(&[retention_draft(now)])
+        .await?;
+    let worker = Retention::start(database.store.clone());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while audit_count(&database.store).await? != 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("startup must clear more than one batch without waiting for requests")??;
+    database.store.persist_batch(&[expired]).await?;
+    // Advance the scheduler's clock, then resume it before database I/O so
+    // pool/statement timeouts still use real elapsed time.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(24 * 60 * 60 + 1)).await;
+    tokio::time::resume();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while audit_count(&database.store).await? != 1 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("daily cleanup must run again without incoming requests")??;
+    tokio::time::timeout(Duration::from_secs(1), worker.stop())
+        .await
+        .context("shutdown must not wait for the next retention interval")?;
+    database.clean().await
+}
+
 #[tokio::test]
 #[ignore = "requires AUDIT_TEST_DATABASE_URL pointing to isolated PostgreSQL"]
 async fn latest_input_keeps_immutable_context_from_its_own_request() -> Result<()> {
@@ -346,36 +546,131 @@ async fn latest_input_keeps_immutable_context_from_its_own_request() -> Result<(
 
 #[tokio::test]
 #[ignore = "requires AUDIT_TEST_DATABASE_URL pointing to isolated PostgreSQL"]
-async fn key_directory_keeps_observed_names_when_key_disappears() -> Result<()> {
+async fn current_key_names_resolve_old_rows_and_change_after_rename_or_deletion() -> Result<()> {
     let database = Database::create().await?;
     persist(
         &database.store,
         &observation("key-a", "thread-a", json!([user("input-a", "用户A")])),
     )
     .await?;
-    database
-        .store
-        .update_keys(
-            &[ObservedKey {
-                id: "key-a".to_string(),
-                name: Some("新名称".to_string()),
-            }],
-            Utc::now(),
+    let secret = database.store.secret("query_cursor").await?;
+    let snapshot: Vec<(String, String)> =
+        sqlx::query_as("SELECT id,key_id FROM prompt_audit.audits")
+            .fetch_all(database.store.pool())
+            .await?;
+    for name in [Some("原名称"), Some("新名称"), None] {
+        let keys = CurrentKeys::from_keys(
+            name.map(|name| {
+                vec![gateway_plugin_sdk::call::host::ClientKey {
+                    id: "key-a".into(),
+                    name: name.into(),
+                    enabled: true,
+                }]
+            })
+            .unwrap_or_default(),
         )
-        .await?;
-    database.store.update_keys(&[], Utc::now()).await?;
-    let service = database.query("UTC").await?;
-    let result = service.handle("api/keys", "").await;
-    assert_eq!(result.status, 200);
-    let key = result.value["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|item| item["id"] == "key-a")
         .unwrap();
-    assert_eq!(key["historical"], true);
-    assert!(key["names"].as_array().unwrap().contains(&json!("原名称")));
-    assert!(key["names"].as_array().unwrap().contains(&json!("新名称")));
+        let service = QueryService::new(
+            database.store.pool().clone(),
+            chrono_tz::UTC,
+            secret.clone(),
+            keys,
+        )
+        .unwrap();
+        let list = service.handle("api/audits", "key=key-a").await;
+        assert_eq!(list.status, 200);
+        assert_eq!(list.value["items"][0]["keyName"], json!(name));
+        let detail = service
+            .handle("api/audit", &format!("id={}", snapshot[0].0))
+            .await;
+        assert_eq!(detail.status, 200);
+        assert_eq!(detail.value["keyName"], json!(name));
+        let filter = service.handle("api/keys", "").await;
+        assert_eq!(
+            filter.value["items"].as_array().unwrap().len(),
+            usize::from(name.is_some())
+        );
+        if let Some(name) = name {
+            assert_eq!(filter.value["items"][0]["name"], name);
+        }
+    }
+    for path in ["api/audits", "api/audit", "api/keys"] {
+        let failed = QueryService::management(
+            &database.store,
+            secret.clone(),
+            "GET",
+            path,
+            "",
+            &[],
+            std::future::ready(Err(codex_proxy_audit::keys::KeyLookupError)),
+        )
+        .await;
+        assert_eq!(failed.status, 503);
+        assert_eq!(failed.value["error"]["code"], "unavailable");
+    }
+    let independent = QueryService::management(
+        &database.store,
+        secret.clone(),
+        "GET",
+        "api/view-context",
+        "",
+        &[],
+        async { panic!("view context must not fetch names") },
+    )
+    .await;
+    assert_eq!(independent.status, 200);
+    let saved = QueryService::management(
+        &database.store,
+        secret.clone(),
+        "PUT",
+        "api/time-zone",
+        "",
+        br#"{"timeZone":"UTC"}"#,
+        async { panic!("timezone save must not fetch names") },
+    )
+    .await;
+    assert_eq!(saved.status, 200);
+    let after: Vec<(String, String)> = sqlx::query_as("SELECT id,key_id FROM prompt_audit.audits")
+        .fetch_all(database.store.pool())
+        .await?;
+    assert_eq!(snapshot, after);
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM information_schema.columns WHERE table_schema='prompt_audit' AND table_name='audits' AND column_name IN ('key_name','key_name_observed_at')").fetch_one(database.store.pool()).await?, 0);
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM information_schema.tables WHERE table_schema='prompt_audit' AND table_name IN ('key_directory','key_names')").fetch_one(database.store.pool()).await?, 0);
+    database.clean().await
+}
+
+#[tokio::test]
+#[ignore = "requires AUDIT_TEST_DATABASE_URL pointing to isolated PostgreSQL"]
+async fn version_two_upgrade_removes_names_and_preserves_audit_content_and_settings() -> Result<()>
+{
+    let database = Database::create_at_version(2).await?;
+    let rows: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT id,key_id,request_id FROM prompt_audit.audits")
+            .fetch_all(database.store.pool())
+            .await?;
+    assert_eq!(
+        rows,
+        vec![("old-audit".into(), "key-a".into(), "old-request".into())]
+    );
+    let blocks: Value =
+        sqlx::query_scalar("SELECT blocks FROM prompt_audit.contents WHERE id='old-content'")
+            .fetch_one(database.store.pool())
+            .await?;
+    assert_eq!(blocks, json!([{"kind":"text","text":"升级前的正文\0🦀"}]));
+    assert_eq!(database.store.time_zone().await?, chrono_tz::Asia::Tokyo);
+    assert_eq!(database.store.secret("query_cursor").await?, vec![0xab; 32]);
+    for object in ["prompt_audit.key_names", "prompt_audit.key_directory"] {
+        assert!(
+            !sqlx::query_scalar::<_, bool>("SELECT to_regclass($1) IS NOT NULL")
+                .bind(object)
+                .fetch_one(database.store.pool())
+                .await?
+        );
+    }
+    let restarted = Store::connect(&database.audit_url).await?;
+    assert_eq!(restarted.secret("query_cursor").await?, vec![0xab; 32]);
+    assert_eq!(restarted.time_zone().await?, chrono_tz::Asia::Tokyo);
+    restarted.close().await;
     database.clean().await
 }
 
@@ -402,7 +697,7 @@ async fn version_one_upgrade_preserves_audits_and_removes_deduplication_state() 
         sqlx::query_scalar("SELECT max(version) FROM prompt_audit.schema_migrations")
             .fetch_one(database.store.pool())
             .await?;
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     let obsolete: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM information_schema.columns WHERE table_schema='prompt_audit' \
          AND table_name='audits' AND column_name IN \
@@ -439,7 +734,7 @@ async fn version_one_upgrade_preserves_audits_and_removes_deduplication_state() 
 #[ignore = "requires AUDIT_TEST_DATABASE_URL pointing to isolated PostgreSQL"]
 async fn newer_database_schema_is_rejected_without_modification() -> Result<()> {
     let database = Database::create().await?;
-    sqlx::query("INSERT INTO prompt_audit.schema_migrations(version) VALUES (3)")
+    sqlx::query("INSERT INTO prompt_audit.schema_migrations(version) VALUES (4)")
         .execute(database.store.pool())
         .await?;
     let error = match Store::connect(&database.audit_url).await {
@@ -455,7 +750,7 @@ async fn newer_database_schema_is_rejected_without_modification() -> Result<()> 
         sqlx::query_scalar("SELECT max(version) FROM prompt_audit.schema_migrations")
             .fetch_one(database.store.pool())
             .await?;
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     database.clean().await
 }
 
@@ -662,6 +957,7 @@ async fn shared_timezone_is_parsed_persistent_and_preserves_audit_data() -> Resu
             "api/time-zone",
             "",
             body,
+            std::future::ready(Ok(CurrentKeys::default())),
         )
     };
     assert_eq!(save(br#"{"timeZone":"Asia/Kathmandu"}"#).await.status, 200);
@@ -700,6 +996,7 @@ async fn shared_timezone_is_parsed_persistent_and_preserves_audit_data() -> Resu
         "api/view-context",
         "",
         &[],
+        std::future::ready(Ok(CurrentKeys::default())),
     )
     .await;
     assert_eq!(failed.status, 500);
@@ -715,27 +1012,36 @@ async fn escaped_rows_and_large_key_directories_paginate_under_fixed_response_ca
     let database = Database::create().await?;
     let drafts = (0..200)
         .map(|index| {
-            let mut value = draft(&observation(
+            draft(&observation(
                 "key-a",
                 "thread-a",
                 json!([user(&format!("input-{index}"), &"\u{0001}".repeat(400))]),
-            ));
-            value.key_name = Some("\u{0001}".repeat(512));
-            value
+            ))
         })
         .collect::<Vec<_>>();
     database.store.persist_batch(&drafts).await?;
-    sqlx::raw_sql(
-        "INSERT INTO prompt_audit.key_directory(id,present,observed_at) \
-         SELECT 'large-key-' || i,false,now() FROM generate_series(1,30) i; \
-         INSERT INTO prompt_audit.key_names(key_id,name,observed_at) \
-         SELECT 'large-key-' || i,j::text || repeat(chr(1),500),now() \
-         FROM generate_series(1,30) i CROSS JOIN generate_series(1,32) j;",
+    let keys = CurrentKeys::from_keys(
+        std::iter::once(gateway_plugin_sdk::call::host::ClientKey {
+            id: "key-a".into(),
+            name: "\u{0001}".repeat(512),
+            enabled: true,
+        })
+        .chain((0..230).map(|i| gateway_plugin_sdk::call::host::ClientKey {
+            id: format!("large-key-{i:03}"),
+            name: "\u{0001}".repeat(512),
+            enabled: true,
+        }))
+        .collect(),
     )
-    .execute(database.store.pool())
-    .await?;
-    let service = database.query("UTC").await?;
-    for (path, query, total) in [("api/audits", "limit=200", 200), ("api/keys", "", 31)] {
+    .unwrap();
+    let service = QueryService::new(
+        database.store.pool().clone(),
+        chrono_tz::UTC,
+        database.store.secret("query_cursor").await?,
+        keys,
+    )
+    .unwrap();
+    for (path, query, total) in [("api/audits", "limit=200", 200), ("api/keys", "", 231)] {
         let mut cursor = None::<String>;
         let mut ids = std::collections::HashSet::new();
         let mut pages = 0;

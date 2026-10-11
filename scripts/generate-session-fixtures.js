@@ -232,7 +232,6 @@ export function buildSessionFixtures(sessions, { limit = 100, minAgentContext = 
   for (let sessionIndex = 0; sessionIndex < parsed.length; sessionIndex++) {
     const session = parsed[sessionIndex];
     const keyId = `ck_session_${pad(sessionIndex + 1)}`;
-    const keyName = `会话样本 ${pad(sessionIndex + 1)}`;
     const turns = new Map();
     const safeMessages = session.messages.map((message, index) => ({ ...message, id: `msg_sample_${pad(sessionIndex + 1)}_${pad(index + 1)}`, blocks: message.blocks.map((block) => block.kind === 'text' ? { ...block, text: redactor.redact(block.text) } : { ...block }) }));
     for (let index = 0; index < safeMessages.length; index++) {
@@ -244,7 +243,7 @@ export function buildSessionFixtures(sessions, { limit = 100, minAgentContext = 
       const number = pad(candidates.length + 1);
       if (message.turnId && !turns.has(message.turnId)) turns.set(message.turnId, `turn_sample_${pad(sessionIndex + 1)}_${pad(turns.size + 1)}`);
       candidates.push({
-        audit: { id: `PA-SESSION-${number}`, messageId: message.id, firstObservedAt: message.timestamp, keyId, keyName,
+        audit: { id: `PA-SESSION-${number}`, messageId: message.id, firstObservedAt: message.timestamp, keyId,
           threadId: `thread_sample_${pad(sessionIndex + 1)}`, sessionId: `session_sample_${pad(sessionIndex + 1)}`,
           requestId: `req_sample_${number}`, turnId: message.turnId ? turns.get(message.turnId) : null,
           repositories: null, input: message.blocks, context },
@@ -257,11 +256,11 @@ export function buildSessionFixtures(sessions, { limit = 100, minAgentContext = 
   const selected = candidates.sort((a, b) => b.audit.firstObservedAt.localeCompare(a.audit.firstObservedAt) || b.audit.id.localeCompare(a.audit.id)).slice(0, limit);
   const audits = selected.map(({ audit }) => audit);
   const keyIds = new Set(audits.map((audit) => audit.keyId));
-  const keys = parsed.map((_, index) => ({ id: `ck_session_${pad(index + 1)}`, names: [`会话样本 ${pad(index + 1)}`] })).filter((key) => keyIds.has(key.id));
+  const keys = parsed.map((_, index) => ({ id: `ck_session_${pad(index + 1)}`, name: `会话样本 ${pad(index + 1)}` })).filter((key) => keyIds.has(key.id));
   const stats = {
     source: 'deidentified-codex-session-sample',
     timestampSemantics: 'Session response_item timestamp mapped for mock review; not gateway first observation.',
-    syntheticMetadata: ['keyId', 'keyName', 'threadId', 'sessionId', 'requestId'],
+    syntheticMetadata: ['keyId', 'threadId', 'sessionId', 'requestId'],
     repositorySemantics: 'Unavailable: local session cwd/git do not establish request-reported workspaces.',
     eligibleSessions: parsed.length, selectedSessions: keys.length, eligibleInputs: candidates.length, records: audits.length,
     contextMessages: audits.reduce((sum, audit) => sum + audit.context.length, 0),

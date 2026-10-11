@@ -13,7 +13,7 @@ const ready = async (page, count = '494 条') => expect(page.locator('#result-co
 const search = async (page, text) => { await page.getByRole('searchbox').fill(text); await page.getByRole('button', { name: '检索', exact: true }).click(); };
 const serviceError = (code, message) => ({ error: { code, message } });
 
-test('dense search, historical Key selection, cursor pages, and plugin-only navigation', async ({ page }) => {
+test('dense search, current Key selection, cursor pages, and plugin-only navigation', async ({ page }) => {
   const ui = page.frameLocator('iframe');
   await page.goto('/'); await ready(ui);
   await expect(ui.locator('tbody tr')).toHaveCount(50);

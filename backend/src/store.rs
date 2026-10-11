@@ -13,15 +13,12 @@ use uuid::Uuid;
 
 use crate::collection::{AuditDraft, ContentBlock};
 
+pub const RETENTION_BATCH_SIZE: i64 = 1_000;
+const RETENTION_AGE: chrono::TimeDelta = chrono::TimeDelta::hours(72);
+
 #[derive(Clone)]
 pub struct Store {
     pool: PgPool,
-}
-
-#[derive(Debug, Clone)]
-pub struct ObservedKey {
-    pub id: String,
-    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -159,12 +156,13 @@ impl Store {
         )
         .fetch_one(&mut *tx)
         .await?;
-        if version > 2 {
+        if version > 3 {
             bail!("audit database schema is newer than this plugin");
         }
         for (target, migration) in [
             (1, include_str!("../migrations/0001_audit.sql")),
             (2, include_str!("../migrations/0002_request_audit.sql")),
+            (3, include_str!("../migrations/0003_live_key_names.sql")),
         ] {
             if version < target {
                 sqlx::raw_sql(migration).execute(&mut *tx).await?;
@@ -211,30 +209,24 @@ impl Store {
         Ok(())
     }
 
-    /// Supply only a successfully fetched complete host.keys.list directory.
-    /// Failed/partial pagination must leave the old membership intact.
-    pub async fn update_keys(
-        &self,
-        keys: &[ObservedKey],
-        observed_at: DateTime<Utc>,
-    ) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("SELECT pg_advisory_xact_lock(728019240992)")
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("UPDATE prompt_audit.key_directory SET present = false")
-            .execute(&mut *tx)
-            .await?;
-        for key in keys {
-            let name = key
-                .name
-                .as_deref()
-                .filter(|name| !name.contains('\0'))
-                .map(|name| name.chars().take(512).collect::<String>());
-            save_key(&mut tx, &key.id, name.as_deref(), observed_at, true).await?;
-        }
-        tx.commit().await?;
-        Ok(())
+    /// 删除超过固定 72 小时保留期的最旧记录，正文通过外键在同一事务级联删除。
+    /// 每批独立提交；跳过其他实例或操作持有的行锁，下一轮再处理。
+    pub async fn delete_expired_batch(&self, now: DateTime<Utc>) -> Result<u64> {
+        let result = sqlx::query(
+            "WITH expired AS ( \
+                 SELECT id FROM prompt_audit.audits \
+                 WHERE first_observed_at < $1 \
+                 ORDER BY first_observed_at, id \
+                 FOR UPDATE SKIP LOCKED LIMIT $2 \
+             ) \
+             DELETE FROM prompt_audit.audits AS audit USING expired \
+             WHERE audit.id = expired.id",
+        )
+        .bind(now - RETENTION_AGE)
+        .bind(RETENTION_BATCH_SIZE)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     pub async fn request_metadata(
@@ -269,39 +261,6 @@ impl Store {
     }
 }
 
-async fn save_key(
-    tx: &mut Transaction<'_, Postgres>,
-    id: &str,
-    name: Option<&str>,
-    observed_at: DateTime<Utc>,
-    directory_snapshot: bool,
-) -> Result<()> {
-    sqlx::query(
-        "INSERT INTO prompt_audit.key_directory (id, present, observed_at) VALUES ($1, true, $2) \
-         ON CONFLICT (id) DO UPDATE SET \
-         present = CASE WHEN $3 THEN true ELSE prompt_audit.key_directory.present END, \
-         observed_at = greatest(prompt_audit.key_directory.observed_at, EXCLUDED.observed_at)",
-    )
-    .bind(id)
-    .bind(observed_at)
-    .bind(directory_snapshot)
-    .execute(&mut **tx)
-    .await?;
-    if let Some(name) = name {
-        sqlx::query(
-            "INSERT INTO prompt_audit.key_names (key_id, name, observed_at) VALUES ($1, $2, $3) \
-             ON CONFLICT (key_id, name) DO UPDATE SET \
-             observed_at = greatest(prompt_audit.key_names.observed_at, EXCLUDED.observed_at)",
-        )
-        .bind(id)
-        .bind(name)
-        .bind(observed_at)
-        .execute(&mut **tx)
-        .await?;
-    }
-    Ok(())
-}
-
 async fn insert_audit(tx: &mut Transaction<'_, Postgres>, draft: &AuditDraft) -> Result<()> {
     let id = Uuid::new_v4().to_string();
     let input_content_id = Uuid::new_v4().to_string();
@@ -329,16 +288,14 @@ async fn insert_audit(tx: &mut Transaction<'_, Postgres>, draft: &AuditDraft) ->
     }
     sqlx::query(
         "INSERT INTO prompt_audit.audits \
-         (id, key_id, key_name, key_name_observed_at, first_observed_at, \
+         (id, key_id, first_observed_at, \
           request_id, thread_id, session_id, turn_id, input_kinds, repositories, \
           input_content_id, input_text, input_search, preview, context_count) \
-         VALUES ($1,$2,$3,$4,date_trunc('milliseconds',$5::timestamptz), \
-                 $6,$7,$8,$9,$10::json,$11::json,$12,$13,$14,$15,$16)",
+         VALUES ($1,$2,date_trunc('milliseconds',$3::timestamptz), \
+                 $4,$5,$6,$7,$8::json,$9::json,$10,$11,$12,$13,$14)",
     )
     .bind(&id)
     .bind(&draft.key_id)
-    .bind(&draft.key_name)
-    .bind(draft.key_name_observed_at)
     .bind(draft.observed_at)
     .bind(&draft.request_id)
     .bind(&draft.thread_id)
@@ -358,14 +315,6 @@ async fn insert_audit(tx: &mut Transaction<'_, Postgres>, draft: &AuditDraft) ->
     .bind(encode_text(&preview))
     .bind(i64::try_from(draft.context.len())?)
     .execute(&mut **tx)
-    .await?;
-    save_key(
-        tx,
-        &draft.key_id,
-        draft.key_name.as_deref(),
-        draft.key_name_observed_at.unwrap_or(draft.observed_at),
-        false,
-    )
     .await?;
     insert_content(
         tx,

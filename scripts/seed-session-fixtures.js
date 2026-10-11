@@ -119,13 +119,6 @@ export async function seedSessionFixtures({ baseUrl = 'http://127.0.0.1:4180', f
     do { try { return await action(); } catch (error) { last = error; await new Promise((done) => setTimeout(done, 250)); } } while (Date.now() < deadline);
     throw new Error(`${label}: ${last?.message || 'timed out'}`);
   };
-  // Wait for the host.keys.list cache before capturing name snapshots; this
-  // never updates a previously saved input's original Key-name observation.
-  await waitUntil(async () => {
-    let cursor;
-    do { const page = await management('keys', cursor ? { cursor } : {}); if (page.items.some((item) => item.id === key.id && item.names.includes(keyName))) return; cursor = page.nextCursor; } while (cursor);
-    throw new Error('Dedicated Key snapshot not refreshed yet');
-  }, 'Fixture Key snapshot');
   const before = await management('audits', { key: key.id });
   const previousIds = new Set(before.items.map((row) => row.id));
   cursor = before.nextCursor;

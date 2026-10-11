@@ -29,7 +29,7 @@ const columns = computed(() => defineTableColumns([
 ]));
 const keyOptions = computed(() => {
   const options = [{ value: '', label: '全部 Client Key' }, ...(keyDirectory.value.kind === 'ready' ? keyDirectory.value.items : []).map((key) => ({
-    value: key.id, label: `${key.names.join(' / ') || '名称未知'}${key.historical ? '（历史）' : ''}`, description: key.id,
+    value: key.id, label: key.name || '名称未知', description: key.id,
   }))];
   if (filters.key && !options.some((option) => option.value === filters.key)) options.push({ value: filters.key, label: filters.key });
   return options;
