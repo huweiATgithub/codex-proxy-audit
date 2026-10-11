@@ -70,9 +70,9 @@ async function start() {
     const { id, payload } = event.data;
     try {
       if (!registration.routes.some((route) => route.method === payload.method && route.path === payload.path)
-        || payload.body !== undefined || typeof payload.query !== 'string' || payload.query.startsWith('?') || payload.query.includes('#')
+        || (payload.body !== undefined && (!(payload.body instanceof ArrayBuffer) || payload.contentType !== 'application/json')) || typeof payload.query !== 'string' || payload.query.startsWith('?') || payload.query.includes('#')
         || new TextEncoder().encode(payload.query).byteLength > 8192) throw new Error('Invalid management request');
-      const result = await fetch(`/__demo/${payload.path}?${payload.query}`);
+      const result = await fetch(`/__demo/${payload.path}?${payload.query}`, { method: payload.method, ...(payload.body ? { headers: { 'content-type': payload.contentType }, body: payload.body } : {}) });
       const body = await result.arrayBuffer();
       if (body.byteLength > 1024 * 1024) throw new Error('Management response exceeds host limit');
       frame.contentWindow.postMessage({ ...envelope, type: 'result', id, ok: true, payload: {

@@ -74,8 +74,9 @@ async function stopHost() {
 }
 async function management(endpoint, values = {}, expected = 200) {
   const target = view.target;
-  const path = `/api/admin/plugins/extensions/${target.instanceId}/${target.artifactSha256}/${target.revision}/api/${endpoints[endpoint].path}?${new URLSearchParams(values)}`;
-  const response = await fetch(base + path, { headers: { cookie }, signal: AbortSignal.timeout(15000) });
+  const path = `/api/admin/plugins/extensions/${target.instanceId}/${target.artifactSha256}/${target.revision}/api/${endpoints[endpoint].path}?${new URLSearchParams(endpoints[endpoint].body ? {} : values)}`;
+  const definition = endpoints[endpoint];
+  const response = await fetch(base + path, { method: definition.method || 'GET', headers: { cookie, ...(definition.body ? { 'content-type': 'application/json' } : {}) }, ...(definition.body ? { body: JSON.stringify(values) } : {}), signal: AbortSignal.timeout(15000) });
   const bytes = new Uint8Array(await response.arrayBuffer());
   assert.ok(bytes.length <= MAX_RESPONSE_BYTES, `response budget: ${endpoint}`);
   const value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
@@ -163,7 +164,20 @@ async function run() {
   instanceId = configured.id; await refreshView();
   const instance = (await json('/api/admin/plugins/instances')).find((item) => item.id === instanceId);
   assert.equal(instance.compatibilityWarning, null, 'plugin host range and capability versions match the actual host');
-  const context = await management('viewContext'); assert.equal(context.timeZone, 'America/New_York'); report('installed executable plugin, isolated role and effective host.timezone RPC');
+  const context = await management('viewContext'); assert.equal(context.timeZone, 'UTC');
+  assert.equal(context.today, new Date().toISOString().slice(0, 10));
+  report('unmodified host installs plugin with UTC default independent of host timezone');
+  const timeZonePath = `/api/admin/plugins/extensions/${view.target.instanceId}/${view.target.artifactSha256}/${view.target.revision}/api/api/time-zone`;
+  for (const headers of [{}, { authorization: `Bearer ${key.plaintextKey}` }]) {
+    const denied = await fetch(base + timeZonePath, { method: 'PUT', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ timeZone: 'Asia/Tokyo' }) });
+    assert.ok([401, 403].includes(denied.status), 'timezone save requires administrator session');
+  }
+  assert.equal((await management('timeZone', { timeZone: 'America/New_York' })).timeZone, 'America/New_York');
+  for (const setting of [{ timeZone: 'Invalid/Zone' }, { timeZone: 'UTC', extra: true }, { timeZone: null }, {}]) {
+    assert.equal((await management('timeZone', setting, 400)).error.code, 'invalid_query');
+    assert.equal((await management('viewContext')).timeZone, 'America/New_York');
+  }
+  report('administrator-only strict timezone save preserves setting on invalid input');
   await management('keys');
   const first = message('integration-input-1', 'INTEGRATION-first 请拟定数据库迁移方案。😀');
   const response1 = await requestModel(key, [first], 'thread-http');
@@ -242,7 +256,41 @@ async function run() {
   for (const item of dated.items) sql(`UPDATE prompt_audit.audits SET first_observed_at = '${item.preview.endsWith(' start') ? '2026-11-01T04:00:00Z' : '2026-11-02T05:00:00Z'}'::timestamptz WHERE id = '${item.id.replaceAll("'", "''")}'`);
   const day = await management('audits', { q: 'INTEGRATION-timezone', from: '2026-11-01', to: '2026-11-01', key: key.id });
   assert.equal(day.total, 1); assert.equal(day.items[0].recordedAtDisplay, '2026-11-01 00:00:00');
-  report('effective host timezone inclusive dates across 25-hour DST day');
+  report('saved plugin timezone inclusive dates across 25-hour DST day');
+  for (const item of dated.items) sql(`UPDATE prompt_audit.audits SET first_observed_at = '${item.preview.endsWith(' start') ? '2026-03-08T05:00:00Z' : '2026-03-09T04:00:00Z'}'::timestamptz WHERE id = '${item.id.replaceAll("'", "''")}'`);
+  const shortDay = await management('audits', { q: 'INTEGRATION-timezone', from: '2026-03-08', to: '2026-03-08', key: key.id });
+  assert.equal(shortDay.total, 1); assert.equal(shortDay.timeZone, 'America/New_York');
+  assert.equal(shortDay.items[0].recordedAtDisplay, '2026-03-08 00:00:00');
+  report('23-hour DST day includes its start and excludes next-day start');
+  const auditSnapshot = () => sql("SELECT md5(coalesce(jsonb_agg(to_jsonb(a) ORDER BY a.id)::text,'')) FROM prompt_audit.audits a") + sql("SELECT md5(coalesce(jsonb_agg(to_jsonb(c) ORDER BY c.id)::text,'')) FROM prompt_audit.contents c");
+  const factsBefore = auditSnapshot(), secretBefore = sql("SELECT encode(value,'hex') FROM prompt_audit.settings WHERE name='query_cursor'");
+  let inFlight;
+  await withAuditTableLock(async () => {
+    inFlight = management('audits', { q: 'INTEGRATION-continue' });
+    await until(() => { assert.equal(sql(`SELECT count(*) FROM pg_stat_activity WHERE usename='${auditRole}' AND wait_event_type='Lock' AND query LIKE 'SELECT count(*) FROM prompt_audit.audits%'`), '1'); }, 'query reads timezone before waiting for audit data');
+    await management('timeZone', { timeZone: 'Asia/Tokyo' });
+  });
+  const oldResponse = await inFlight;
+  assert.equal(oldResponse.timeZone, 'America/New_York');
+  assert.equal((await management('viewContext')).timeZone, 'Asia/Tokyo');
+  await management('timeZone', { timeZone: 'America/New_York' });
+  report('save completes during a blocked query and its response retains its original timezone');
+  const contentFirst = await management('content', { id: longDetail.id, contentId: longDetail.input.id });
+  assert.ok(contentFirst.nextCursor);
+  // A large directory exercises the Key cursor without changing business credentials.
+  sql("INSERT INTO prompt_audit.key_directory(id,present,observed_at) SELECT 'timezone-cursor-' || lpad(i::text,3,'0'),false,now() FROM generate_series(1,105) i");
+  const keyFirst = await management('keys'); assert.ok(keyFirst.nextCursor);
+  await management('timeZone', { timeZone: 'Asia/Kathmandu' });
+  assert.equal((await management('audits', { q: 'integration-PAGINATION', cursor: cursorFirst.nextCursor }, 400)).error.code, 'invalid_cursor');
+  assert.equal((await management('content', { id: longDetail.id, contentId: longDetail.input.id, cursor: contentFirst.nextCursor }, 400)).error.code, 'invalid_cursor');
+  assert.equal((await management('keys', { cursor: keyFirst.nextCursor }, 400)).error.code, 'invalid_cursor');
+  assert.equal((await management('audit', { id: longDetail.id })).timeZone, 'Asia/Kathmandu');
+  assert.equal(auditSnapshot(), factsBefore);
+  assert.equal(sql("SELECT encode(value,'hex') FROM prompt_audit.settings WHERE name='query_cursor'"), secretBefore);
+  await management('timeZone', { timeZone: 'America/New_York' });
+  await management('keys', { cursor: keyFirst.nextCursor });
+  sql("DELETE FROM prompt_audit.key_directory WHERE id LIKE 'timezone-cursor-%'");
+  report('timezone-bound list/content/Key cursors and unchanged facts, bodies and signing secret');
   const directory = await management('keys'); assert.ok(directory.items.some((item) => item.id === key.id && item.names.includes('Integration primary')));
   const all = await management('audits'); assert.equal(Number(sql('SELECT count(*) FROM prompt_audit.audits')), all.total); assert.ok(upstream.requests.length > 0); report('five contracted management GET routes and real persisted records');
   sql(`DELETE FROM public.model_requests WHERE id = '${continuation.requestId.replaceAll("'", "''")}'`);
@@ -254,6 +302,9 @@ async function run() {
   await json('/api/admin/client-keys/update', { id: key.id, name: 'Integration renamed', groupIds: [], maxConcurrency: 0, requestsPerMinute: 0 });
   await json('/api/admin/client-keys/delete', { id: otherKey.id });
   await stopHost(); await startHost(); await refreshView();
+  assert.equal((await management('viewContext')).timeZone, 'America/New_York');
+  assert.equal(auditSnapshot(), factsBefore);
+  assert.equal(sql("SELECT encode(value,'hex') FROM prompt_audit.settings WHERE name='query_cursor'"), secretBefore);
   await requestModel(key, [first], 'thread-http'); await listCount('INTEGRATION-first', 6); report('host/plugin restart preserves history and records a repeated request');
   const historical = await management('keys');
   const renamed = historical.items.find((item) => item.id === key.id), deleted = historical.items.find((item) => item.id === otherKey.id);
@@ -277,9 +328,39 @@ async function run() {
   assert.equal(await page.locator('iframe').getAttribute('src'), null, 'host owns srcdoc assembly');
   assert.ok(requested.some((url) => url.includes('/api/api/audit-content')), 'actual host page bridge called backend content endpoint');
   assert.ok(!requested.some((url) => url.includes('__demo')), 'Demo service never used'); assert.deepEqual(errors, []);
+  const dates = [await ui.locator('#date-from').inputValue(), await ui.locator('#date-to').inputValue()];
+  const rowTime = await ui.locator('tbody time').first().textContent();
+  const beforeSaveRequests = requested.filter((url) => /\/api\/api\/(audits|audit|audit-content|keys|view-context)(?:\?|$)/.test(url)).length;
+  await ui.locator('#time-zone').fill('Asia/Kathmandu');
+  await ui.getByRole('button', { name: '保存', exact: true }).click();
+  await until(async () => { assert.ok((await ui.locator('.timezone-saved').textContent()).includes('Asia/Kathmandu')); }, 'real iframe saves timezone through PUT bridge');
+  assert.equal(requested.filter((url) => /\/api\/api\/(audits|audit|audit-content|keys|view-context)(?:\?|$)/.test(url)).length, beforeSaveRequests);
+  assert.deepEqual([await ui.locator('#date-from').inputValue(), await ui.locator('#date-to').inputValue()], dates);
+  assert.equal(await ui.locator('tbody time').first().textContent(), rowTime);
+  assert.ok((await ui.locator('.timezone').textContent()).includes('America/New_York'));
+  assert.ok((await ui.locator('.metadata time').textContent()).includes('America/New_York'));
+  await page.screenshot({ path: join(temporary, 'real-host-independent-save.png'), fullPage: true });
+  await ui.getByRole('button', { name: '刷新列表' }).click();
+  await until(async () => { assert.ok((await ui.locator('.timezone').textContent()).includes('Asia/Kathmandu')); }, 'manual refresh uses saved timezone');
+  await ui.locator(`[data-audit="${continuation.id}"]`).click();
+  await until(async () => { assert.ok((await ui.locator('.metadata time').textContent()).includes('Asia/Kathmandu')); }, 'detail labels its own response timezone');
+  await until(async () => { assert.ok((await ui.locator('.input-card .body-text').textContent()).includes('INTEGRATION-continue')); }, 'refreshed detail finishes reading input');
+  await until(async () => { assert.ok((await ui.locator('.context-section').textContent()).includes('Agent 方案：先检查数据库')); }, 'refreshed detail finishes reading context');
+  assert.deepEqual(errors, []);
+  report('authenticated page saves independently, retains date filters and labels each response');
   await page.screenshot({ path: join(temporary, 'real-host-ui.png'), fullPage: true }); await browser.close(); browser = null;
   report('existing built UI through real authenticated host bridge and sandbox iframe');
-  writeFileSync(join(temporary, 'result.json'), JSON.stringify({ hostUrl: `http://0.0.0.0:${hostPort}`, pageUrl: `${base}/plugins/${instanceId}/${view.pages[0].id}`, reports, screenshot: join(temporary, 'real-host-ui.png') }, null, 2));
+  if (options['rust-tests']) {
+    await stopHost();
+    const testDatabase = `rust_query_${suffix}`;
+    sql(`CREATE DATABASE "${testDatabase}" TEMPLATE "${pgDatabase}"`);
+    const testEnvironment = { ...process.env, AUDIT_TEST_DATABASE_URL: `postgres://${pgUser}:${password}@127.0.0.1:${pgPort}/${testDatabase}` };
+    const tested = spawnSync('cargo', ['test', '--manifest-path', 'backend/Cargo.toml', '--locked', '--test', 'storage', '--test', 'query', '--', '--ignored'], { env: testEnvironment, stdio: 'inherit' });
+    assert.equal(tested.status, 0, 'isolated PostgreSQL Rust storage and host-migrated query tests');
+    report('isolated PostgreSQL Rust storage and host-migrated query tests');
+    if (options.keep) await startHost();
+  }
+  writeFileSync(join(temporary, 'result.json'), JSON.stringify({ hostUrl: `http://0.0.0.0:${hostPort}`, pageUrl: `${base}/plugins/${instanceId}/${view.pages[0].id}`, reports, screenshot: join(temporary, 'real-host-ui.png'), independentSaveScreenshot: join(temporary, 'real-host-independent-save.png'), hostCommit: options['host-commit'] || null, hostBinarySha256: createHash('sha256').update(readFileSync(resolve(options['host-binary']))).digest('hex'), packageSha256: sha }, null, 2));
   console.log(`Evidence: ${temporary}`);
   if (options.keep) {
     console.log(`Remote review: http://<this-machine>:${hostPort}/plugins/${instanceId}/${view.pages[0].id}`);

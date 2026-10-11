@@ -197,7 +197,7 @@ test('demo loads exact production resources in isolation and uses server time fa
   await ui.locator('[data-audit]').first().click();
   await expect(ui.getByRole('button', { name: '复制审计 ID' })).toBeVisible();
   const rowTime = await ui.locator('tbody time').first().innerText();
-  await expect(ui.locator('.metadata time')).toHaveText(rowTime);
+  await expect(ui.locator('.metadata time')).toHaveText(`${rowTime} · Asia/Shanghai`);
   expect(requests.every((entry) => entry.frame() === page.mainFrame() && entry.method() === 'GET' && !new URL(entry.url()).searchParams.has('timeZone'))).toBe(true);
 });
 
@@ -214,4 +214,79 @@ test('missing host time facts stop initialization, with explicit retry and no lo
   await expect(ui.locator('#date-from')).toHaveCount(0);
   fail = false;
   await ui.getByRole('button', { name: '重试', exact: true }).click(); await ready(ui);
+});
+
+test('explicit save stays independent of pending queries and labels retained responses', async ({ page, request }) => {
+  await request.put('/__demo/api/time-zone', { data: { timeZone: 'UTC' } });
+  try {
+    await page.context().addInitScript(() => {
+      const original = Intl.DateTimeFormat;
+      Intl.DateTimeFormat = function (locale, options) {
+        const formatter = new original(locale, options);
+        if (!locale && !options) formatter.resolvedOptions = () => ({ timeZone: 'Asia/Tokyo' });
+        return formatter;
+      };
+    });
+    const ui = page.frameLocator('iframe');
+    const calls = [];
+    page.on('request', (entry) => { if (entry.url().includes('/__demo/')) calls.push(entry); });
+    await page.goto('/');
+    await expect(ui.locator('tbody tr')).toHaveCount(50);
+    await expect(ui.locator('#time-zone')).toHaveValue('UTC');
+    await ui.locator('[data-audit="PA-0018"]').click();
+    await expect(ui.locator('.metadata time')).toContainText('UTC');
+    const dates = [await ui.locator('#date-from').inputValue(), await ui.locator('#date-to').inputValue()];
+    const oldTime = await ui.locator('tbody time').first().innerText();
+    const reads = calls.filter((entry) => entry.method() === 'GET').length;
+    await ui.getByRole('button', { name: '使用浏览器时区', exact: true }).click();
+    await expect(ui.locator('#time-zone')).toHaveValue('Asia/Tokyo');
+    expect(calls.some((entry) => entry.method() === 'PUT')).toBe(false);
+    expect((await (await request.get('/__demo/api/view-context')).json()).timeZone).toBe('UTC');
+    await ui.getByRole('button', { name: '保存', exact: true }).click();
+    await expect(ui.locator('.timezone-saved')).toContainText('Asia/Tokyo');
+    expect(calls.filter((entry) => entry.method() === 'GET')).toHaveLength(reads);
+    await expect(ui.locator('.timezone')).toContainText('UTC');
+    await expect(ui.locator('tbody time').first()).toHaveText(oldTime);
+    await expect(ui.locator('.metadata time')).toContainText('UTC');
+    expect([await ui.locator('#date-from').inputValue(), await ui.locator('#date-to').inputValue()]).toEqual(dates);
+    await ui.locator('#time-zone').fill('Invalid/Zone');
+    await ui.getByRole('button', { name: '保存', exact: true }).click();
+    await expect(ui.locator('.timezone-settings [role="alert"]')).toContainText('时区无效');
+    await expect(ui.locator('.timezone-saved')).toContainText('Asia/Tokyo');
+    await ui.locator('#time-zone').fill('America/New_York');
+    let release, captured;
+    const snapshot = new Promise((resolve) => { captured = resolve; });
+    const gate = new Promise((resolve) => { release = resolve; });
+    await page.route('**/__demo/api/audits?**', async (route) => {
+      const response = await route.fetch();
+      captured();
+      await gate;
+      await route.fulfill({ response });
+    });
+    const started = page.waitForRequest((entry) => entry.url().includes('/__demo/api/audits'));
+    await ui.getByRole('button', { name: '刷新列表' }).click(); await started; await snapshot;
+    const before = calls.filter((entry) => entry.method() === 'GET').length;
+    await ui.getByRole('button', { name: '保存', exact: true }).click();
+    await expect(ui.locator('.timezone-saved')).toContainText('America/New_York');
+    expect(calls.filter((entry) => entry.method() === 'GET')).toHaveLength(before);
+    release();
+    await expect(ui.locator('.timezone')).toContainText('Asia/Tokyo');
+    expect([await ui.locator('#date-from').inputValue(), await ui.locator('#date-to').inputValue()]).toEqual(dates);
+  } finally { await request.put('/__demo/api/time-zone', { data: { timeZone: 'Asia/Shanghai' } }); }
+});
+
+test('unavailable browser detection fills UTC without saving', async ({ page, request }) => {
+  await page.addInitScript(() => {
+    const original = Intl.DateTimeFormat;
+    Intl.DateTimeFormat = function (locale, options) {
+      const formatter = new original(locale, options);
+      if (!locale && !options) formatter.resolvedOptions = () => ({});
+      return formatter;
+    };
+  });
+  const ui = page.frameLocator('iframe');
+  await page.goto('/'); await ready(ui);
+  await ui.getByRole('button', { name: '使用浏览器时区', exact: true }).click();
+  await expect(ui.locator('#time-zone')).toHaveValue('UTC');
+  expect((await (await request.get('/__demo/api/view-context')).json()).timeZone).toBe('Asia/Shanghai');
 });

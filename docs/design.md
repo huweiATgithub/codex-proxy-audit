@@ -2,7 +2,7 @@
 
 ## 1. 方案与职责
 
-通过独立的 Codex Proxy RS 网关插件实现 Prompt 审计。宿主只需接入通用的只读部署上下文能力，提供有效部署时区与管理响应预算；采集、存储与查询语义由插件负责。插件在 `request` 中间件提取最新用户输入及本次请求自带的有限上文，提交到固定容量环形缓冲区，由独立 worker 将审计事实写入 PG schema，并通过 `management` 能力提供管理员页面。
+通过独立的 Codex Proxy RS 网关插件实现 Prompt 审计。插件负责采集、存储、共享审计时区与查询语义，通过宿主已有的中间件和管理页桥接入。插件在 `request` 中间件提取最新用户输入及本次请求自带的有限上文，提交到固定容量环形缓冲区，由独立 worker 将审计事实写入 PG schema，并通过 `management` 能力提供管理员页面。
 
 审计单位是满足采集规则的最后一条用户输入。插件依据[采集行为](collection.md)检查请求的最后一个输入项；以工具调用、工具结果或 assistant 消息结束的请求不产生记录。重复请求分别形成审计记录，模型调用随后失败、取消或未发送也可能留下记录。
 
@@ -131,7 +131,7 @@ Client Key 代表网关凭据的归属。多人共享一个 Key 时，插件不�
 
 页面以跨 Client Key 的高密度用户输入表格作为唯一审阅入口，适用于大量输入的快速扫读与检索。每行是一条符合采集规则的用户输入观察；重复请求可能有多条记录，记录数量不代表实际发言次数。Thread ID 与 Session ID 保留各自原始语义，可在记录信息中查看；首期不提供会话归类、会话时间线或会话汇总查询。
 
-顶部只提供用户输入正文关键词、记录时间范围与 Client Key 筛选，条件组合生效。关键词按连续字面片段匹配完整的已采集输入文本，不区分英文字母大小写；不把关键词当作正则表达式，也不搜索前序对话、附件二进制或未采集内容。空关键词不限制正文，关键词最多 200 个 Unicode 码点。MVP 不提供采集提示列、分类标签、提示面板或按提示筛选。
+顶部提供共享审计时区设置，以及用户输入正文关键词、记录时间范围与 Client Key 筛选，条件组合生效。关键词按连续字面片段匹配完整的已采集输入文本，不区分英文字母大小写；不把关键词当作正则表达式，也不搜索前序对话、附件二进制或未采集内容。空关键词不限制正文，关键词最多 200 个 Unicode 码点。MVP 不提供采集提示列、分类标签、提示面板或按提示筛选。
 
 表格只列出记录时间、Key 名称快照与稳定 ID、用户输入预览，默认按记录时间从新到旧排列。前序对话和审计 ID 在详情中查看。预览固定为紧凑单行；关键词检索时显示命中附近的原文片段并高亮，不因匹配处位于长输入后部而只展示无关开头。页面主体优先用于表格，不预先占用大块空白详情区。
 
@@ -149,17 +149,18 @@ Client Key 代表网关凭据的归属。多人共享一个 Key 时，插件不�
 
 前后端查询契约版本为 **1.0.0**。字段定义以 [`contracts/audit.js`](../contracts/audit.js) 为唯一源，UI 在读取边界解析响应，模拟服务也按该定义输出；[`contracts/openapi.json`](../contracts/openapi.json) 是供后端实现使用的 OpenAPI 3.1 导出，运行 `npm run contract:export` 生成，`npm run contract:check` 检查一致性。以下约定补充 Schema 无法表达的排序、关联与分段语义。
 
-宿主按 method 与相对 path 精确匹配。五个入口均为 `GET`，通过 `window.codexProxyPlugin.request({ method: 'GET', path, query })` 调用；`path` 无前导 `/`，`query` 是 `URLSearchParams` 编码的字符串，无前导 `?`，不携带正文。正式 UI 不直接请求宿主管理 HTTP 地址，也不自行保存认证凭据。管理员身份由宿主校验。
+宿主按 method 与相对 path 精确匹配。五个查询入口为 `GET`，通过 `window.codexProxyPlugin.request({ method: 'GET', path, query })` 调用；`path` 无前导 `/`，`query` 是 `URLSearchParams` 编码的字符串，无前导 `?`，不携带正文。时区设置使用 `PUT api/time-zone`，通过同一页桥传入 `contentType: 'application/json'` 和 UTF-8 JSON 的 `ArrayBuffer` 正文。正式 UI 不直接请求宿主管理 HTTP 地址，也不自行保存认证凭据。管理员身份由宿主校验。
 
 | 相对路径 | Query 参数 | 成功响应 |
 | --- | --- | --- |
-| `api/view-context` | 无 | `{timeZone, today}`；宿主部署时区与服务端当天日期，供页面初始化 |
-| `api/audits` | 可选 `from`、`to`、`key`、`q`、`limit`、`cursor` | `{items, total, nextCursor}`；每项为 `{id, recordedAt, recordedAtDisplay, keyId, keyName, preview, contextCount}` |
-| `api/audit` | 必填 `id` | `{id, recordedAt, recordedAtDisplay, keyId, keyName, threadId, sessionId, requestId, turnId, inputKinds, repositories, requestMetadata, input, context}`；包含内容目录，不含正文 |
+| `api/view-context` | 无 | `{timeZone, today}`；已保存审计时区与服务端当天日期，供页面初始化 |
+| `api/audits` | 可选 `from`、`to`、`key`、`q`、`limit`、`cursor` | `{timeZone, items, total, nextCursor}`；每项为 `{id, recordedAt, recordedAtDisplay, keyId, keyName, preview, contextCount}` |
+| `api/audit` | 必填 `id` | `{timeZone, id, recordedAt, recordedAtDisplay, keyId, keyName, threadId, sessionId, requestId, turnId, inputKinds, repositories, requestMetadata, input, context}`；包含内容目录，不含正文 |
 | `api/audit-content` | 必填 `id`、`contentId`；可选 `cursor` | `{auditId, contentId, blocks, nextCursor}`；按原顺序返回内容片段 |
+| `api/time-zone`（PUT） | 无；严格 JSON 正文 `{timeZone}` | 保存后的 `{timeZone}` |
 | `api/keys` | 可选 `cursor` | `{items, nextCursor}`；每项为 `{id, names, historical}`，每页最多 100 项 |
 
-响应是 UTF-8 `application/json`，不另包一层 `data`。JSON 字段采用 camelCase；UI 忽略额外响应字段，缺失必填字段或已知字段类型不符则报错。ID 和游标均为不透明字符串，UI 不推导格式或序号。`recordedAt` 对应 `first_observed_at` 的原始时间点，格式固定为带毫秒的 UTC RFC 3339，如 `2026-10-08T18:42:18.000Z`。`recordedAtDisplay` 是后端按宿主部署时区生成的 `YYYY-MM-DD HH:mm:ss` 文本，列表与详情直接显示；前端不重新格式化，也不从展示文本反解析时间点。可缺失的名称、Thread ID、Session ID、Turn ID、来源请求 ID、phase 和附件说明显式返回 `null`，不是空字符串或省略字段。字符计数与正文偏移均按 Unicode 码点计算，不能使用 UTF-8 字节数或 UTF-16 code unit 数。
+响应是 UTF-8 `application/json`，不另包一层 `data`。JSON 字段采用 camelCase；UI 忽略额外响应字段，缺失必填字段或已知字段类型不符则报错。ID 和游标均为不透明字符串，UI 不推导格式或序号。`recordedAt` 对应 `first_observed_at` 的原始时间点，格式固定为带毫秒的 UTC RFC 3339，如 `2026-10-08T18:42:18.000Z`。`recordedAtDisplay` 是后端按该次查询的审计时区生成的 `YYYY-MM-DD HH:mm:ss` 文本，列表与详情直接显示；前端不重新格式化，也不从展示文本反解析时间点。可缺失的名称、Thread ID、Session ID、Turn ID、来源请求 ID、phase 和附件说明显式返回 `null`，不是空字符串或省略字段。字符计数与正文偏移均按 Unicode 码点计算，不能使用 UTF-8 字节数或 UTF-16 code unit 数。
 
 `turnId` 只来自本条用户消息的 `internal_chat_message_metadata_passthrough.turn_id`，缺失时不使用当前请求 turn 补值。`inputKinds` 与**已保存的输入块**逐项对应，长度必须等于 `input.blockCount`；剔除客户端注入块时同步剔除对应分类，不能错位或去重。未知分类保留原始字符串，未提供或不能可靠对齐的位置为 `null`。分类只展示在详情记录信息中。
 
@@ -167,11 +168,11 @@ Client Key 代表网关凭据的归属。多人共享一个 Key 时，插件不�
 
 `requestMetadata` 为 `{userAgent, model, reasoningEffort}` 或 `null`，对应 §4.3 的宿主关联查询。存在对象时三个字段均必填、各自可空；长度上限分别为 8,192、256、80 码点，超限值返回 `null`。插件存储其来源 `requestId`，不存这三项的副本。宿主行尚未出现或被清理后，详情的这个查询投影可以变化；固定的审计输入、仓库快照与前序对话不随之改变。
 
-时间规则沿用 codex-proxy-rs 的 [`host.timezone`](https://github.com/zyycn/codex-proxy-rs/blob/389dc63633a3b24c5b40b0002901371820bc6998/deploy/README.md#部署时区)，缺省为 `Asia/Shanghai`；这是宿主部署配置，不是浏览器、进程 `TZ`、数据库会话或上游 `requestLocation.timezone`。按[宿主页面时间合同](https://github.com/zyycn/codex-proxy-rs/blob/389dc63633a3b24c5b40b0002901371820bc6998/docs/api.md#页面时间合同)，后端统一负责时间展示与日期边界。`api/view-context` 的 `today` 由服务端时钟在该时区下生成，`timeZone` 只供页面说明。UI 先读取此接口，以 `today` 初始化起止日期，再请求列表和 Key 目录；初始化失败时显示错误并允许重试，不能回退到浏览器日期或固定时区。
+审计时区是插件在 `prompt_audit.settings` 中保存的共享、非 secret 的 IANA `timeZone`，缺省为 `UTC`。存储边界将值解析为 `chrono_tz::Tz`，每次查询读取一次后传给查询处理；同一响应的展示、日期边界与服务端当天日期始终使用这个值。`api/view-context` 的 `today` 由服务端时钟在该时区下生成，UI 先读取它以初始化起止日期，再请求列表和 Key 目录；初始化失败时显示错误并允许重试。
 
-`from`、`to` 为 `YYYY-MM-DD`，均包含所选宿主当地日期；缺省表示该侧无界。查询不接受客户端 `timeZone` 覆盖。后端将日期转换为当地起始日边界至结束日次日起始边界的半开区间，按宿主日历规则处理跳时及重复时刻，不能固定加 24 小时。时间展示、默认日期与过滤必须使用同一有效部署时区，列表游标也绑定该时区，部署时区变化后旧游标不能复用。起始日期晚于结束日期、无效日期、重复参数、未知参数均返回 `400 invalid_query`。
+管理员在页面编辑时区，点击“使用浏览器时区”只填入检测值，检测不可用时填入 `UTC`；点击“保存”才调用 `PUT api/time-zone`。正文必须只含字符串 `timeZone`，无效 IANA 名称、缺失字段、重复字段或未知字段返回 `400 invalid_query`，保留原设置。保存后的值适用于连接同一审计 schema 的实例和管理员；持久化设置与游标签名密钥在重启后保留。保存和查询是独立请求，不触发刷新、取消、同步或自动重试，已选择的日期保持原值。列表与详情从自己的响应 `timeZone` 标注时间，可能与之后保存的设置不同。
 
-后端接入前置条件：宿主 v3.23.0／v3.23.1 管理页桥与插件 SDK 尚未提供部署时区读取能力；`settings.load` 中的 `request_location.timezone` 不代表系统时区。安装本仓库的[宿主补丁](../host-patches/v3.23.0-deployment-context.patch)后，通用只读回调 `host.deployment_context` 接受 `{}` 与空 payload，返回 `{time_zone, maximum_buffered_body_bytes}` 与空 payload。时区由启动组合根注入已解析的有效 `host.timezone`，预算取自有效 Runtime `RpcLimits`；不接收插件覆盖值，缺少接入时返回错误。插件在管理查询时读取该合同，执行时间投影与过滤，并将响应字节预算取为返回上限与 512 KiB 的较小值；不能额外维护时区或宿主预算配置。此补丁只提供宿主事实，不包含审计策略、数据库或专属页面逻辑；未安装补丁的宿主不满足正式后端接入条件，Demo 仅模拟这些事实。
+`from`、`to` 为 `YYYY-MM-DD`，均包含所选审计当地日期；缺省表示该侧无界。查询不接受客户端 `timeZone` 覆盖。后端将日期转换为当地起始日边界至结束日次日起始边界的半开区间，按该时区日历规则处理跳时及重复时刻，不能固定加 24 小时；完全跳过的当地日期边界映射到之后第一个有效时刻。列表、正文和 Key 游标均绑定该次查询的时区，设置变化后在另一时区使用旧游标返回 `400 invalid_cursor`。起始日期晚于结束日期、无效日期、重复参数、未知参数均返回 `400 invalid_query`。
 
 `key` 精确匹配稳定 Key ID，不匹配名称。`q` 是去除首尾空白后、最多 200 个 Unicode 码点的连续字面片段；缺省或空串不过滤。搜索对象是用户输入的文本块依次用换行连接而成的文本，不含前序对话及非文本块说明。只对 ASCII `A–Z` 忽略大小写，其他字符原样匹配；`%`、`_`、反斜杠及正则元字符均为普通字符。后端须先在完整范围内过滤再分页；`preview` 最多 400 码点，含查询词时取命中附近的原文，可加省略号，不生成摘要或 HTML。高亮由 UI 按相同匹配规则安全渲染。
 
@@ -198,9 +199,10 @@ Key 目录来自审计存储，按 `id` 升序分页，不能只取宿主当前�
 
 插件错误体固定为 `{error: {code, message}}`，message 最多 300 码点且不得包含凭据、SQL 或内部堆栈。宿主的 401、403 和页桥超时可能不符合该 JSON 结构，UI 分别提示重新登录、无权访问或读取失败，不误判为空结果。收到不符合 Schema、内容类型或内容顺序的成功响应时显示契约错误，不继续使用原始数据。
 
-宿主管理请求和响应各最多 1 MiB，且受宿主 `maximum_buffered_body_bytes` 的更小值限制；query 最多 8192 bytes。[宿主管理限制][management-runtime]、[query 校验][management-validation] 本插件另外将每个 JSON 响应限制为 **512 KiB**，按 UTF-8 编码后的实际长度计算；宿主配置更小时，后端进一步缩小列表和正文分段。目录仅含元数据，不随正文长度增大；不能因传输限制截短已保存的原文。可选仓库集合与输入分类各预留最多 64 KiB；分类超出预算时逐块返回 `null`。宿主设置的更小预算若无法容纳固定详情目录，返回 `503 unavailable`，不截断正文或伪装为记录缺失。
+宿主管理请求和响应各最多 1 MiB，query 最多 8192 bytes。[宿主管理限制][management-runtime]、[query 校验][management-validation] 本插件固定将每个 JSON 响应限制为 **512 KiB**，按 UTF-8 编码后的实际长度计算，在内部缩小列表、Key 目录及正文分段以满足上限。目录仅含元数据，不随正文长度增大；不能因传输限制截短已保存的原文。可选仓库集合与输入分类各预留最多 64 KiB；分类超出预算时逐块返回 `null`。固定详情目录超过插件响应上限时返回 `503 unavailable`，不伪装为记录缺失。时区保存正文最多 8192 bytes。
 
-页桥每页最多 8 个并发管理请求；UI 将全部读取共用一个最多 4 个在途请求的队列。管理请求没有取消协议，失去消费者的在途请求仍占用槽位直至结束，只丢弃其结果；尚未开始的过时请求不发送。[页桥实现][bridge-runtime]
+
+页桥每页最多 8 个并发管理请求；UI 将全部读取共用一个最多 4 个在途请求的队列，时区保存独立发送，不等待读取槽位。管理请求没有取消协议，失去消费者的在途请求仍占用槽位直至结束，只丢弃其结果；尚未开始的过时请求不发送。[页桥实现][bridge-runtime]
 
 静态资源每项最多 1 MiB、总计最多 8 MiB、最多 128 项。宿主隔离页禁止 ES Module 脚本及直接网络连接，因此 `npm run build` 生成经典 IIFE 脚本和本地 CSS，并输出 `dist/plugin/management.json` 供后端注册上述路由、非公开资源和页面。后端打包还需在插件 manifest 中声明这些资源及摘要。正式构建不含模拟数据或 HTTP 降级入口；主题沿用宿主注入的变量与变更通知，布局使用 `--cp-plugin-viewport-height`。Demo 读取同一份 `dist/plugin/management.json` 和静态资源，在 `sandbox="allow-scripts"` 的 iframe 中加载，应用同样的 CSP 网络限制，并模拟 v2 管理请求、主题及视口消息。模拟数据与 HTTP 请求只存在于外层宿主和模拟服务中，插件页面没有 Demo 分支或 URL 恢复行为。模拟器覆盖本 UI 使用的管理页桥子集，不替代在真实宿主中的集成验收。[隔离页与资源限制][frame-limit]
 

@@ -3,13 +3,17 @@ import { computed, inject, nextTick, onMounted, onUnmounted, reactive, ref } fro
 import { BaseButton, BaseIconButton, BaseInput, BaseSelect, BaseTable, BaseToast, defineTableColumns, toast } from '@codex-proxy/ui';
 import { ArrowDown, ArrowUp, ArrowDownWideNarrow, Copy, FileSearch, LoaderCircle, RefreshCw, Search, X } from '@lucide/vue';
 import { PAGE_SIZES } from './audit.js';
+import { useTimeZone } from './state/time-zone.js';
 import { useAudits } from './state/audits.js';
 import AuditDetail from './components/AuditDetail.vue';
 import HighlightedText from './components/HighlightedText.vue';
 
 const props = defineProps({ viewContext: { type: Object, required: true } });
 const initial = { from: props.viewContext.today, to: props.viewContext.today, key: '', q: '', size: 50 };
-const store = useAudits(inject('auditClient'), initial);
+const client = inject('auditClient');
+const store = useAudits(client, initial);
+const { draft: timeZoneDraft, saved: savedTimeZone, state: timeZoneState, fillBrowser, save: saveTimeZone } = useTimeZone(client, props.viewContext.timeZone);
+const listTimeZone = computed(() => list.value.kind === 'ready' ? list.value.data.timeZone : '');
 const { query, list, detail: detailState, keyDirectory, selectedId, pageIndex, items, canPrevious, canNext } = store;
 const filters = reactive({ from: initial.from, to: initial.to, key: initial.key, q: initial.q });
 const filterError = ref('');
@@ -102,6 +106,14 @@ onUnmounted(() => {
       <div class="brand"><span class="brand-icon"><FileSearch :size="19" /></span><span>Codex Proxy</span><span class="brand-divider">/</span><h1>Prompt 审计</h1></div>
     </header>
     <main>
+      <div class="timezone-settings" aria-label="审计时区设置">
+        <label for="time-zone">审计时区</label>
+        <BaseInput id="time-zone" class="timezone-input" v-model="timeZoneDraft" size="sm" aria-label="审计时区" placeholder="UTC" autocomplete="off" :maxlength="128" />
+        <BaseButton size="sm" variant="secondary" @click="fillBrowser">使用浏览器时区</BaseButton>
+        <BaseButton size="sm" :disabled="timeZoneState.kind === 'saving'" @click="saveTimeZone">{{ timeZoneState.kind === 'saving' ? '保存中…' : '保存' }}</BaseButton>
+        <span class="timezone-saved" role="status">已保存：{{ savedTimeZone }}<template v-if="timeZoneState.kind === 'saved'"> · 保存成功</template></span>
+        <p v-if="timeZoneState.kind === 'error'" class="filter-error" role="alert">{{ timeZoneState.error.message }}</p>
+      </div>
       <div class="filters" role="search" aria-label="筛选审计记录">
         <BaseInput id="query" v-model="filters.q" class="search-field" size="sm" type="search" aria-label="搜索用户输入正文" placeholder="搜索用户输入正文…" autocomplete="off" :maxlength="400" @keydown.enter.prevent="applyFilters">
           <template #prefix><Search :size="16" /></template><template #suffix><kbd>/</kbd></template>
@@ -118,14 +130,14 @@ onUnmounted(() => {
       </div>
       <div class="results-heading">
         <div class="results-summary"><h2>用户输入</h2><span id="result-count" class="count" role="status">{{ total }} 条</span><span v-if="query.q" class="active-filter">正文包含“{{ query.q }}”</span></div>
-        <div class="table-options"><span class="timezone">系统时间 · {{ viewContext.timeZone }} · 最新在前</span><BaseIconButton label="刷新列表" size="sm" :disabled="list.kind === 'loading'" @click="refreshList"><RefreshCw :size="14" /></BaseIconButton></div>
+        <div class="table-options"><span class="timezone">记录时间<template v-if="listTimeZone"> · {{ listTimeZone }}</template> · 最新在前</span><BaseIconButton label="刷新列表" size="sm" :disabled="list.kind === 'loading'" @click="refreshList"><RefreshCw :size="14" /></BaseIconButton></div>
       </div>
       <div class="workspace" :class="{ 'detail-open': selectedId }">
         <section ref="recordsPanel" class="records-panel" :class="{ 'compact-columns': compactColumns }" aria-label="用户输入列表">
           <div v-if="list.kind === 'error'" class="empty-state request-error" role="alert"><h2>暂时无法显示列表</h2><p>{{ list.error.message }}</p><BaseButton size="sm" @click="restartRequired ? refreshList() : store.retryList()">{{ restartRequired ? '重新检索' : '重试' }}</BaseButton></div>
           <BaseTable v-else class="audit-table" :loading="list.kind === 'loading'" :columns="columns" :rows="items" row-key="id" density="compact" :selected-row-keys="selectedId ? [selectedId] : []" :sort="{ key: 'recordedAt', direction: 'desc' }" show-header-when-empty @click="rowClick">
             <template #header-recordedAt><span class="time-heading" title="网关记录这条输入的时间；后续重复请求不更新时间。">记录时间<ArrowDownWideNarrow :size="13" /></span></template>
-            <template #recordedAt="{ row }"><time :datetime="row.recordedAt" :title="viewContext.timeZone">{{ row.recordedAtDisplay }}</time></template>
+            <template #recordedAt="{ row }"><time :datetime="row.recordedAt" :title="listTimeZone">{{ row.recordedAtDisplay }}</time></template>
             <template #keyName="{ row }"><span class="key-cell" :title="row.keyName || '名称未知'"><span class="key-name">{{ row.keyName || '名称未知' }}</span></span></template>
             <template #preview="{ row }"><button class="record-preview" :data-audit="row.id" type="button" :aria-label="`审阅 ${row.id}：${row.preview.slice(0, 100)}`" :aria-expanded="row.id === selectedId" :title="row.preview.slice(0, 800)" @click="selectRecord(row.id)"><HighlightedText :text="row.preview" :query="query.q" /></button></template>
             <template #empty><div class="empty-state"><Search :size="24" /><h2>没有匹配的输入</h2><p>试试更换关键词，或放宽日期和 Key 筛选。</p><BaseButton size="sm" @click="resetFilters">清除筛选</BaseButton></div></template>

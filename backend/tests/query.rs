@@ -58,8 +58,7 @@ async fn pg_queries_follow_contract_and_read_host_metadata() {
     let secret = store.secret("query_cursor").await.unwrap();
     let service = QueryService::new(
         store.pool().clone(),
-        "America/New_York",
-        512 * 1024,
+        "America/New_York".parse().unwrap(),
         secret.clone(),
     )
     .unwrap();
@@ -123,8 +122,7 @@ async fn pg_queries_follow_contract_and_read_host_metadata() {
     );
     let restarted = QueryService::new(
         store.pool().clone(),
-        "America/New_York",
-        512 * 1024,
+        "America/New_York".parse().unwrap(),
         store.secret("query_cursor").await.unwrap(),
     )
     .unwrap();
@@ -164,7 +162,7 @@ async fn pg_queries_follow_contract_and_read_host_metadata() {
         .await["total"],
         0
     );
-    let utc = QueryService::new(store.pool().clone(), "UTC", 512 * 1024, secret).unwrap();
+    let utc = QueryService::new(store.pool().clone(), chrono_tz::UTC, secret).unwrap();
     assert_eq!(
         utc.handle(
             "api/audits",

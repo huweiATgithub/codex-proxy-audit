@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgPoolOptions};
 use uuid::Uuid;
@@ -104,6 +105,32 @@ impl Store {
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// One read per query; an absent shared setting means UTC.
+    pub async fn time_zone(&self) -> Result<Tz, sqlx::Error> {
+        let value: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT value FROM prompt_audit.settings WHERE name = 'timeZone'")
+                .fetch_optional(&self.pool)
+                .await?;
+        match value {
+            None => Ok(chrono_tz::UTC),
+            Some(value) => std::str::from_utf8(&value)
+                .map_err(|error| sqlx::Error::Decode(Box::new(error)))?
+                .parse::<Tz>()
+                .map_err(|error| sqlx::Error::Decode(Box::new(error))),
+        }
+    }
+
+    pub async fn save_time_zone(&self, time_zone: Tz) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO prompt_audit.settings (name, value) VALUES ('timeZone', $1) \
+             ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(time_zone.name().as_bytes())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     async fn migrate(&self) -> Result<()> {

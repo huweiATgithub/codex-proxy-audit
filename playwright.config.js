@@ -11,7 +11,7 @@ export default defineConfig({
     screenshot: 'only-on-failure', trace: 'retain-on-failure',
   },
   webServer: {
-    command: 'node demo/server.js --host 127.0.0.1 --port 4174',
+    command: 'node demo/server.js --host 127.0.0.1 --port 4174 --time-zone Asia/Shanghai',
     env: { AUDIT_DEMO_NOW: '2026-10-09T04:00:00.000Z' },
     url: 'http://127.0.0.1:4174', reuseExistingServer: false,
     gracefulShutdown: { signal: 'SIGTERM', timeout: 2000 },

@@ -10,13 +10,15 @@ const count = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const boundedText = (max) => z.string().regex(new RegExp(`^[\\s\\S]{0,${max}}$`, 'u'));
 const date = z.iso.date();
 const timestamp = z.iso.datetime({ precision: 3 });
-const displayTime = z.string().regex(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/).describe('Host-generated local time text; render verbatim, never parse as an instant.');
+const displayTime = z.string().regex(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/).describe('Server-generated local time text; render verbatim, never parse as an instant.');
+const timeZone = z.string().min(1).max(128).describe('Shared audit IANA timezone, default UTC.');
+export const timeZoneSetting = z.object({ timeZone }).strict();
 const keyName = boundedText(512).nullable();
 const pageQuery = { cursor: cursor.optional() };
 
 export const auditQuery = z.object({
-  from: date.optional().describe('Inclusive date in host.timezone; absent means unbounded.'),
-  to: date.optional().describe('Inclusive date in host.timezone; absent means unbounded.'),
+  from: date.optional().describe('Inclusive date in the saved audit timezone; absent means unbounded.'),
+  to: date.optional().describe('Inclusive date in the saved audit timezone; absent means unbounded.'),
   key: id.optional().describe('Stable Client Key ID, including historical keys.'),
   q: boundedText(200).optional().describe('Trimmed literal substring of input text only; ASCII case insensitive.'),
   limit: z.enum(['50', '100', '200']).default('50').describe('Target maximum; the byte budget may return fewer rows.'),
@@ -26,8 +28,8 @@ export const detailQuery = z.object({ id }).strict();
 export const contentQuery = z.object({ id, contentId: id, ...pageQuery }).strict();
 export const keysQuery = z.object({ ...pageQuery }).strict();
 export const viewContext = z.object({
-  timeZone: z.string().min(1).max(128).describe('Effective host.timezone, for display only; not a client preference.'),
-  today: date.describe('Current date from the server clock in host.timezone; used for the initial filter.'),
+  timeZone,
+  today: date.describe('Current date from the server clock in the saved audit timezone; used for the initial filter.'),
 });
 
 const contentDescriptor = z.object({
@@ -41,10 +43,11 @@ export const auditSummary = z.object({
   contextCount: count,
 });
 export const auditPage = z.object({
-  items: z.array(auditSummary).max(200), total: count,
+  timeZone, items: z.array(auditSummary).max(200), total: count,
   nextCursor: cursor.nullable(),
 });
 export const auditDetail = z.object({
+  timeZone,
   id, recordedAt: timestamp, recordedAtDisplay: displayTime, keyId: id, keyName,
   threadId: id.nullable(), sessionId: id.nullable(), requestId: id.nullable(),
   turnId: id.nullable().describe('The input message turn_id; never inferred from the enclosing request turn.'),
@@ -87,7 +90,8 @@ export const errorResponse = z.object({ error: z.object({
   message: boundedText(300),
 }) });
 export const endpoints = {
-  viewContext: { path: 'api/view-context', query: z.object({}).strict(), response: viewContext, summary: 'Get the host timezone and server-local date for initial page filters.' },
+  timeZone: { method: 'PUT', path: 'api/time-zone', query: z.object({}).strict(), body: timeZoneSetting, response: timeZoneSetting, summary: 'Save the shared audit timezone explicitly; does not refresh audit queries.' },
+  viewContext: { path: 'api/view-context', query: z.object({}).strict(), response: viewContext, summary: 'Get the saved audit timezone and server-local date for initial page filters.' },
   audits: { path: 'api/audits', query: auditQuery, response: auditPage, summary: 'List input excerpts using a stable descending cursor.' },
   audit: { path: 'api/audit', query: detailQuery, response: auditDetail, summary: 'Get saved audit metadata, associated host request metadata and ordered content descriptors; no full bodies.' },
   content: { path: 'api/audit-content', query: contentQuery, response: contentPage, summary: 'Read ordered stored content in bounded chunks.' },

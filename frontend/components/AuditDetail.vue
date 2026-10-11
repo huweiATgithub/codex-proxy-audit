@@ -10,7 +10,7 @@ const showEarlier = ref(false);
 const messages = computed(() => showEarlier.value ? props.audit.context : props.audit.context.slice(-3));
 const metadata = computed(() => [
   ['Client Key', `${props.audit.keyName || '名称未知'} · ${props.audit.keyId}`],
-  ['记录时间', props.audit.recordedAtDisplay],
+  ['记录时间', `${props.audit.recordedAtDisplay} · ${props.audit.timeZone}`],
   ['请求模型', props.audit.requestMetadata?.model || '未取得'],
   ['推理强度', props.audit.requestMetadata?.reasoningEffort || '未取得'],
   ['审计 ID', props.audit.id], ['来源请求 ID', props.audit.requestId || '未取得'],

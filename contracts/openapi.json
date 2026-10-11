@@ -6,10 +6,264 @@
     "description": "Paths are relative to the plugin instance. Transport is window.codexProxyPlugin.request; no direct HTTP base URL. See docs/design.md section 5.3 for cursor and content sequencing invariants."
   },
   "paths": {
+    "/api/time-zone": {
+      "put": {
+        "operationId": "timeZone",
+        "summary": "Save the shared audit timezone explicitly; does not refresh audit queries.",
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "timeZone": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "Shared audit IANA timezone, default UTC."
+                  }
+                },
+                "required": [
+                  "timeZone"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "UTF-8 JSON; at most 524288 bytes.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "timeZone": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128,
+                      "description": "Shared audit IANA timezone, default UTC."
+                    }
+                  },
+                  "required": [
+                    "timeZone"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Plugin error; see docs/design.md section 5.3.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "invalid_query",
+                            "invalid_cursor",
+                            "not_found",
+                            "cursor_expired",
+                            "unavailable",
+                            "internal_error"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "pattern": "^[\\s\\S]{0,300}$"
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Host administrator session expired; body is host-defined."
+          },
+          "403": {
+            "description": "Host administrator permission denied; body is host-defined."
+          },
+          "404": {
+            "description": "Plugin error; see docs/design.md section 5.3.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "invalid_query",
+                            "invalid_cursor",
+                            "not_found",
+                            "cursor_expired",
+                            "unavailable",
+                            "internal_error"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "pattern": "^[\\s\\S]{0,300}$"
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Plugin error; see docs/design.md section 5.3.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "invalid_query",
+                            "invalid_cursor",
+                            "not_found",
+                            "cursor_expired",
+                            "unavailable",
+                            "internal_error"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "pattern": "^[\\s\\S]{0,300}$"
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Plugin error; see docs/design.md section 5.3.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "invalid_query",
+                            "invalid_cursor",
+                            "not_found",
+                            "cursor_expired",
+                            "unavailable",
+                            "internal_error"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "pattern": "^[\\s\\S]{0,300}$"
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Plugin error; see docs/design.md section 5.3.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "invalid_query",
+                            "invalid_cursor",
+                            "not_found",
+                            "cursor_expired",
+                            "unavailable",
+                            "internal_error"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "pattern": "^[\\s\\S]{0,300}$"
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/view-context": {
       "get": {
         "operationId": "viewContext",
-        "summary": "Get the host timezone and server-local date for initial page filters.",
+        "summary": "Get the saved audit timezone and server-local date for initial page filters.",
         "parameters": [],
         "responses": {
           "200": {
@@ -23,13 +277,13 @@
                       "type": "string",
                       "minLength": 1,
                       "maxLength": 128,
-                      "description": "Effective host.timezone, for display only; not a client preference."
+                      "description": "Shared audit IANA timezone, default UTC."
                     },
                     "today": {
                       "type": "string",
                       "format": "date",
                       "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$",
-                      "description": "Current date from the server clock in host.timezone; used for the initial filter."
+                      "description": "Current date from the server clock in the saved audit timezone; used for the initial filter."
                     }
                   },
                   "required": [
@@ -254,7 +508,7 @@
             "in": "query",
             "required": false,
             "schema": {
-              "description": "Inclusive date in host.timezone; absent means unbounded.",
+              "description": "Inclusive date in the saved audit timezone; absent means unbounded.",
               "type": "string",
               "format": "date",
               "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$"
@@ -265,7 +519,7 @@
             "in": "query",
             "required": false,
             "schema": {
-              "description": "Inclusive date in host.timezone; absent means unbounded.",
+              "description": "Inclusive date in the saved audit timezone; absent means unbounded.",
               "type": "string",
               "format": "date",
               "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$"
@@ -324,6 +578,12 @@
                 "schema": {
                   "type": "object",
                   "properties": {
+                    "timeZone": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128,
+                      "description": "Shared audit IANA timezone, default UTC."
+                    },
                     "items": {
                       "maxItems": 200,
                       "type": "array",
@@ -342,7 +602,7 @@
                           "recordedAtDisplay": {
                             "type": "string",
                             "pattern": "^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}$",
-                            "description": "Host-generated local time text; render verbatim, never parse as an instant."
+                            "description": "Server-generated local time text; render verbatim, never parse as an instant."
                           },
                           "keyId": {
                             "type": "string",
@@ -399,6 +659,7 @@
                     }
                   },
                   "required": [
+                    "timeZone",
                     "items",
                     "total",
                     "nextCursor"
@@ -634,6 +895,12 @@
                 "schema": {
                   "type": "object",
                   "properties": {
+                    "timeZone": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128,
+                      "description": "Shared audit IANA timezone, default UTC."
+                    },
                     "id": {
                       "type": "string",
                       "pattern": "^[\\s\\S]{1,256}$"
@@ -646,7 +913,7 @@
                     "recordedAtDisplay": {
                       "type": "string",
                       "pattern": "^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}$",
-                      "description": "Host-generated local time text; render verbatim, never parse as an instant."
+                      "description": "Server-generated local time text; render verbatim, never parse as an instant."
                     },
                     "keyId": {
                       "type": "string",
@@ -919,6 +1186,7 @@
                     }
                   },
                   "required": [
+                    "timeZone",
                     "id",
                     "recordedAt",
                     "recordedAtDisplay",

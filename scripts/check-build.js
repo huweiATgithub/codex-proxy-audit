@@ -12,7 +12,7 @@ if (files.length > 128 || files.some((file) => statSync(resolve(directory, file)
 const script = readFileSync(resolve(directory, 'app.js'), 'utf8');
 if (script.includes('/__demo/') || script.includes('req_demo_') || script.includes('thread_demo_')) throw new Error('Demo transport or fixtures leaked into plugin build.');
 const registration = {
-  routes: Object.values(endpoints).map(({ path }) => ({ method: 'GET', path, request_content_types: [], response_content_types: ['application/json'] })),
+  routes: Object.values(endpoints).map(({ path, method = 'GET', body }) => ({ method, path, request_content_types: body ? ['application/json'] : [], response_content_types: ['application/json'] })),
   resources: files.map((path) => ({ path, public: false })),
   pages: [{ id: 'prompt-audit', title: 'Prompt 审计', description: '检索用户输入，查看原文与前序对话。', entry: 'index.html', icon: null }],
   callbacks: [],

@@ -18,8 +18,6 @@ use gateway_plugin_sdk::{
     },
     client::{ComposedPlugin, HostClient, PluginBuilder, RequestCall, TypedReply},
 };
-use serde::Deserialize;
-use serde_json::json;
 use tokio::sync::{Mutex, Notify, oneshot};
 
 use crate::{
@@ -184,13 +182,6 @@ impl KeyCache {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DeploymentContext {
-    time_zone: String,
-    maximum_buffered_body_bytes: usize,
-}
-
 pub async fn plugin(store: Store, writer: Writer) -> anyhow::Result<ComposedPlugin> {
     let registration: ManagementRegistration =
         serde_json::from_slice(include_bytes!("../../dist/plugin/management.json"))?;
@@ -207,26 +198,54 @@ pub async fn plugin(store: Store, writer: Writer) -> anyhow::Result<ComposedPlug
                     && call.request.body.len() <= MAX_OBSERVATION_BYTES
                     && let Ok(body) = serde_json::from_slice(&call.request.body)
                 {
-                        let (key_name, key_name_observed_at) = keys.try_lock().ok()
-                            .map(|cache| (cache.names.get(&head.client_key_id).cloned(), cache.observed_at))
-                            .unwrap_or_default();
-                        let observation = RequestObservation {
-                            key_id: head.client_key_id.clone(), request_id: head.request_id.clone(), body,
-                            headers: head.headers.iter().filter_map(|header| {
+                    let (key_name, key_name_observed_at) = keys
+                        .try_lock()
+                        .ok()
+                        .map(|cache| {
+                            (
+                                cache.names.get(&head.client_key_id).cloned(),
+                                cache.observed_at,
+                            )
+                        })
+                        .unwrap_or_default();
+                    let observation = RequestObservation {
+                        key_id: head.client_key_id.clone(),
+                        request_id: head.request_id.clone(),
+                        body,
+                        headers: head
+                            .headers
+                            .iter()
+                            .filter_map(|header| {
                                 let name = header.name.to_ascii_lowercase();
-                                if !matches!(name.as_str(),
-                                    "x-codex-turn-metadata" | "session_id" | "x-codex-session-id"
-                                    | "thread_source" | "x-codex-thread-source" | "subagent_kind"
-                                    | "x-codex-subagent-kind" | "request_kind" | "x-codex-request-kind"
-                                    | "turn_trigger" | "x-codex-turn-trigger" | "x-openai-subagent"
-                                ) { return None; }
-                                std::str::from_utf8(&header.value).ok().map(|value| (name, value.to_owned()))
-                            }).collect::<BTreeMap<_, _>>(),
-                            observed_at: Utc::now(), key_name, key_name_observed_at,
-                        };
-                        if let Some(draft) = collect(&observation) {
-                            writer.submit(draft);
-                        }
+                                if !matches!(
+                                    name.as_str(),
+                                    "x-codex-turn-metadata"
+                                        | "session_id"
+                                        | "x-codex-session-id"
+                                        | "thread_source"
+                                        | "x-codex-thread-source"
+                                        | "subagent_kind"
+                                        | "x-codex-subagent-kind"
+                                        | "request_kind"
+                                        | "x-codex-request-kind"
+                                        | "turn_trigger"
+                                        | "x-codex-turn-trigger"
+                                        | "x-openai-subagent"
+                                ) {
+                                    return None;
+                                }
+                                std::str::from_utf8(&header.value)
+                                    .ok()
+                                    .map(|value| (name, value.to_owned()))
+                            })
+                            .collect::<BTreeMap<_, _>>(),
+                        observed_at: Utc::now(),
+                        key_name,
+                        key_name_observed_at,
+                    };
+                    if let Some(draft) = collect(&observation) {
+                        writer.submit(draft);
+                    }
                 }
                 call.next.run(call.request).await
             }
@@ -236,24 +255,41 @@ pub async fn plugin(store: Store, writer: Writer) -> anyhow::Result<ComposedPlug
             let secret = secret.clone();
             let keys = keys.clone();
             async move {
-                let reply = call.host.call("host.deployment_context", json!({}), Vec::new()).await;
-                let context = reply.ok().filter(|reply| reply.payload.is_empty()).and_then(|reply| serde_json::from_value::<DeploymentContext>(reply.result).ok());
-                let result = if let Some(context) = context {
-                    match QueryService::new(store.pool().clone(), &context.time_zone, context.maximum_buffered_body_bytes.min(512 * 1024), secret) {
-                        Ok(query) => {
-                            if call.request.path == "api/keys" {
-                                let mut cache = keys.lock().await;
-                                if tokio::time::timeout(Duration::from_secs(1), cache.refresh(&call.host, &store)).await.is_err() {
-                                    eprintln!("audit: Key directory refresh timed out; previous snapshot retained");
-                                }
-                            }
-                            query.handle(&call.request.path, &call.request.query).await
-                        }
-                        Err(_) => crate::query::QueryResponse { status: 503, value: json!({"error":{"code":"unavailable","message":"宿主部署上下文暂不可用"}}) },
+                if call.request.path == "api/keys" {
+                    let mut cache = keys.lock().await;
+                    if tokio::time::timeout(
+                        Duration::from_secs(1),
+                        cache.refresh(&call.host, &store),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        eprintln!(
+                            "audit: Key directory refresh timed out; previous snapshot retained"
+                        );
                     }
-                } else { crate::query::QueryResponse { status: 503, value: json!({"error":{"code":"unavailable","message":"宿主部署上下文暂不可用"}}) } };
-                let payload = serde_json::to_vec(&result.value).map_err(|_| PluginFault::new(gateway_plugin_sdk::ErrorCode::Fault, "audit response encoding failed"))?;
-                Ok(TypedReply::new(ManagementResponse { status: result.status, content_type: "application/json".into(), headers: Vec::new() }).with_payload(payload))
+                }
+                let result = QueryService::management(
+                    &store,
+                    secret,
+                    &call.request.method,
+                    &call.request.path,
+                    &call.request.query,
+                    &call.payload,
+                )
+                .await;
+                let payload = serde_json::to_vec(&result.value).map_err(|_| {
+                    PluginFault::new(
+                        gateway_plugin_sdk::ErrorCode::Fault,
+                        "audit response encoding failed",
+                    )
+                })?;
+                Ok(TypedReply::new(ManagementResponse {
+                    status: result.status,
+                    content_type: "application/json".into(),
+                    headers: Vec::new(),
+                })
+                .with_payload(payload))
             }
         })?;
     Ok(builder.build()?)

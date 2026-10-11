@@ -7,7 +7,7 @@ export const invalidResponse = () => new AuditError('invalid_response', '接口�
 const aborted = () => new DOMException('Aborted', 'AbortError');
 export const isAborted = (error) => error?.name === 'AbortError';
 
-// One queue covers all readers. Abandoned in-flight bridge calls retain their slot
+// One queue covers all readers; settings saves run independently. Abandoned in-flight bridge calls retain their slot
 // until settlement because the host does not support cancellation for management.
 export function createAuditClient(host) {
   let active = 0;
@@ -20,46 +20,53 @@ export function createAuditClient(host) {
       job.run().then(job.resolve, job.reject).finally(() => { active--; drain(); });
     }
   }
+  async function execute(endpoint, values, signal) {
+    if (!host || host.version !== 2 || typeof host.request !== 'function') throw new AuditError('host_missing', '请从 Codex Proxy 的插件管理页面打开审计。');
+    const params = new URLSearchParams(Object.entries(endpoints[endpoint].body ? {} : values).filter(([, value]) => value !== undefined && value !== null && value !== '').map(([key, value]) => [key, String(value)]));
+    let parsedQuery;
+    try { parsedQuery = parseQuery(endpoint, params); } catch { throw new AuditError('invalid_query', '筛选条件无效，请检查日期和关键词。', 400); }
+    const query = new URLSearchParams(parsedQuery).toString();
+    if (new TextEncoder().encode(query).byteLength > MAX_QUERY_BYTES) throw new AuditError('invalid_query', '查询条件过长，请缩小筛选范围。', 400);
+    let body;
+    if (endpoints[endpoint].body) {
+      try { body = new TextEncoder().encode(JSON.stringify(endpoints[endpoint].body.parse(values))).buffer; }
+      catch { throw new AuditError('invalid_query', '审计时区无效，请使用 IANA 时区名称。', 400); }
+    }
+    let reply;
+    try { reply = await host.request({ method: endpoints[endpoint].method || 'GET', path: endpoints[endpoint].path, query, ...(body ? { contentType: 'application/json', body } : {}) }); }
+    catch { throw signal?.aborted ? aborted() : new AuditError('transport', '审计请求暂时失败，请重试。'); }
+    if (signal?.aborted) throw aborted();
+    if (reply?.status === 401) throw new AuditError('unauthorized', '登录已失效，请在宿主重新登录。', 401);
+    if (reply?.status === 403) throw new AuditError('forbidden', '当前账号没有审计访问权限。', 403);
+    if (!reply || typeof reply.contentType !== 'string' || reply.contentType.split(';')[0].trim().toLowerCase() !== 'application/json'
+      || !(reply.body instanceof ArrayBuffer) || reply.body.byteLength > MAX_RESPONSE_BYTES) throw invalidResponse();
+    let value;
+    try { value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(reply.body)); } catch { throw invalidResponse(); }
+    if (reply.status !== 200) {
+      const parsed = errorResponse.safeParse(value);
+      if (!parsed.success) throw invalidResponse();
+      const expected = { invalid_query: 400, invalid_cursor: 400, not_found: 404, cursor_expired: 410, unavailable: 503, internal_error: 500 };
+      if (expected[parsed.data.error.code] !== reply.status) throw invalidResponse();
+      throw new AuditError(parsed.data.error.code, parsed.data.error.message, reply.status);
+    }
+    const parsed = endpoints[endpoint].response.safeParse(value);
+    if (!parsed.success) throw invalidResponse();
+    const result = parsed.data;
+    if (result.nextCursor && result.nextCursor === parsedQuery.cursor) throw invalidResponse();
+    if (result.items && (new Set(result.items.map((item) => item.id)).size !== result.items.length || (!result.items.length && result.nextCursor))) throw invalidResponse();
+    if (endpoint === 'audits' && (result.items.length > Number(parsedQuery.limit) || result.total < result.items.length)) throw invalidResponse();
+    if (endpoint === 'audit' && (result.id !== parsedQuery.id || new Set([result.input.id, ...result.context.map((message) => message.content.id)]).size !== result.context.length + 1 || new Set(result.context.map((message) => message.id)).size !== result.context.length)) throw invalidResponse();
+    if (endpoint === 'content' && (result.auditId !== parsedQuery.id || result.contentId !== parsedQuery.contentId || (!result.blocks.length && result.nextCursor) || result.blocks.reduce((total, block) => total + (block.kind === 'text' ? Array.from(block.text).length : 0), 0) > CONTENT_CHARACTERS)) throw invalidResponse();
+    return result;
+  }
   function request(endpoint, values, signal) {
     return new Promise((resolve, reject) => {
-      queue.push({ signal, resolve, reject, run: async () => {
-        if (!host || host.version !== 2 || typeof host.request !== 'function') throw new AuditError('host_missing', '请从 Codex Proxy 的插件管理页面打开审计。');
-        const params = new URLSearchParams(Object.entries(values).filter(([, value]) => value !== undefined && value !== null && value !== '').map(([key, value]) => [key, String(value)]));
-        let parsedQuery;
-        try { parsedQuery = parseQuery(endpoint, params); } catch { throw new AuditError('invalid_query', '筛选条件无效，请检查日期和关键词。', 400); }
-        const query = new URLSearchParams(parsedQuery).toString();
-        if (new TextEncoder().encode(query).byteLength > MAX_QUERY_BYTES) throw new AuditError('invalid_query', '查询条件过长，请缩小筛选范围。', 400);
-        let reply;
-        try { reply = await host.request({ method: 'GET', path: endpoints[endpoint].path, query }); }
-        catch { throw signal?.aborted ? aborted() : new AuditError('transport', '暂时无法读取审计数据，请重试。'); }
-        if (signal?.aborted) throw aborted();
-        if (reply?.status === 401) throw new AuditError('unauthorized', '登录已失效，请在宿主重新登录。', 401);
-        if (reply?.status === 403) throw new AuditError('forbidden', '当前账号没有审计访问权限。', 403);
-        if (!reply || typeof reply.contentType !== 'string' || reply.contentType.split(';')[0].trim().toLowerCase() !== 'application/json'
-          || !(reply.body instanceof ArrayBuffer) || reply.body.byteLength > MAX_RESPONSE_BYTES) throw invalidResponse();
-        let value;
-        try { value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(reply.body)); } catch { throw invalidResponse(); }
-        if (reply.status !== 200) {
-          const parsed = errorResponse.safeParse(value);
-          if (!parsed.success) throw invalidResponse();
-          const expected = { invalid_query: 400, invalid_cursor: 400, not_found: 404, cursor_expired: 410, unavailable: 503, internal_error: 500 };
-          if (expected[parsed.data.error.code] !== reply.status) throw invalidResponse();
-          throw new AuditError(parsed.data.error.code, parsed.data.error.message, reply.status);
-        }
-        const parsed = endpoints[endpoint].response.safeParse(value);
-        if (!parsed.success) throw invalidResponse();
-        const result = parsed.data;
-        if (result.nextCursor && result.nextCursor === parsedQuery.cursor) throw invalidResponse();
-        if (result.items && (new Set(result.items.map((item) => item.id)).size !== result.items.length || (!result.items.length && result.nextCursor))) throw invalidResponse();
-        if (endpoint === 'audits' && (result.items.length > Number(parsedQuery.limit) || result.total < result.items.length)) throw invalidResponse();
-        if (endpoint === 'audit' && (result.id !== parsedQuery.id || new Set([result.input.id, ...result.context.map((message) => message.content.id)]).size !== result.context.length + 1 || new Set(result.context.map((message) => message.id)).size !== result.context.length)) throw invalidResponse();
-        if (endpoint === 'content' && (result.auditId !== parsedQuery.id || result.contentId !== parsedQuery.contentId || (!result.blocks.length && result.nextCursor) || result.blocks.reduce((total, block) => total + (block.kind === 'text' ? Array.from(block.text).length : 0), 0) > CONTENT_CHARACTERS)) throw invalidResponse();
-        return result;
-      } });
+      queue.push({ signal, resolve, reject, run: () => execute(endpoint, values, signal) });
       drain();
     });
   }
   return {
+    saveTimeZone: (timeZone) => execute('timeZone', { timeZone }),
     viewContext: (signal) => request('viewContext', {}, signal),
     list: (query, signal) => request('audits', query, signal),
     detail: (id, signal) => request('audit', { id }, signal),

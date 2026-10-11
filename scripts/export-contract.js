@@ -8,11 +8,12 @@ const jsonSchema = (schema) => {
 };
 const paths = Object.fromEntries(Object.entries(endpoints).map(([operationId, endpoint]) => {
   const query = jsonSchema(endpoint.query);
-  return [`/${endpoint.path}`, { get: {
+  return [`/${endpoint.path}`, { [(endpoint.method || 'GET').toLowerCase()]: {
     operationId, summary: endpoint.summary,
     parameters: Object.entries(query.properties).map(([name, schema]) => ({
       name, in: 'query', required: query.required?.includes(name) || false, schema,
     })),
+    ...(endpoint.body ? { requestBody: { required: true, content: { 'application/json': { schema: jsonSchema(endpoint.body) } } } } : {}),
     responses: {
       200: { description: `UTF-8 JSON; at most ${MAX_RESPONSE_BYTES} bytes.`, content: { 'application/json': { schema: jsonSchema(endpoint.response) } } },
       ...Object.fromEntries([400, 404, 410, 500, 503].map((status) => [status, { description: 'Plugin error; see docs/design.md section 5.3.', content: { 'application/json': { schema: jsonSchema(errorResponse) } } }])),

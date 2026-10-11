@@ -57,7 +57,7 @@ impl ApiError {
         Self {
             status: 503,
             code: "unavailable",
-            message: "当前宿主响应限制不足以读取记录。",
+            message: "记录超过审计响应大小限制。",
         }
     }
 }
@@ -95,8 +95,6 @@ pub struct QueryResponse {
 pub struct QueryService {
     pool: PgPool,
     time_zone: Tz,
-    time_zone_name: String,
-    response_budget: usize,
     cursor_secret: Vec<u8>,
 }
 
@@ -104,6 +102,7 @@ pub struct QueryService {
 #[serde(deny_unknown_fields)]
 struct Cursor {
     version: u8,
+    time_zone: String,
     scope: String,
     position: Value,
     expires: i64,
@@ -120,44 +119,48 @@ struct ListQuery {
 }
 
 impl QueryService {
-    /// `time_zone` is supplied by the host's effective deployment configuration.
+    /// A query receives one parsed snapshot of the shared setting.
     /// The signing secret comes from Store::secret, so restarts preserve cursors.
-    pub fn new(
-        pool: PgPool,
-        time_zone: &str,
-        response_budget: usize,
-        cursor_secret: Vec<u8>,
-    ) -> Result<Self, String> {
-        let parsed = time_zone
-            .parse::<Tz>()
-            .map_err(|_| "宿主部署时区无效。".to_string())?;
-        if time_zone.chars().count() > 128 || cursor_secret.len() < 32 || response_budget < 128 {
+    pub fn new(pool: PgPool, time_zone: Tz, cursor_secret: Vec<u8>) -> Result<Self, String> {
+        if cursor_secret.len() < 32 {
             return Err("查询服务配置无效。".to_string());
         }
         Ok(Self {
             pool,
-            time_zone: parsed,
-            time_zone_name: time_zone.to_string(),
-            response_budget: response_budget.min(MAX_RESPONSE_BYTES),
+            time_zone,
             cursor_secret,
         })
     }
 
-    pub async fn handle(&self, path: &str, raw_query: &str) -> QueryResponse {
-        let result = self.dispatch(path, raw_query).await.and_then(|value| {
-            if bytes(&value)? > self.response_budget {
-                Err(ApiError::budget())
-            } else {
-                Ok(value)
+    pub async fn management(
+        store: &crate::store::Store,
+        cursor_secret: Vec<u8>,
+        method: &str,
+        path: &str,
+        raw_query: &str,
+        body: &[u8],
+    ) -> QueryResponse {
+        let result = async {
+            if method == "PUT" && path == "api/time-zone" {
+                parse_params(raw_query, &[])?;
+                let time_zone = parse_time_zone(body)?;
+                store.save_time_zone(time_zone).await?;
+                return Ok(json!({"timeZone": time_zone.name()}));
             }
-        });
-        match result {
-            Ok(value) => QueryResponse { status: 200, value },
-            Err(error) => QueryResponse {
-                status: error.status,
-                value: json!({"error":{"code":error.code,"message":error.message}}),
-            },
+            if method != "GET" || !body.is_empty() {
+                return Err(ApiError::invalid_query());
+            }
+            let time_zone = store.time_zone().await?;
+            let query = Self::new(store.pool().clone(), time_zone, cursor_secret)
+                .map_err(|_| ApiError::internal())?;
+            query.dispatch(path, raw_query).await
         }
+        .await;
+        response(result)
+    }
+
+    pub async fn handle(&self, path: &str, raw_query: &str) -> QueryResponse {
+        response(self.dispatch(path, raw_query).await)
     }
 
     async fn dispatch(&self, path: &str, raw_query: &str) -> ApiResult<Value> {
@@ -172,7 +175,7 @@ impl QueryService {
         let params = parse_params(raw_query, allowed)?;
         match path {
             "api/view-context" => Ok(
-                json!({"timeZone":self.time_zone_name,"today":Utc::now().with_timezone(&self.time_zone).format("%Y-%m-%d").to_string()}),
+                json!({"timeZone":self.time_zone.name(),"today":Utc::now().with_timezone(&self.time_zone).format("%Y-%m-%d").to_string()}),
             ),
             "api/audits" => self.list(parse_list(&params)?).await,
             "api/audit" => self.detail(required_id(&params, "id")?).await,
@@ -191,7 +194,8 @@ impl QueryService {
 
     fn sign_cursor(&self, scope: &str, position: Value) -> ApiResult<String> {
         let cursor = Cursor {
-            version: 1,
+            version: 2,
+            time_zone: self.time_zone.name().to_string(),
             scope: scope.to_string(),
             position,
             expires: Utc::now().timestamp() + CURSOR_LIFETIME_SECONDS,
@@ -229,7 +233,8 @@ impl QueryService {
             .map_err(|_| ApiError::invalid_cursor())?;
         let cursor: Cursor =
             serde_json::from_slice(&payload).map_err(|_| ApiError::invalid_cursor())?;
-        if cursor.version != 1 || cursor.scope != scope {
+        if cursor.version != 2 || cursor.time_zone != self.time_zone.name() || cursor.scope != scope
+        {
             return Err(ApiError::invalid_cursor());
         }
         if cursor.expires < Utc::now().timestamp() {
@@ -249,7 +254,7 @@ impl QueryService {
         let scope = format!(
             "audits:{}",
             scope_hash(
-                &json!({"from":query.from.map(|day|day.to_string()),"to":query.to.map(|day|day.to_string()),"key":query.key,"q":query.q,"limit":query.limit,"timeZone":self.time_zone_name,"order":"first_observed_at DESC,id COLLATE C DESC"})
+                &json!({"from":query.from.map(|day|day.to_string()),"to":query.to.map(|day|day.to_string()),"key":query.key,"q":query.q,"limit":query.limit,"timeZone":self.time_zone.name(),"order":"first_observed_at DESC,id COLLATE C DESC"})
             )?
         );
         let position = self.read_cursor(query.cursor.as_deref(), &scope)?;
@@ -284,7 +289,9 @@ impl QueryService {
             })
             .transpose()?;
         if query.key.as_deref().is_some_and(|key| key.contains('\0')) {
-            return Ok(json!({"items":[],"total":0,"nextCursor":null}));
+            return Ok(
+                json!({"timeZone":self.time_zone.name(),"items":[],"total":0,"nextCursor":null}),
+            );
         }
         let folded = crate::store::search_text(&query.q);
         // Count and rows share one read-only snapshot within this request. The cursor
@@ -331,8 +338,9 @@ impl QueryService {
                 None
             };
             items.push(item);
-            if bytes(&json!({"items":items,"total":total,"nextCursor":next}))?
-                > self.response_budget
+            if bytes(
+                &json!({"timeZone":self.time_zone.name(),"items":items,"total":total,"nextCursor":next}),
+            )? > MAX_RESPONSE_BYTES
             {
                 items.pop();
                 break;
@@ -347,7 +355,9 @@ impl QueryService {
         } else {
             None
         };
-        Ok(json!({"items":items,"total":total,"nextCursor":next_cursor}))
+        Ok(
+            json!({"timeZone":self.time_zone.name(),"items":items,"total":total,"nextCursor":next_cursor}),
+        )
     }
 
     fn display_time(&self, time: DateTime<Utc>) -> String {
@@ -412,7 +422,7 @@ impl QueryService {
         }
         let time: DateTime<Utc> = audit.try_get("first_observed_at")?;
         Ok(
-            json!({"id":id,"recordedAt":utc_timestamp(time),"recordedAtDisplay":self.display_time(time),"keyId":key_id,"keyName":audit.try_get::<Option<String>,_>("key_name")?,"threadId":audit.try_get::<Option<String>,_>("thread_id")?,"sessionId":audit.try_get::<Option<String>,_>("session_id")?,"requestId":request_id,"turnId":audit.try_get::<Option<String>,_>("turn_id")?,"inputKinds":input_kinds,"repositories":audit.try_get::<Option<Value>,_>("repositories")?,"requestMetadata":request_metadata,"input":input,"context":context}),
+            json!({"timeZone":self.time_zone.name(),"id":id,"recordedAt":utc_timestamp(time),"recordedAtDisplay":self.display_time(time),"keyId":key_id,"keyName":audit.try_get::<Option<String>,_>("key_name")?,"threadId":audit.try_get::<Option<String>,_>("thread_id")?,"sessionId":audit.try_get::<Option<String>,_>("session_id")?,"requestId":request_id,"turnId":audit.try_get::<Option<String>,_>("turn_id")?,"inputKinds":input_kinds,"repositories":audit.try_get::<Option<Value>,_>("repositories")?,"requestMetadata":request_metadata,"input":input,"context":context}),
         )
     }
 
@@ -495,8 +505,8 @@ impl QueryService {
                         break;
                     }
                     // JSON string escaping can consume six bytes per code point.
-                    // Find the largest segment that also fits the effective host
-                    // budget; do not truncate the persisted original.
+                    // Find the largest segment that also fits the plugin response
+                    // cap; do not truncate the persisted original.
                     let maximum = (total - offset).min(budget);
                     let mut length = maximum;
                     let mut segment;
@@ -519,7 +529,7 @@ impl QueryService {
                         segments.push(segment.clone());
                         let fits = bytes(
                             &json!({"auditId":audit_id,"contentId":content_id,"blocks":segments,"nextCursor":next}),
-                        )? <= self.response_budget;
+                        )? <= MAX_RESPONSE_BYTES;
                         segments.pop();
                         if fits {
                             break;
@@ -550,7 +560,7 @@ impl QueryService {
             segments.push(segment);
             if bytes(
                 &json!({"auditId":audit_id,"contentId":content_id,"blocks":segments,"nextCursor":next}),
-            )? > self.response_budget
+            )? > MAX_RESPONSE_BYTES
             {
                 segments.pop();
                 break;
@@ -601,7 +611,7 @@ impl QueryService {
             items.push(
                 json!({"id":id,"names":names,"historical":row.try_get::<bool,_>("historical")?}),
             );
-            if bytes(&json!({"items":items,"nextCursor":next}))? > self.response_budget {
+            if bytes(&json!({"items":items,"nextCursor":next}))? > MAX_RESPONSE_BYTES {
                 items.pop();
                 break;
             }
@@ -617,6 +627,44 @@ impl QueryService {
         };
         Ok(json!({"items":items,"nextCursor":next}))
     }
+}
+
+fn response(result: ApiResult<Value>) -> QueryResponse {
+    let result = result.and_then(|value| {
+        if bytes(&value)? > MAX_RESPONSE_BYTES {
+            Err(ApiError::budget())
+        } else {
+            Ok(value)
+        }
+    });
+    match result {
+        Ok(value) => QueryResponse { status: 200, value },
+        Err(error) => QueryResponse {
+            status: error.status,
+            value: json!({"error":{"code":error.code,"message":error.message}}),
+        },
+    }
+}
+
+fn parse_time_zone(body: &[u8]) -> ApiResult<Tz> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Setting {
+        time_zone: String,
+    }
+    let invalid = || ApiError {
+        status: 400,
+        code: "invalid_query",
+        message: "审计时区无效，请使用 IANA 时区名称。",
+    };
+    if body.len() > MAX_QUERY_BYTES {
+        return Err(invalid());
+    }
+    let setting: Setting = serde_json::from_slice(body).map_err(|_| invalid())?;
+    if setting.time_zone.len() > 128 {
+        return Err(invalid());
+    }
+    setting.time_zone.parse().map_err(|_| invalid())
 }
 
 fn parse_params(raw: &str, allowed: &[&str]) -> ApiResult<BTreeMap<String, String>> {
@@ -781,17 +829,38 @@ fn day_boundary(day: NaiveDate, time_zone: Tz) -> ApiResult<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn service(budget: usize) -> QueryService {
+    fn service() -> QueryService {
         QueryService::new(
             sqlx::postgres::PgPoolOptions::new()
                 .connect_lazy("postgres://unused:unused@localhost/unused")
                 .unwrap(),
-            "America/New_York",
-            budget,
+            "America/New_York".parse().unwrap(),
             vec![7; 32],
         )
         .unwrap()
     }
+    #[test]
+    fn timezone_body_is_strict_and_parsed() {
+        for body in [
+            r#"{}"#,
+            r#"{"timeZone":null}"#,
+            r#"{"timeZone":"Invalid/Zone"}"#,
+            r#"{"timeZone":" UTC"}"#,
+            r#"{"timeZone":"UTC","other":1}"#,
+            r#"{"timeZone":"UTC","timeZone":"Asia/Tokyo"}"#,
+            r#"{"timeZone":"UTC"} trailing"#,
+        ] {
+            assert_eq!(
+                parse_time_zone(body.as_bytes()).unwrap_err().code,
+                "invalid_query"
+            );
+        }
+        assert_eq!(
+            parse_time_zone(br#"{"timeZone":"Asia/Kathmandu"}"#).unwrap(),
+            chrono_tz::Asia::Kathmandu
+        );
+    }
+
     #[test]
     fn strict_queries_match_unicode_and_literal_rules() {
         for raw in [
@@ -817,7 +886,7 @@ mod tests {
     }
     #[tokio::test]
     async fn cursors_are_authenticated_scoped_persistent_and_expirable() {
-        let service = service(512 * 1024);
+        let service = service();
         let cursor = service
             .sign_cursor("a", json!({"index":1,"offset":3}))
             .unwrap();
@@ -825,8 +894,13 @@ mod tests {
             service.read_cursor(Some(&cursor), "a").unwrap().unwrap()["offset"],
             3
         );
-        let same = QueryService::new(service.pool.clone(), "UTC", 512 * 1024, vec![7; 32]).unwrap();
+        let same = QueryService::new(service.pool.clone(), service.time_zone, vec![7; 32]).unwrap();
         assert!(same.read_cursor(Some(&cursor), "a").is_ok());
+        let other = QueryService::new(service.pool.clone(), chrono_tz::UTC, vec![7; 32]).unwrap();
+        assert_eq!(
+            other.read_cursor(Some(&cursor), "a").unwrap_err().code,
+            "invalid_cursor"
+        );
         assert_eq!(
             service.read_cursor(Some(&cursor), "b").unwrap_err().code,
             "invalid_cursor"
@@ -841,7 +915,8 @@ mod tests {
             "invalid_cursor"
         );
         let expired = Cursor {
-            version: 1,
+            version: 2,
+            time_zone: service.time_zone.name().to_string(),
             scope: "a".into(),
             position: json!(0),
             expires: Utc::now().timestamp() - 1,
@@ -879,7 +954,7 @@ mod tests {
     }
     #[tokio::test]
     async fn content_segments_preserve_codepoints_empty_blocks_and_ownership() {
-        let service = service(512 * 1024);
+        let service = service();
         let source = json!([{"kind":"text","text":"😀é中".repeat(401)},{"kind":"text","text":""},{"kind":"nontext","mediaType":"image","description":null}]);
         let page = service
             .content_page("a", "c", "content-scope", &source, 0, 0)
@@ -911,8 +986,8 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn small_host_budget_returns_continuous_content_without_losing_text() {
-        let service = service(2000);
+    async fn fixed_response_cap_returns_continuous_content_without_losing_text() {
+        let service = service();
         let source = json!([{"kind":"text","text":"\u{0001}😀".repeat(1800)}]);
         let mut index = 0;
         let mut offset = 0;
@@ -921,7 +996,7 @@ mod tests {
             let page = service
                 .content_page("audit", "content", "scope", &source, index, offset)
                 .unwrap();
-            assert!(bytes(&page).unwrap() <= 2000);
+            assert!(bytes(&page).unwrap() <= MAX_RESPONSE_BYTES);
             for block in page["blocks"].as_array().unwrap() {
                 combined.push_str(block["text"].as_str().unwrap());
             }

@@ -29,9 +29,9 @@ function descriptor(id, blocks) {
 
 // Runs in the preview server only. The browser receives the same bounded wire
 // responses as a plugin client; fixture bodies are never bundled into the UI.
-export function createDemoService({ audits = fixtureAudits, keys = fixtureKeys, modelRequests = fixtureRequests, maxListRows = 200, keyPageSize = 100, timeZone = 'Asia/Shanghai', now = () => new Date() } = {}) {
-  const dateFormatter = new Intl.DateTimeFormat('sv-SE', { timeZone });
-  const timeFormatter = new Intl.DateTimeFormat('sv-SE', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
+export function createDemoService({ audits = fixtureAudits, keys = fixtureKeys, modelRequests = fixtureRequests, maxListRows = 200, keyPageSize = 100, timeZone = 'UTC', now = () => new Date() } = {}) {
+  let dateFormatter = new Intl.DateTimeFormat('sv-SE', { timeZone });
+  let timeFormatter = new Intl.DateTimeFormat('sv-SE', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
   const metadata = (audit) => ({ id: audit.id, recordedAt: audit.firstObservedAt, recordedAtDisplay: timeFormatter.format(new Date(audit.firstObservedAt)), keyId: audit.keyId, keyName: audit.keyName || null });
   const viewContext = () => ({ timeZone, today: dateFormatter.format(now()) });
   const records = audits.map((audit) => ({ ...audit, firstObservedAt: new Date(audit.firstObservedAt).toISOString() })).sort((a, b) => b.firstObservedAt.localeCompare(a.firstObservedAt) || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
@@ -50,11 +50,11 @@ export function createDemoService({ audits = fixtureAudits, keys = fixtureKeys, 
     let last;
     for (const audit of remaining.slice(0, Math.min(Number(query.limit), maxListRows))) {
       const item = { ...metadata(audit), preview: preview(audit, query.q), contextCount: audit.context.length };
-      if (bytes({ items: [...items, item], total: matching.length, nextCursor: 'x'.repeat(2048) }) > MAX_RESPONSE_BYTES) break;
+      if (bytes({ timeZone, items: [...items, item], total: matching.length, nextCursor: 'x'.repeat(2048) }) > MAX_RESPONSE_BYTES) break;
       items.push(item); last = audit;
     }
     if (!items.length && remaining.length) fail('internal_error', 500, '记录预览超过响应限制。');
-    return { items, total: matching.length, nextCursor: remaining.length > items.length ? encodeCursor({ scope, after: [last.firstObservedAt, last.id] }) : null };
+    return { timeZone, items, total: matching.length, nextCursor: remaining.length > items.length ? encodeCursor({ scope, after: [last.firstObservedAt, last.id] }) : null };
   }
   function getAudit(id) {
     const audit = records.find((record) => record.id === id);
@@ -65,7 +65,7 @@ export function createDemoService({ audits = fixtureAudits, keys = fixtureKeys, 
     const audit = getAudit(query.id);
     const request = modelRequests.find((row) => row.id === audit.requestId && row.keyId === audit.keyId);
     return {
-      ...metadata(audit), threadId: audit.threadId ?? null, sessionId: audit.sessionId ?? null, requestId: audit.requestId ?? null,
+      timeZone, ...metadata(audit), threadId: audit.threadId ?? null, sessionId: audit.sessionId ?? null, requestId: audit.requestId ?? null,
       turnId: audit.turnId ?? null, inputKinds: audit.input.map((block) => block.inputKind ?? null),
       repositories: audit.repositories ?? null,
       requestMetadata: request ? { userAgent: request.userAgent ?? null, model: request.model ?? null, reasoningEffort: request.reasoningEffort ?? null } : null,
@@ -78,7 +78,7 @@ export function createDemoService({ audits = fixtureAudits, keys = fixtureKeys, 
     const contextIndex = /^context-(\d+)$/.exec(query.contentId)?.[1];
     const source = query.contentId === 'input' ? audit.input : contextIndex === undefined ? null : audit.context[Number(contextIndex)]?.blocks;
     if (!source) fail('not_found', 404, '记录内容不存在或已被清理。');
-    const scope = `content:${query.id}:${query.contentId}`;
+    const scope = `content:${timeZone}:${query.id}:${query.contentId}`;
     const position = cursorValue(query.cursor, scope) ?? { index: 0, offset: 0 };
     if (!Number.isSafeInteger(position.index) || !Number.isSafeInteger(position.offset) || position.index < 0 || position.offset < 0
       || position.index > source.length || (position.index === source.length && position.offset !== 0)) fail('invalid_cursor', 400, '正文读取位置无效。');
@@ -104,7 +104,8 @@ export function createDemoService({ audits = fixtureAudits, keys = fixtureKeys, 
     return { auditId: audit.id, contentId: query.contentId, blocks, nextCursor: index < source.length ? encodeCursor({ scope, after: { index, offset } }) : null };
   }
   function keyList(query) {
-    const after = cursorValue(query.cursor, 'keys');
+    const scope = `keys:${timeZone}`;
+    const after = cursorValue(query.cursor, scope);
     if (after !== null && typeof after !== 'string') fail('invalid_cursor', 400, 'Key 分页位置无效。');
     const directory = [...keys].sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0).filter((key) => after === null || key.id > after);
     const items = [];
@@ -114,14 +115,26 @@ export function createDemoService({ audits = fixtureAudits, keys = fixtureKeys, 
       items.push(item);
     }
     if (!items.length && directory.length) fail('internal_error', 500, 'Key 目录项超过响应限制。');
-    return { items, nextCursor: directory.length > items.length ? encodeCursor({ scope: 'keys', after: items.at(-1).id }) : null };
+    return { items, nextCursor: directory.length > items.length ? encodeCursor({ scope, after: items.at(-1).id }) : null };
   }
-  return function handle(path, params) {
+  return function handle(path, params, method = 'GET', body) {
     const endpoint = Object.entries(endpoints).find(([, entry]) => entry.path === path)?.[0];
     try {
       if (!endpoint) fail('not_found', 404, '接口不存在。');
+      if (method !== (endpoints[endpoint].method || 'GET')) fail('invalid_query', 400, '请求方法无效。');
       let query;
       try { query = parseQuery(endpoint, params); } catch { fail('invalid_query', 400, '筛选条件无效，请检查日期、关键词和分页参数。'); }
+      if (endpoint === 'timeZone') {
+        let setting, nextDate, nextTime;
+        try {
+          setting = endpoints.timeZone.body.parse(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(body)));
+          if (!/^[A-Za-z][A-Za-z0-9._+/-]*$/.test(setting.timeZone)) throw new Error();
+          nextDate = new Intl.DateTimeFormat('sv-SE', { timeZone: setting.timeZone });
+          nextTime = new Intl.DateTimeFormat('sv-SE', { timeZone: setting.timeZone, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
+        } catch { fail('invalid_query', 400, '审计时区无效，请使用 IANA 时区名称。'); }
+        timeZone = setting.timeZone; dateFormatter = nextDate; timeFormatter = nextTime;
+        return { status: 200, value: { timeZone } };
+      }
       const value = { viewContext, audits: list, audit: detail, content, keys: keyList }[endpoint](query);
       const parsed = endpoints[endpoint].response.parse(value);
       if (bytes(parsed) > MAX_RESPONSE_BYTES) fail('internal_error', 500, '响应超过大小限制。');

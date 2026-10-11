@@ -7,9 +7,9 @@ import { audits } from '../demo/fixtures.js';
 import { CONTENT_CHARACTERS, MAX_RESPONSE_BYTES, parseQuery } from '../contracts/audit.js';
 
 const reply = (value, status = 200) => ({ status, contentType: 'application/json; charset=utf-8', body: new TextEncoder().encode(JSON.stringify(value)).buffer });
-const bridge = (service) => ({ version: 2, async request({ method, path, query }) {
-  assert.equal(method, 'GET'); assert.ok(!path.startsWith('/')); assert.ok(!query.startsWith('?'));
-  const result = service(path, new URLSearchParams(query));
+const bridge = (service) => ({ version: 2, async request({ method, path, query, body }) {
+  assert.ok(['GET', 'PUT'].includes(method)); assert.ok(!path.startsWith('/')); assert.ok(!query.startsWith('?'));
+  const result = service(path, new URLSearchParams(query), method, body);
   const response = reply(result.value, result.status);
   assert.ok(response.body.byteLength <= MAX_RESPONSE_BYTES);
   return response;
@@ -59,7 +59,7 @@ test('local inclusive dates retain both DST repeated hours and sort by the insta
   await assert.rejects(api.list({ from: '2026-11-02', to: '2026-11-01' }), (error) => error.code === 'invalid_query');
 });
 
-test('host timezone owns default date, display text, date filtering and cursor scope', async () => {
+test('saved audit timezone owns default date, display text, date filtering and cursor scope', async () => {
   const records = [{ ...audits[0], firstObservedAt: '2026-10-08T18:42:18.000Z' }];
   for (const [timeZone, today, display] of [
     ['Asia/Shanghai', '2026-10-09', '2026-10-09 02:42:18'],
@@ -177,11 +177,54 @@ test('shared request queue bounds concurrency and skips abandoned queued reads',
   const api = createAuditClient({ version: 2, async request() {
     count++; active++; maximum = Math.max(maximum, active);
     await new Promise((resolve) => setTimeout(resolve, 8)); active--;
-    return reply({ items: [], total: 0, nextCursor: null });
+    return reply({ timeZone: 'UTC', items: [], total: 0, nextCursor: null });
   } });
   const abort = new AbortController();
   const running = Array.from({ length: 10 }, (_, index) => api.list({}, index === 9 ? abort.signal : undefined));
   abort.abort();
   const results = await Promise.allSettled(running);
   assert.equal(maximum, 4); assert.equal(count, 9); assert.equal(results[9].reason.name, 'AbortError');
+});
+
+test('saving a shared UTC-default setting preserves data and binds all cursor families', async () => {
+  const api = createAuditClient(bridge(createDemoService({ keyPageSize: 1 })));
+  assert.equal((await api.viewContext()).timeZone, 'UTC');
+  const list = await api.list({});
+  const detail = await api.detail('PA-0009');
+  const content = await api.content(detail.id, detail.input.id);
+  const keys = await api.keys();
+  assert.ok(list.nextCursor && content.nextCursor && keys.nextCursor);
+  assert.deepEqual(await api.saveTimeZone('Asia/Kathmandu'), { timeZone: 'Asia/Kathmandu' });
+  await assert.rejects(api.saveTimeZone('Invalid/Zone'), (error) => error.code === 'invalid_query');
+  assert.equal((await api.viewContext()).timeZone, 'Asia/Kathmandu');
+  assert.equal((await api.detail(detail.id)).timeZone, 'Asia/Kathmandu');
+  assert.equal((await api.detail(detail.id)).recordedAt, detail.recordedAt);
+  assert.deepEqual((await api.content(detail.id, detail.input.id)).blocks, content.blocks);
+  assert.equal((await api.list({})).total, list.total);
+  await assert.rejects(api.list({ cursor: list.nextCursor }), (error) => error.code === 'invalid_cursor');
+  await assert.rejects(api.content(detail.id, detail.input.id, content.nextCursor), (error) => error.code === 'invalid_cursor');
+  await assert.rejects(api.keys(keys.nextCursor), (error) => error.code === 'invalid_cursor');
+});
+
+test('settings saves complete while all read slots are occupied without refetching', async () => {
+  let release;
+  const pending = new Promise((resolve) => { release = resolve; });
+  const calls = [];
+  const api = createAuditClient({ version: 2, async request(input) {
+    calls.push(input);
+    if (input.method === 'PUT') {
+      assert.equal(input.path, 'api/time-zone');
+      assert.equal(input.query, '');
+      assert.equal(input.contentType, 'application/json');
+      return reply(JSON.parse(new TextDecoder().decode(input.body)));
+    }
+    await pending;
+    return reply({ timeZone: 'UTC', items: [], total: 0, nextCursor: null });
+  } });
+  const reads = Array.from({ length: 4 }, () => api.list({ from: '2026-11-01', to: '2026-11-01' }));
+  assert.deepEqual(await api.saveTimeZone('Asia/Tokyo'), { timeZone: 'Asia/Tokyo' });
+  assert.equal(calls.length, 5);
+  release();
+  assert.ok((await Promise.all(reads)).every((value) => value.timeZone === 'UTC'));
+  assert.equal(calls.length, 5);
 });

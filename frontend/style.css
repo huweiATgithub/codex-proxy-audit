@@ -126,3 +126,7 @@ main { display: flex; flex-direction: column; flex: 1; min-height: 0; padding: 1
 .spinner { animation: spin 1s linear infinite; }
 @media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
 @media (max-width: 620px) { .cursor-pagination { flex-wrap: wrap; } .cursor-pagination > div { margin-left: auto; } }
+
+.timezone-settings { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 12px; }
+.timezone-settings > .timezone-input { width: 220px; }
+.timezone-settings > label, .timezone-saved { font-size: 12px; color: var(--cp-color-text-secondary); }

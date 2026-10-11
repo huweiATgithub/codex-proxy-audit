@@ -128,8 +128,7 @@ impl Database {
     async fn query(&self, time_zone: &str) -> Result<QueryService> {
         QueryService::new(
             self.store.pool().clone(),
-            time_zone,
-            512 * 1024,
+            time_zone.parse().map_err(anyhow::Error::msg)?,
             self.store.secret("query_cursor").await?,
         )
         .map_err(anyhow::Error::msg)
@@ -643,4 +642,122 @@ fn codepoint_projection_keeps_literal_nul_and_ascii_only_folding() {
     assert!(!search_text("a").contains(&search_text("\0")));
     assert!(decode_text("x00").is_err());
     assert!(decode_text("x00d800").is_err());
+}
+
+#[tokio::test]
+#[ignore = "requires AUDIT_TEST_DATABASE_URL pointing to isolated PostgreSQL"]
+async fn shared_timezone_is_parsed_persistent_and_preserves_audit_data() -> Result<()> {
+    let database = Database::create().await?;
+    assert_eq!(database.store.time_zone().await?, chrono_tz::UTC);
+    let secret = database.store.secret("query_cursor").await?;
+    let before =
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM prompt_audit.schema_migrations")
+            .fetch_one(database.store.pool())
+            .await?;
+    let save = |body: &'static [u8]| {
+        QueryService::management(
+            &database.store,
+            secret.clone(),
+            "PUT",
+            "api/time-zone",
+            "",
+            body,
+        )
+    };
+    assert_eq!(save(br#"{"timeZone":"Asia/Kathmandu"}"#).await.status, 200);
+    for body in [
+        br#"{"timeZone":"Not/AZone"}"#.as_slice(),
+        br#"{"timeZone":"UTC","extra":true}"#.as_slice(),
+        br#"{"timeZone":null}"#.as_slice(),
+        br#"{"timeZone":"UTC","timeZone":"Asia/Tokyo"}"#.as_slice(),
+    ] {
+        let result = save(body).await;
+        assert_eq!(result.status, 400);
+        assert_eq!(result.value["error"]["code"], "invalid_query");
+        assert_eq!(
+            database.store.time_zone().await?,
+            chrono_tz::Asia::Kathmandu
+        );
+    }
+    let restarted = Store::connect(&database.audit_url).await?;
+    assert_eq!(restarted.time_zone().await?, chrono_tz::Asia::Kathmandu);
+    assert_eq!(restarted.secret("query_cursor").await?, secret);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM prompt_audit.schema_migrations")
+            .fetch_one(restarted.pool())
+            .await?,
+        before
+    );
+    sqlx::query("UPDATE prompt_audit.settings SET value = $1 WHERE name = 'timeZone'")
+        .bind(b"Invalid/StoredZone".as_slice())
+        .execute(database.store.pool())
+        .await?;
+    assert!(restarted.time_zone().await.is_err());
+    let failed = QueryService::management(
+        &restarted,
+        secret.clone(),
+        "GET",
+        "api/view-context",
+        "",
+        &[],
+    )
+    .await;
+    assert_eq!(failed.status, 500);
+    assert_eq!(save(br#"{"timeZone":"UTC"}"#).await.status, 200);
+    assert_eq!(restarted.time_zone().await?, chrono_tz::UTC);
+    restarted.close().await;
+    database.clean().await
+}
+
+#[tokio::test]
+#[ignore = "requires AUDIT_TEST_DATABASE_URL pointing to isolated PostgreSQL"]
+async fn escaped_rows_and_large_key_directories_paginate_under_fixed_response_cap() -> Result<()> {
+    let database = Database::create().await?;
+    let drafts = (0..200)
+        .map(|index| {
+            let mut value = draft(&observation(
+                "key-a",
+                "thread-a",
+                json!([user(&format!("input-{index}"), &"\u{0001}".repeat(400))]),
+            ));
+            value.key_name = Some("\u{0001}".repeat(512));
+            value
+        })
+        .collect::<Vec<_>>();
+    database.store.persist_batch(&drafts).await?;
+    sqlx::raw_sql(
+        "INSERT INTO prompt_audit.key_directory(id,present,observed_at) \
+         SELECT 'large-key-' || i,false,now() FROM generate_series(1,30) i; \
+         INSERT INTO prompt_audit.key_names(key_id,name,observed_at) \
+         SELECT 'large-key-' || i,j::text || repeat(chr(1),500),now() \
+         FROM generate_series(1,30) i CROSS JOIN generate_series(1,32) j;",
+    )
+    .execute(database.store.pool())
+    .await?;
+    let service = database.query("UTC").await?;
+    for (path, query, total) in [("api/audits", "limit=200", 200), ("api/keys", "", 31)] {
+        let mut cursor = None::<String>;
+        let mut ids = std::collections::HashSet::new();
+        let mut pages = 0;
+        loop {
+            let params = cursor
+                .as_ref()
+                .map(|cursor| format!("{query}&cursor={cursor}"))
+                .unwrap_or_else(|| query.to_string());
+            let response = service.handle(path, &params).await;
+            assert_eq!(response.status, 200, "{}", response.value);
+            assert!(serde_json::to_vec(&response.value)?.len() <= 512 * 1024);
+            for item in response.value["items"].as_array().unwrap() {
+                assert!(ids.insert(item["id"].as_str().unwrap().to_string()));
+            }
+            pages += 1;
+            cursor = response.value["nextCursor"].as_str().map(str::to_string);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert!(pages > 1);
+        assert_eq!(ids.len(), total);
+    }
+    database.clean().await
 }

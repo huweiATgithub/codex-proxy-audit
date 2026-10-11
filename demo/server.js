@@ -7,7 +7,7 @@ import { audits, keys, modelRequests } from './fixtures.js';
 
 const { values } = parseArgs({ options: {
   host: { type: 'string', default: '0.0.0.0' }, port: { type: 'string', default: '4173' },
-  'time-zone': { type: 'string', default: 'Asia/Shanghai' },
+  'time-zone': { type: 'string', default: 'UTC' },
   fixtures: { type: 'string' },
 } });
 const port = Number(values.port);
@@ -42,19 +42,25 @@ const server = createServer(async (request, response) => {
     response.writeHead(status, { 'Content-Type': type + '; charset=utf-8', 'Cache-Control': 'no-store' });
     response.end(body);
   };
-  if (request.method !== 'GET') return send(405, 'text/plain', 'GET required');
   if (url.pathname.startsWith('/__demo/')) {
-    const result = handle(url.pathname.slice('/__demo/'.length), url.searchParams);
+    const chunks = []; let length = 0;
+    for await (const chunk of request) {
+      length += chunk.length;
+      if (length > 8192) return send(400, 'application/json', JSON.stringify({ error: { code: 'invalid_query', message: '请求正文过长。' } }));
+      chunks.push(chunk);
+    }
+    const result = handle(url.pathname.slice('/__demo/'.length), url.searchParams, request.method, Buffer.concat(chunks));
     await new Promise((resolve) => setTimeout(resolve, 120));
     return send(result.status, 'application/json', JSON.stringify(result.value));
   }
+  if (request.method !== 'GET') return send(405, 'text/plain', 'GET required');
   if (url.pathname === '/plugin.json') return send(200, 'application/json', JSON.stringify({ registration, resources, themes }));
   const asset = assets.get(url.pathname);
   if (asset) return send(200, ...asset);
   send(404, 'text/plain', 'Not found');
 });
 server.listen(port, values.host, () => {
-  console.log(`Prompt Audit demo: http://${values.host}:${port}/ (host.timezone: ${values['time-zone']})`);
+  console.log(`Prompt Audit demo: http://${values.host}:${port}/ (audit timeZone: ${values['time-zone']})`);
   console.log('Loading dist/plugin through the simulated management host. Ctrl+C stops the server.');
 });
 for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => server.close(() => process.exit(0)));
