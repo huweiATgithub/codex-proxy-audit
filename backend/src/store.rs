@@ -212,6 +212,12 @@ impl Store {
     /// 删除超过固定 72 小时保留期的最旧记录，正文通过外键在同一事务级联删除。
     /// 每批独立提交；跳过其他实例或操作持有的行锁，下一轮再处理。
     pub async fn delete_expired_batch(&self, now: DateTime<Utc>) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        // Keep the longer cleanup timeout local to this transaction so reads
+        // and writes retain their normal timeout when the connection is reused.
+        sqlx::query("SET LOCAL statement_timeout = '3s'")
+            .execute(&mut *tx)
+            .await?;
         let result = sqlx::query(
             "WITH expired AS ( \
                  SELECT id FROM prompt_audit.audits \
@@ -224,8 +230,9 @@ impl Store {
         )
         .bind(now - RETENTION_AGE)
         .bind(RETENTION_BATCH_SIZE)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected())
     }
 

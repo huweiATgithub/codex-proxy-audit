@@ -460,6 +460,48 @@ async fn retention_cascade_lock_timeout_rolls_back_the_batch_and_can_retry() -> 
 
 #[tokio::test]
 #[ignore = "requires AUDIT_TEST_DATABASE_URL pointing to isolated PostgreSQL"]
+async fn retention_worker_allows_slower_deletion_without_changing_pooled_timeouts() -> Result<()> {
+    let database = Database::create().await?;
+    database
+        .store
+        .persist_batch(&[retention_draft(Utc::now() - chrono::TimeDelta::days(4))])
+        .await?;
+    // Cross both the ordinary statement timeout and the old worker deadline.
+    sqlx::raw_sql(
+        "CREATE FUNCTION prompt_audit.slow_delete() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN PERFORM pg_sleep(2.2); RETURN OLD; END $$; \
+         CREATE TRIGGER slow_delete BEFORE DELETE ON prompt_audit.audits \
+         FOR EACH ROW EXECUTE FUNCTION prompt_audit.slow_delete();",
+    )
+    .execute(database.store.pool())
+    .await?;
+    let worker = Retention::start(database.store.clone());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while audit_count(&database.store).await? != 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("cleanup must allow deletion taking longer than two seconds")??;
+    worker.stop().await;
+
+    // Hold every existing connection so the check includes the cleanup session.
+    let mut connections = Vec::new();
+    for _ in 0..database.store.pool().size() {
+        let mut connection = database.store.pool().acquire().await?;
+        let timeout: String = sqlx::query_scalar("SHOW statement_timeout")
+            .fetch_one(&mut *connection)
+            .await?;
+        assert_eq!(timeout, "1500ms");
+        connections.push(connection);
+    }
+    drop(connections);
+    database.clean().await
+}
+
+#[tokio::test]
+#[ignore = "requires AUDIT_TEST_DATABASE_URL pointing to isolated PostgreSQL"]
 async fn retention_worker_catches_up_at_startup_and_runs_daily_without_requests() -> Result<()> {
     let database = Database::create().await?;
     let now = Utc::now();

@@ -187,7 +187,9 @@ async function run() {
   const response1 = await requestModel(key, [first], 'thread-http');
   if (options['upgrade-from-package']) {
     await until(() => { assert.equal(sql('SELECT count(*) FROM prompt_audit.audits'), '1'); }, 'old package captures before any Key-directory query');
-    assert.equal(sql('SELECT key_name IS NULL FROM prompt_audit.audits'), 't');
+    if (Number(sql('SELECT max(version) FROM prompt_audit.schema_migrations')) < 3) {
+      assert.equal(sql('SELECT key_name IS NULL FROM prompt_audit.audits'), 't');
+    }
     const snapshot = () => sql("SELECT md5(jsonb_agg(to_jsonb(a)-'key_name'-'key_name_observed_at' ORDER BY a.id)::text) FROM prompt_audit.audits a") + sql("SELECT md5(jsonb_agg(to_jsonb(c) ORDER BY c.id)::text) FROM prompt_audit.contents c");
     const before = snapshot(), signingSecret = sql("SELECT encode(value,'hex') FROM prompt_audit.settings WHERE name='query_cursor'");
     const target = await uploadPackage(options.package);
@@ -196,7 +198,7 @@ async function run() {
     assert.equal(snapshot(), before);
     assert.equal(sql("SELECT encode(value,'hex') FROM prompt_audit.settings WHERE name='query_cursor'"), signingSecret);
     assert.equal((await management('viewContext')).timeZone, 'America/New_York');
-    report('real v0.1.6 upgrade preserves audit facts, content, settings and signing secret');
+    report('packaged upgrade preserves audit facts, content, settings and signing secret');
   }
   assert.equal(sql("SELECT count(*) FROM information_schema.columns WHERE table_schema='prompt_audit' AND table_name='audits' AND column_name IN ('key_name','key_name_observed_at')"), '0');
   assert.equal(sql("SELECT count(*) FROM information_schema.tables WHERE table_schema='prompt_audit' AND table_name IN ('key_directory','key_names')"), '0');

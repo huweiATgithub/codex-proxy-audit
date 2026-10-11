@@ -33,7 +33,7 @@ const PERSIST_WAIT: Duration = Duration::from_secs(2);
 const MAX_OBSERVATION_BYTES: usize = 16 * 1024 * 1024;
 const RETENTION_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const RETENTION_BATCH_PAUSE: Duration = Duration::from_millis(100);
-const RETENTION_WAIT: Duration = Duration::from_secs(2);
+const RETENTION_WAIT: Duration = Duration::from_secs(4);
 
 /// 独立于采集和写入的清理任务；无请求时仍执行，退出时停止。
 pub struct Retention {
