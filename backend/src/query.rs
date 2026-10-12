@@ -4,13 +4,15 @@ use std::collections::BTreeMap;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Duration, LocalResult, NaiveDate, SecondsFormat, TimeZone, Utc};
 use chrono_tz::Tz;
+use gateway_plugin_sdk::client::HostClient;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Row};
 
 use crate::keys::{CurrentKeys, KeyLookupError};
+use crate::request_metadata::{RequestMetadata, RequestMetadataError};
+use crate::store::{AuditListFilter, Store, StoreError};
 
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_QUERY_BYTES: usize = 8192;
@@ -63,19 +65,9 @@ impl ApiError {
         }
     }
 }
-impl From<sqlx::Error> for ApiError {
-    fn from(error: sqlx::Error) -> Self {
-        let unavailable = match &error {
-            sqlx::Error::Io(_)
-            | sqlx::Error::PoolTimedOut
-            | sqlx::Error::PoolClosed
-            | sqlx::Error::Tls(_) => true,
-            sqlx::Error::Database(error) => error.code().is_some_and(|code| {
-                code.starts_with("08") || code.starts_with("53") || code.starts_with("57")
-            }),
-            _ => false,
-        };
-        if unavailable {
+impl From<StoreError> for ApiError {
+    fn from(error: StoreError) -> Self {
+        if error.is_unavailable() {
             Self {
                 status: 503,
                 code: "unavailable",
@@ -97,6 +89,16 @@ impl From<KeyLookupError> for ApiError {
     }
 }
 
+impl From<RequestMetadataError> for ApiError {
+    fn from(_: RequestMetadataError) -> Self {
+        Self {
+            status: 503,
+            code: "unavailable",
+            message: "宿主请求信息暂时不可用，请稍后重试。",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct QueryResponse {
     pub status: u16,
@@ -105,7 +107,7 @@ pub struct QueryResponse {
 
 #[derive(Clone)]
 pub struct QueryService {
-    pool: PgPool,
+    store: Store,
     time_zone: Tz,
     cursor_secret: Vec<u8>,
     keys: CurrentKeys,
@@ -135,7 +137,7 @@ impl QueryService {
     /// A query receives one parsed snapshot of the shared setting.
     /// The signing secret comes from Store::secret, so restarts preserve cursors.
     pub fn new(
-        pool: PgPool,
+        store: Store,
         time_zone: Tz,
         cursor_secret: Vec<u8>,
         keys: CurrentKeys,
@@ -144,7 +146,7 @@ impl QueryService {
             return Err("查询服务配置无效。".to_string());
         }
         Ok(Self {
-            pool,
+            store,
             time_zone,
             cursor_secret,
             keys,
@@ -152,7 +154,7 @@ impl QueryService {
     }
 
     pub async fn management(
-        store: &crate::store::Store,
+        store: &Store,
         cursor_secret: Vec<u8>,
         method: &str,
         path: &str,
@@ -176,7 +178,7 @@ impl QueryService {
             } else {
                 CurrentKeys::default()
             };
-            let query = Self::new(store.pool().clone(), time_zone, cursor_secret, keys)
+            let query = Self::new(store.clone(), time_zone, cursor_secret, keys)
                 .map_err(|_| ApiError::internal())?;
             query.dispatch(path, raw_query).await
         }
@@ -186,6 +188,36 @@ impl QueryService {
 
     pub async fn handle(&self, path: &str, raw_query: &str) -> QueryResponse {
         response(self.dispatch(path, raw_query).await)
+    }
+
+    /// Optional host metadata is fetched only by its explicit management route.
+    pub async fn management_metadata(
+        store: &Store,
+        host: &HostClient,
+        method: &str,
+        raw_query: &str,
+        body: &[u8],
+    ) -> QueryResponse {
+        let result = async {
+            if method != "GET" || !body.is_empty() {
+                return Err(ApiError::invalid_query());
+            }
+            let params = parse_params(raw_query, &["id"])?;
+            let id = required_id(&params, "id")?;
+            if id.contains('\0') {
+                return Err(ApiError::not_found());
+            }
+            let audit = store
+                .request_reference(id)
+                .await?
+                .ok_or_else(ApiError::not_found)?;
+            // The database read is complete before the host callback starts.
+            let metadata =
+                RequestMetadata::fetch(host, audit.request_id.as_deref(), &audit.key_id).await?;
+            Ok(json!({"auditId": id, "requestMetadata": metadata}))
+        }
+        .await;
+        response(result)
     }
 
     async fn dispatch(&self, path: &str, raw_query: &str) -> ApiResult<Value> {
@@ -318,44 +350,43 @@ impl QueryService {
                 json!({"timeZone":self.time_zone.name(),"items":[],"total":0,"nextCursor":null}),
             );
         }
-        let folded = crate::store::search_text(&query.q);
         // Count and rows share one read-only snapshot within this request. The cursor
         // deliberately does not promise a snapshot across subsequent requests.
-        let mut transaction = self.pool.begin().await?;
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            .execute(&mut *transaction)
+        let list = self
+            .store
+            .list(AuditListFilter {
+                start,
+                end,
+                key: query.key.as_deref(),
+                search: &query.q,
+                after: after_time.zip(after_id.as_deref()),
+                limit: query.limit,
+            })
             .await?;
-        let total: i64 = sqlx::query_scalar("SELECT count(*) FROM prompt_audit.audits WHERE ($1::timestamptz IS NULL OR first_observed_at >= $1) AND ($2::timestamptz IS NULL OR first_observed_at < $2) AND ($3::text IS NULL OR key_id = $3) AND strpos(input_search,$4)>0")
-            .bind(start).bind(end).bind(&query.key).bind(&folded).fetch_one(&mut *transaction).await?;
+        let total = list.total;
         if !(0..=MAX_SAFE_INTEGER).contains(&total) {
             return Err(ApiError::internal());
         }
-        let rows = sqlx::query("SELECT id,key_id,first_observed_at,context_count, CASE WHEN $4::text='' THEN preview ELSE substring(input_text FROM greatest(strpos(input_search,$4)-245,1) FOR 2786) END AS excerpt, CASE WHEN $4::text='' THEN false ELSE strpos(input_search,$4)>246 END AS prefix, CASE WHEN $4::text='' THEN false ELSE char_length(input_text)>greatest(strpos(input_search,$4)-245,1)+2785 END AS suffix FROM prompt_audit.audits WHERE ($1::timestamptz IS NULL OR first_observed_at >= $1) AND ($2::timestamptz IS NULL OR first_observed_at < $2) AND ($3::text IS NULL OR key_id = $3) AND strpos(input_search,$4)>0 AND ($5::timestamptz IS NULL OR (first_observed_at,id COLLATE \"C\") < ($5,$6::text COLLATE \"C\")) ORDER BY first_observed_at DESC,id COLLATE \"C\" DESC LIMIT $7")
-            .bind(start).bind(end).bind(&query.key).bind(&folded).bind(after_time).bind(after_id).bind(query.limit+1).fetch_all(&mut *transaction).await?;
-        transaction.commit().await?;
+        let rows = list.rows;
         let mut items = Vec::new();
         let mut last_position = None;
         for (index, row) in rows.iter().take(query.limit as usize).enumerate() {
-            let id: String = row.try_get("id")?;
-            let time: DateTime<Utc> = row.try_get("first_observed_at")?;
-            let excerpt: String = row.try_get("excerpt")?;
-            let excerpt = crate::store::decode_text(&excerpt).map_err(|_| ApiError::internal())?;
-            let prefix: bool = row.try_get("prefix")?;
-            let suffix: bool = row.try_get("suffix")?;
+            let id = &row.id;
+            let time = row.first_observed_at;
             let preview = format!(
                 "{}{}{}",
-                if prefix { "…" } else { "" },
-                excerpt,
-                if suffix { "…" } else { "" }
+                if row.prefix { "…" } else { "" },
+                row.excerpt,
+                if row.suffix { "…" } else { "" }
             );
-            let context_count: i64 = row.try_get("context_count")?;
+            let context_count = row.context_count;
             if !(0..=MAX_SAFE_INTEGER).contains(&context_count)
-                || !valid_id(&id)
+                || !valid_id(id)
                 || preview.chars().count() > 400
             {
                 return Err(ApiError::internal());
             }
-            let item = json!({"id":id,"recordedAt":utc_timestamp(time),"recordedAtDisplay":self.display_time(time),"keyId":row.try_get::<String,_>("key_id")?,"keyName":self.keys.name(&row.try_get::<String,_>("key_id")?),"preview":preview,"contextCount":context_count});
+            let item = json!({"id":id,"recordedAt":utc_timestamp(time),"recordedAtDisplay":self.display_time(time),"keyId":row.key_id,"keyName":self.keys.name(&row.key_id),"preview":preview,"contextCount":context_count});
             let position = json!([time.to_rfc3339(), id]);
             let next = if rows.len() > index + 1 {
                 Some(self.sign_cursor(&scope, position.clone())?)
@@ -395,31 +426,20 @@ impl QueryService {
         if id.contains('\0') {
             return Err(ApiError::not_found());
         }
-        let mut transaction = self.pool.begin().await?;
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            .execute(&mut *transaction)
-            .await?;
-        let audit = sqlx::query("SELECT id,key_id,first_observed_at,request_id,thread_id,session_id,turn_id,input_kinds,repositories,input_content_id FROM prompt_audit.audits WHERE id=$1").bind(id).fetch_optional(&mut *transaction).await?.ok_or_else(ApiError::not_found)?;
-        let request_id: Option<String> = audit.try_get("request_id")?;
-        let key_id: String = audit.try_get("key_id")?;
-        let request_metadata = if let Some(ref request_id) = request_id {
-            // The fixed host view projects metadata without granting access
-            // to the remaining host request observation JSON.
-            let row = sqlx::query("SELECT user_agent,requested_model_id,reasoning_effort FROM public.model_request_observations WHERE id=$1 AND client_api_key_ref=$2")
-                .bind(request_id).bind(&key_id).fetch_optional(&mut *transaction).await?;
-            row.map(|row| -> ApiResult<Value> { Ok(json!({"userAgent":bounded_optional(row.try_get("user_agent")?,8192),"model":bounded_optional(row.try_get("requested_model_id")?,256),"reasoningEffort":bounded_optional(row.try_get("reasoning_effort")?,80)})) }).transpose()?
-        } else {
-            None
-        };
-        let contents = sqlx::query("SELECT id,ordinal,role,phase,truncated,character_count,block_count FROM prompt_audit.contents WHERE audit_id=$1 ORDER BY ordinal").bind(id).fetch_all(&mut *transaction).await?;
-        transaction.commit().await?;
-        let input_id: String = audit.try_get("input_content_id")?;
+        let audit = self
+            .store
+            .detail(id)
+            .await?
+            .ok_or_else(ApiError::not_found)?;
+        let request_id = audit.request_id;
+        let key_id = audit.key_id;
+        let input_id = audit.input_content_id;
         let mut input = None;
         let mut context = Vec::new();
-        for row in contents {
-            let content_id: String = row.try_get("id")?;
-            let characters: i64 = row.try_get("character_count")?;
-            let blocks: i64 = row.try_get("block_count")?;
+        for row in audit.contents {
+            let content_id = row.id;
+            let characters = row.character_count;
+            let blocks = row.block_count;
             if !valid_id(&content_id)
                 || !(0..=MAX_SAFE_INTEGER).contains(&characters)
                 || !(0..=MAX_SAFE_INTEGER).contains(&blocks)
@@ -431,23 +451,23 @@ impl QueryService {
             if content_id == input_id {
                 input = Some(descriptor);
             } else {
-                let role: Option<String> = row.try_get("role")?;
+                let role = row.role;
                 if !matches!(role.as_deref(), Some("user" | "assistant")) {
                     return Err(ApiError::internal());
                 }
-                context.push(json!({"id":content_id,"role":role,"phase":bounded_optional(row.try_get("phase")?,80),"truncated":row.try_get::<bool,_>("truncated")?,"content":descriptor}));
+                context.push(json!({"id":content_id,"role":role,"phase":bounded_optional(row.phase,80),"truncated":row.truncated,"content":descriptor}));
             }
         }
         let input = input.ok_or_else(ApiError::internal)?;
-        let input_kinds: Value = audit.try_get("input_kinds")?;
+        let input_kinds = audit.input_kinds;
         if input_kinds.as_array().map(Vec::len)
             != input["blockCount"].as_u64().map(|number| number as usize)
         {
             return Err(ApiError::internal());
         }
-        let time: DateTime<Utc> = audit.try_get("first_observed_at")?;
+        let time = audit.first_observed_at;
         Ok(
-            json!({"timeZone":self.time_zone.name(),"id":id,"recordedAt":utc_timestamp(time),"recordedAtDisplay":self.display_time(time),"keyId":key_id,"keyName":self.keys.name(&key_id),"threadId":audit.try_get::<Option<String>,_>("thread_id")?,"sessionId":audit.try_get::<Option<String>,_>("session_id")?,"requestId":request_id,"turnId":audit.try_get::<Option<String>,_>("turn_id")?,"inputKinds":input_kinds,"repositories":audit.try_get::<Option<Value>,_>("repositories")?,"requestMetadata":request_metadata,"input":input,"context":context}),
+            json!({"timeZone":self.time_zone.name(),"id":id,"recordedAt":utc_timestamp(time),"recordedAtDisplay":self.display_time(time),"keyId":key_id,"keyName":self.keys.name(&key_id),"threadId":audit.thread_id,"sessionId":audit.session_id,"requestId":request_id,"turnId":audit.turn_id,"inputKinds":input_kinds,"repositories":audit.repositories,"input":input,"context":context}),
         )
     }
 
@@ -465,14 +485,11 @@ impl QueryService {
         if audit_id.contains('\0') || content_id.contains('\0') {
             return Err(ApiError::not_found());
         }
-        let row =
-            sqlx::query("SELECT blocks FROM prompt_audit.contents WHERE audit_id=$1 AND id=$2")
-                .bind(audit_id)
-                .bind(content_id)
-                .fetch_optional(&self.pool)
-                .await?
-                .ok_or_else(ApiError::not_found)?;
-        let blocks: Value = row.try_get("blocks")?;
+        let blocks = self
+            .store
+            .content(audit_id, content_id)
+            .await?
+            .ok_or_else(ApiError::not_found)?;
         self.content_page(audit_id, content_id, &scope, &blocks, index, offset)
     }
 
@@ -856,9 +873,7 @@ mod tests {
     use super::*;
     fn service() -> QueryService {
         QueryService::new(
-            sqlx::postgres::PgPoolOptions::new()
-                .connect_lazy("postgres://unused:unused@localhost/unused")
-                .unwrap(),
+            Store::lazy_memory(),
             "America/New_York".parse().unwrap(),
             vec![7; 32],
             CurrentKeys::default(),
@@ -921,7 +936,7 @@ mod tests {
             3
         );
         let same = QueryService::new(
-            service.pool.clone(),
+            service.store.clone(),
             service.time_zone,
             vec![7; 32],
             CurrentKeys::default(),
@@ -929,7 +944,7 @@ mod tests {
         .unwrap();
         assert!(same.read_cursor(Some(&cursor), "a").is_ok());
         let other = QueryService::new(
-            service.pool.clone(),
+            service.store.clone(),
             chrono_tz::UTC,
             vec![7; 32],
             CurrentKeys::default(),

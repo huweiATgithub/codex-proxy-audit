@@ -2,5 +2,6 @@
 pub mod collection;
 pub mod keys;
 pub mod query;
+mod request_metadata;
 pub mod runtime;
 pub mod store;

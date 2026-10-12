@@ -56,11 +56,6 @@ export const auditDetail = z.object({
     rootPath: boundedText(4096),
     remotes: z.array(z.object({ name: boundedText(256), url: boundedText(8192) })).nullable(),
   })).nullable().describe('Repository snapshot observed on requestId, not necessarily when a historical input was written. Null means unavailable; [] means reported empty.'),
-  requestMetadata: z.object({
-    userAgent: boundedText(8192).nullable(),
-    model: boundedText(256).nullable().describe('Host requested_model_id, not the upstream resolved model.'),
-    reasoningEffort: boundedText(80).nullable(),
-  }).nullable().describe('Read from the host request row matching requestId and keyId; not duplicated in audit storage. Null when no matching row exists.'),
   input: contentDescriptor,
   context: z.array(z.object({
     id, role: z.enum(['user', 'assistant']), phase: boundedText(80).nullable(),
@@ -68,6 +63,14 @@ export const auditDetail = z.object({
     content: contentDescriptor,
   })),
 }).refine((audit) => audit.inputKinds.length === audit.input.blockCount, { message: 'Input classifications must align with saved blocks.' });
+export const requestMetadata = z.object({
+  auditId: id,
+  requestMetadata: z.object({
+    userAgent: boundedText(8192).nullable(),
+    model: boundedText(256).nullable().describe('Host requestedModel, not the upstream resolved model.'),
+    reasoningEffort: boundedText(80).nullable(),
+  }).nullable().describe('Loaded explicitly through the host request detail API matching the saved requestId and keyId; not duplicated in audit storage. Null when no matching host record exists.'),
+});
 const textSegment = z.object({
   kind: z.literal('text'), index: count, offset: count,
   text: boundedText(CONTENT_CHARACTERS), totalCharacters: count,
@@ -93,7 +96,8 @@ export const endpoints = {
   timeZone: { method: 'PUT', path: 'api/time-zone', query: z.object({}).strict(), body: timeZoneSetting, response: timeZoneSetting, summary: 'Save the shared audit timezone explicitly; does not refresh audit queries.' },
   viewContext: { path: 'api/view-context', query: z.object({}).strict(), response: viewContext, summary: 'Get the saved audit timezone and server-local date for initial page filters.' },
   audits: { path: 'api/audits', query: auditQuery, response: auditPage, summary: 'List input excerpts using a stable descending cursor.' },
-  audit: { path: 'api/audit', query: detailQuery, response: auditDetail, summary: 'Get saved audit metadata, associated host request metadata and ordered content descriptors; no full bodies.' },
+  audit: { path: 'api/audit', query: detailQuery, response: auditDetail, summary: 'Get saved audit metadata and ordered content descriptors; no full bodies or host request metadata.' },
+  requestMetadata: { path: 'api/audit-request-metadata', query: detailQuery, response: requestMetadata, summary: 'Explicitly load host request metadata for one saved audit; no content bodies.' },
   content: { path: 'api/audit-content', query: contentQuery, response: contentPage, summary: 'Read ordered stored content in bounded chunks.' },
   keys: { path: 'api/keys', query: keysQuery, response: keyPage, summary: 'List current host Client Keys with their current names, ordered by ID.' },
 };

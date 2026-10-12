@@ -1,18 +1,18 @@
 <script setup>
-import { computed, ref } from 'vue';
+import { computed, inject, ref } from 'vue';
 import { BaseButton } from '@codex-proxy/ui';
 import { Bot, ChevronDown, ChevronUp, User } from '@lucide/vue';
 import ContentBlocks from './ContentBlocks.vue';
+import { useRequestMetadata } from '../state/request-metadata.js';
 
 const props = defineProps({ audit: { type: Object, required: true }, query: { type: String, default: '' } });
+const { state: requestMetadata, load: loadRequestMetadata } = useRequestMetadata(inject('auditClient'), () => props.audit.id);
 const contextOpen = ref(true);
 const showEarlier = ref(false);
 const messages = computed(() => showEarlier.value ? props.audit.context : props.audit.context.slice(-3));
 const metadata = computed(() => [
   ['Client Key', `${props.audit.keyName || '名称未知'} · ${props.audit.keyId}`],
   ['记录时间', `${props.audit.recordedAtDisplay} · ${props.audit.timeZone}`],
-  ['请求模型', props.audit.requestMetadata?.model || '未取得'],
-  ['推理强度', props.audit.requestMetadata?.reasoningEffort || '未取得'],
   ['审计 ID', props.audit.id], ['来源请求 ID', props.audit.requestId || '未取得'],
   ['Thread ID', props.audit.threadId || '未取得'], ['Session ID', props.audit.sessionId || '未取得'],
   ['Turn ID', props.audit.turnId || '未取得'],
@@ -66,10 +66,21 @@ const metadata = computed(() => [
             </div>
           </dd>
         </div>
-        <div class="metadata-field metadata-wide"><dt>User-Agent</dt><dd>{{ audit.requestMetadata?.userAgent || '未取得' }}</dd></div>
       </dl>
-      <p class="metadata-note">仓库信息为来源请求的快照；模型、推理强度与 UA 取自宿主记录。</p>
-      <p v-if="!audit.requestMetadata" class="metadata-note">来源请求记录不可用。</p>
+      <p class="metadata-note">仓库信息为来源请求的快照。</p>
+      <div class="request-metadata" :aria-busy="requestMetadata.kind === 'loading'">
+        <BaseButton v-if="requestMetadata.kind === 'idle' || requestMetadata.kind === 'loading'" variant="secondary" size="sm" :disabled="requestMetadata.kind === 'loading'" @click="loadRequestMetadata">{{ requestMetadata.kind === 'loading' ? '正在加载请求信息…' : '加载请求信息' }}</BaseButton>
+        <div v-if="requestMetadata.kind === 'error'" class="inline-error" role="alert"><span>{{ requestMetadata.error.message }}</span><BaseButton size="sm" variant="ghost" @click="loadRequestMetadata">重试请求信息</BaseButton></div>
+        <p v-else-if="requestMetadata.kind === 'missing'" class="metadata-note" role="status">来源请求记录不可用。</p>
+        <template v-else-if="requestMetadata.kind === 'ready'">
+          <dl>
+            <div class="metadata-field"><dt>请求模型</dt><dd>{{ requestMetadata.data.model || '未取得' }}</dd></div>
+            <div class="metadata-field"><dt>推理强度</dt><dd>{{ requestMetadata.data.reasoningEffort || '未取得' }}</dd></div>
+            <div class="metadata-field metadata-wide"><dt>User-Agent</dt><dd>{{ requestMetadata.data.userAgent || '未取得' }}</dd></div>
+          </dl>
+          <p class="metadata-note">模型、推理强度与 UA 取自宿主记录。</p>
+        </template>
+      </div>
     </section>
   </div>
 </template>

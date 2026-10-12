@@ -2,7 +2,7 @@
 
 ## 1. 方案与职责
 
-通过独立的 Codex Proxy RS 网关插件实现 Prompt 审计。插件负责采集、存储、共享审计时区与查询语义，通过宿主已有的中间件和管理页桥接入。插件在 `request` 中间件提取最新用户输入及本次请求自带的有限上文，提交到固定容量环形缓冲区，由独立 worker 将审计事实写入 PG schema，并通过 `management` 能力提供管理员页面。
+通过独立的 Codex Proxy RS 网关插件实现 Prompt 审计。插件负责采集、存储、共享审计时区与查询语义，通过宿主已有的中间件和管理页桥接入。插件在 `request` 中间件提取最新用户输入及本次请求自带的有限上文，提交到固定容量环形缓冲区，由独立 worker 将审计事实写入私有 SQLite 数据库，并通过 `management` 能力提供管理员页面。
 
 审计单位是满足采集规则的最后一条用户输入。插件依据[采集行为](collection.md)检查请求的最后一个输入项；以工具调用、工具结果或 assistant 消息结束的请求不产生记录。重复请求分别形成审计记录，模型调用随后失败、取消或未发送也可能留下记录。
 
@@ -13,7 +13,7 @@ flowchart LR
     H -. 最新输入及请求内上文 .-> A[采集行为模块]
     A --> Q[固定容量环形缓冲区]
     Q --> W[数据库 worker]
-    W --> P[(同一 PG 数据库中的 prompt_audit schema)]
+    W --> P[(插件私有 SQLite 数据库)]
     K[host.keys.list] -. 管理查询时刷新 .-> M
     UI[插件审计页面] --> B[宿主管理页面桥]
     B --> M[插件 management API]
@@ -25,8 +25,8 @@ flowchart LR
 | 中间件适配 | 解析 HTTP / WebSocket 请求，非阻塞提交审计任务后继续调用宿主链 |
 | 采集行为 | 判定来源、过滤子代理、检查最新用户输入、选择本次请求的有限前序上下文 |
 | Key 名称查询 | 管理查询分页读取宿主当前 Key 列表，以临时 ID 到名称映射展示记录；不保存名称或目录 |
-| 审计任务与存储 | 环形缓冲区满时覆盖最旧任务；worker 以有界批次保存输入及固定上下文，并提供查询投影 |
-| 管理 API 与页面 | 使用已有管理员身份，提供筛选、列表与详情，不重新解释采集规则 |
+| 审计任务与存储 | 环形缓冲区满时覆盖最旧任务；worker 以有界批次保存输入及固定上下文；Store 封装数据库连接、SQL、事务、类型转换和错误分类 |
+| 管理 API 与页面 | 使用已有管理员身份，提供筛选、列表与详情；点击加载请求信息后单独查询宿主，不重新解释采集规则 |
 
 首期面向 Codex 经 Responses HTTP / WebSocket 进入网关的文本对话。其他客户端缺少 Codex 元数据时，只能按实际可见的用户消息形成观察记录，不能确认其来源。本方案不提供真人身份认证、完整 Agent 运行回放或对子代理执行过程的审计。
 
@@ -36,17 +36,19 @@ flowchart LR
 
 | 来源 | 核实基线 | 用途 |
 | --- | --- | --- |
-| Codex Proxy RS upstream（zyycn/codex-proxy-rs） | `v3.23.0`，`389dc63633a3b24c5b40b0002901371820bc6998` | 宿主与 SDK 合同的固定源码基线 |
+| Codex Proxy RS upstream（zyycn/codex-proxy-rs） | `v3.25.0`，`05ba116eef849a0f4fa2d1940be82182bb2f7683` | 宿主与 SDK 合同的固定源码基线 |
 | 官方 Codex | `0.160.1`，`d27764b82f7118f674371e6d6e76271d9d606edb` | 输入结构、子代理来源、增量请求及 turn 行为 |
 | codex-proxy-plugins | `cfd37537f99f2c957639c6fa2c14d40dcb0c3368` | 独立插件组织方式与管理页面示例 |
 
-宿主兼容声明为 `~3.23.0`，接受稳定版 `>=3.23.0, <3.24.0`。目标宿主合同为 manifest v2、进程协议 v2、middleware v4 和 management v1。插件使用 upstream 仓库的 Rust `gateway-plugin-sdk`，Git 依赖固定到上表宿主提交。SDK 当前标记为 `0.1.0`，不能仅凭这个版本号表达兼容性。[宿主兼容表][host-compat]、[SDK 清单][sdk-cargo]
+宿主兼容声明为 `~3.25.0`，接受稳定版 `>=3.25.0, <3.26.0`。目标宿主合同为 manifest v2、进程协议 v2、middleware v4 和 management v1。插件使用 upstream 仓库的 Rust `gateway-plugin-sdk`，Git 依赖固定到上表宿主提交。SDK 当前标记为 `0.1.0`，不能仅凭这个版本号表达兼容性。[宿主兼容表][host-compat]、[SDK 清单][sdk-cargo]
+
+中间件调用的 `timeout_ms` 限制插件自身处理时间，默认上限为 120 秒。宿主与 SDK 在 `next.run` 等待宿主期间暂停这份预算，结果或错误返回后恢复剩余时间；入站与返回处理共享同一预算，普通宿主回调仍计时。请求总期限、下游操作超时与取消信号独立生效，客户端取消或插件退出仍会结束等待并回收资源。本插件使用上述 SDK 构建，以同时满足宿主与插件侧的等待语义。[中间件预算][middleware-budget]
 
 用户提供的 [workbench 示例][workbench] 可以作为工程入口参考，但它使用 middleware v3 及较早的 SDK Git revision。新插件使用 v4 时，应同时选择支持 v4 的 SDK，不能只修改 manifest 的能力版本。
 
 本插件只需要 `middleware` 和 `management` 两项能力。安装时必须把 middleware 绑定到 `request` 阶段，并安排在其他会改写输入的 request 插件之前；清单声明能力本身不会启用采集。management 自动激活，不接受额外 binding。[能力合同][capabilities]、[绑定校验][binding]
 
-插件是受信任的独立进程，可以自行访问数据库。宿主没有提供任意 SQL、数据库连接池借用或宿主 Vue 组件注入接口；PG 与页面分别按下文的独立连接和管理页面合同实现。[信任边界][manifest]
+插件是受信任的独立进程，可以自行访问数据库。宿主回调不需要额外权限声明；`HostClient::dispatch_http` 使用宿主签发的插件身份调用管理接口，不依赖管理员 Cookie，期限、取消与资源生命周期仍生效。宿主没有提供任意 SQL、数据库连接池借用或宿主 Vue 组件注入接口；存储与页面分别按下文的私有 SQLite 和管理页面合同实现。[信任边界][manifest]、[主动 HTTP 分派][http-dispatch]
 
 ## 3. Client Key 与审计身份
 
@@ -56,11 +58,11 @@ request 中间件提供 `client_key_id`，每条审计记录只保存稳定的 K
 
 Client Key 代表网关凭据的归属。多人共享一个 Key 时，插件不能进一步确认究竟是哪一个人发言；本设计不额外构造用户身份。Key 明文不进入审计存储。
 
-## 4. 共用 PostgreSQL 的存储设计
+## 4. 插件私有 SQLite 的存储设计
 
-### 4.1 选择独立 schema
+### 4.1 插件私有数据库
 
-插件使用与宿主相同的 PostgreSQL **database**，建立独立 `prompt_audit` schema 和数据库角色。插件自建连接池、自管 schema 迁移和数据生命周期，不读取宿主 Key 表、不修改宿主迁移记录、不设置指向宿主表的级联外键。Key 名称通过 SDK 获取。
+插件面向单宿主、单插件实例，使用 SQLx 的 SQLite 驱动在进程内读写私有数据库文件。SQLite 3.54.0 引擎随插件静态链接，其版本由构建依赖锁定，无需独立数据库服务。插件自建连接池、自管 schema 初始化和数据生命周期，不读取宿主 Key 表、不修改宿主迁移记录、不设置指向宿主表的级联外键。Key 名称通过 SDK 获取。[SQLite 驱动][sqlite-driver]
 
 宿主的 `host.state` 已使用宿主 PG，但它是插件实例私有的 JSON KV，不是通用数据库协议。其公共能力与持续审计的需求有明显区别：
 
@@ -75,17 +77,17 @@ Client Key 代表网关凭据的归属。多人共享一个 Key 时，插件不�
 
 审计记录固定保留 3 天，即从 `first_observed_at` 起经过 72 小时，不提供保留期配置。清理使用插件当前 UTC 时间，删除严格早于 `now - 72 hours` 的记录；恰好位于边界的记录留到下一批，展示时区和夏令时不影响保留期。删除审计行时，数据库通过 `ON DELETE CASCADE` 在同一事务删除它的输入和前序对话；共享时区与游标签名密钥不属于这次清理范围。
 
-插件在启动成功后立即启动独立清理任务，无请求时也每天清理。每批按记录时间、ID 从旧到新最多删除 1,000 条，复用时间索引，以 `FOR UPDATE SKIP LOCKED` 跳过其他操作或实例持有的行锁；满批提交后等待 100 毫秒继续清理积压，未满批时等待 24 小时开始下一轮。计数只包含审计行，不包含级联删除的正文行。各批独立提交，在事务内将语句超时设为 3 秒，沿用 1 秒锁等待超时，任务每批总等待上限为 4 秒；事务结束后恢复连接原有的 1.5 秒语句超时。失败记录日志，在下一轮每日清理时重试。清理不进入请求路径或占用写入 worker，退出时停止。允许到期后再保留约一天，因此正常运行时实际留存约 3～4 天；锁竞争、积压、插件停用或数据库不可用会延长这个间隔，恢复运行后继续清理已有过期记录。删除插件实例或 Client Key 本身不触发清理。
+插件在启动成功后立即启动独立清理任务，无请求时也每天清理。每批按记录时间、ID 从旧到新最多删除 1,000 条，复用时间索引，并在写事务中完成删除；满批提交后等待 100 毫秒继续清理积压，未满批时等待 24 小时开始下一轮。计数只包含审计行，不包含级联删除的正文行。各批独立提交，清理 SQL 的执行时限为 3 秒，沿用 1 秒锁等待上限，任务每批总等待上限为 4 秒；Store 负责执行时限、中断与事务回滚，普通 SQL 的执行时限仍为 1.5 秒。失败记录日志，在下一轮每日清理时重试。清理不进入请求路径或占用写入 worker，退出时停止。允许到期后再保留约一天，因此正常运行时实际留存约 3～4 天；锁竞争、积压、插件停用或数据库不可用会延长这个间隔，恢复运行后继续清理已有过期记录。删除插件实例或 Client Key 本身不触发清理。
 
-PostgreSQL 的 [autovacuum](https://www.postgresql.org/docs/current/routine-vacuuming.html#VACUUM-FOR-SPACE-RECOVERY) 负责回收已删除行的空间供数据库复用，数据库文件通常不会立即缩小；部署须保持 autovacuum 正常运行。这是按时间清理历史的策略，不是磁盘字节配额，仍需为约 3～4 天的数据、清理积压和数据库维护预留空间。
+SQLite 删除后的页空间可供数据库复用，数据库文件通常不会立即缩小；插件不增加自动压缩任务。这是按时间清理历史的策略，不是磁盘字节配额，仍需为约 3～4 天的数据、清理积压和 WAL 文件预留空间。[页空间复用][sqlite-space]
 
-### 4.2 连接配置
+### 4.2 数据目录与存储边界
 
-在插件 `configurationSchema` 中声明必填的 `databaseUrl` 字符串，并将其列入 `secretFields`。管理员通过插件实例的 secrets 配置设置连接串，宿主在握手时合并到 `Handshake.configuration`，插件从该配置建立连接。
+宿主以临时解包目录 `<runtime_data_dir>/plugins/plugin-*` 作为插件启动目录；包对象释放时该目录会被清理，重新解包时路径也会改变。Store 以启动目录向上两级定位宿主持久数据根目录，自动创建固定文件 `<runtime_data_dir>/huwei.prompt-audit/audit.sqlite3`，重启和重新解包复用同一文件。插件 configuration 为 `{}`，无 secrets、目录配置或额外握手字段。[进程启动目录][process-env]、[临时解包目录][package-cache]、[缓存位置][plugin-cache]
 
-宿主启动插件时执行 `env_clear()`，插件不能假设自动继承宿主的 `DATABASE_URL`。普通 configuration 不允许携带声明为 secret 的字段。插件日志和管理 API 不回显连接串。[进程环境][process-env]、[配置合并][configuration]
+Store 初始化目录、连接池和初始 schema，事务内创建 `audits`、`contents`、`settings` 并记录 schema 版本。连接启用 WAL、`synchronous=FULL`、外键检查和 1 秒锁等待上限。SQLite 同时只允许一个写事务；现有采集 worker、独立清理任务和时区保存共用 Store，由 SQLite 协调写事务，管理查询使用读事务。[WAL][sqlite-wal]、[连接设置][sqlite-pragmas]
 
-独立角色拥有审计 schema 所需的权限，并额外取得宿主只读视图 `public.model_request_observations` 的 `id`、`client_api_key_ref`、`user_agent`、`requested_model_id`、`reasoning_effort` 五列的只读权限，用于详情关联。在 v3.23.0 中，该视图按宿主迁移 `0025_request_observation.sql` 从 `model_requests.request_observation_json` 投影 UA 与推理强度；插件不读取完整 JSON 或其他列。这些字段与语义以 §2 的固定源码为基线；宿主升级时核对列与语义，不扩展为任意宿主表访问。当前 SDK 没有读取既有请求记录的接口，此处使用后端独立 PG 连接，不借用管理员凭据调用宿主 HTTP API。
+Store 对外提供批量保存、过期清理、设置存取、列表、详情、正文及来源请求引用读取，返回普通 Rust 数据类型和存储错误，不暴露 SQLx 连接、Row 或驱动错误。列表的准确总数与候选记录在同一读事务中取得；详情的审计字段与有序正文描述也在同一读事务中取得。QueryService 继续负责参数解析、日期边界、游标签名、正文分段、响应大小限制和响应组装。宿主请求信息通过 §2 的 SDK 主动 HTTP 分派读取，完成来源请求引用的数据库读取后再调用宿主。
 
 ### 4.3 逻辑数据模型
 
@@ -95,28 +97,28 @@ PostgreSQL 的 [autovacuum](https://www.postgresql.org/docs/current/routine-vacu
 | --- | --- | --- |
 | 审计输入 | 审计 ID、Key ID、本次请求的记录时间、来源 request ID、各自独立的 thread ID 与 session ID、消息级 turn ID、输入内容及逐块类型 | 对最新用户输入的固定观察记录；重复请求分别保存，记录时间不等于客户端提交时刻 |
 | 仓库快照 | 来源请求报告的仓库根路径及各 remote 名称、URL | 属于该 request ID 的观察，不反推为历史输入编写时的仓库状态 |
-| 宿主请求关联 | 用来源 request ID 与 Key ID 读取宿主已有的 UA、请求模型、reasoning effort | 查询时组合，不在审计 schema 中重复保存这三项 |
+| 宿主请求关联 | 点击加载请求信息后，用已保存的来源 request ID 与 Key ID 读取宿主已有的 UA、请求模型、reasoning effort | 单独查询时组合，不在审计数据库中重复保存这三项 |
 | 前序上下文快照 | 来自本次请求的有序消息；每条包含角色、文本、可用的 phase、截断标记 | 与输入一起保存，后续 Agent 输出不修改该快照 |
 
-输入与其上下文组成同一个审计事实，在同一事务保存，落库后以自身内容供 UI 查询。环形队列、worker 批次、超时及丢失边界见[采集行为 §7](collection.md#7-审计任务与异步写入)。数据库迁移保留已有审计事实，移除会话状态和输入去重约束。schema v3 需要支持当前结构的插件；恢复旧版需要相应的数据库备份，不能仅切换插件版本。内容以有序文本块保存；非文本输入的范围见[采集行为](collection.md#4-识别用户输入)。
+输入与其上下文组成同一个审计事实，在同一事务保存，落库后以自身内容供 UI 查询。环形队列、worker 批次、超时及丢失边界见[采集行为 §7](collection.md#7-审计任务与异步写入)。内容以有序文本块保存；非文本输入的范围见[采集行为](collection.md#4-识别用户输入)。
 
 扩展元数据只保存上表的仓库根路径、remote URLs、消息级 turn ID 和逐块输入类型，取值与排除范围由[采集行为 §3.1](collection.md#31-解析元数据)定义。请求用途与来源只参与当次采集判定，不作为审计字段保存。请求缺少的上文不通过响应 ID、前驱关联或其他请求恢复。
 
-宿主在 `model_requests` 及其 `request_observation_json` 保存 UA、请求模型与推理强度，由 `model_request_observations` 提供 `user_agent`、`requested_model_id`、`reasoning_effort` 投影。[请求建档][request-creation]、[存储映射][request-storage] 详情按宿主视图的 `id = requestId AND client_api_key_ref = keyId` 关联底层 `model_requests`，仅投影这三项；使用删除 Key 后仍保留的 `client_api_key_ref`，不依赖可空的 Key 外键。`model` 表示来源请求的请求模型，不是 `upstream_model_id`，UA 是宿主记录的入站 UA。它们描述承载本次观察的模型请求，不能当作请求中每条历史输入最初使用的模型或客户端。
+管理员显式加载请求信息时，后端按审计 ID 读取已保存的来源 request ID 与 Key ID，通过 `HostClient::dispatch_http` 发起 `GET /api/admin/usage/records/detail?id=<requestId>`。客户端不提供宿主 request ID 或 Key ID。后端解析宿主详情响应，核对 `requestId` 与 `clientApiKeyId` 均匹配已保存值，再提取 `userAgent`、`requestedModel` 与 `reasoningEffort`。[宿主详情接口][host-request-detail]、[详情参数][host-request-query]、[宿主字段映射][host-request-fields] 插件的 `model` 来自 `requestedModel`，UA 是宿主记录的入站 UA；它们描述承载本次观察的模型请求，不能当作每条历史输入最初使用的模型或客户端。普通详情与正文读取不发起宿主请求详情查询。
 
-来源请求可能尚未建档、未形成记录，或已经按宿主保留期清理，关联缺失不删除或隐藏审计输入，详情返回 `requestMetadata: null`；已存在行内的未知值逐项返回 `null`。数据库查询失败按接口错误返回，不能冒充缺失。宿主清理后不从审计副本恢复这三项，也不设置跨 schema 外键阻止清理；审计输入按 §4.1 的 72 小时保留期独立清理。[宿主清理][request-retention]
+来源请求可能尚未建档、未形成记录，或已经按宿主保留期清理；没有匹配的宿主记录时，独立请求信息接口返回 `requestMetadata: null`，不删除或隐藏审计输入。已存在记录中的未知字段逐项返回 `null`。宿主查询失败按接口错误返回，不能冒充缺失，页面在请求信息区域提供重试。宿主清理后不从审计副本恢复这三项，也不设置宿主表外键阻止清理；审计输入按 §4.1 的 72 小时保留期独立清理。[宿主清理][request-retention]
 
 每次满足采集条件的请求形成独立审计记录，不按会话标识、turn ID、消息 ID 或正文合并；数据库没有输入去重唯一约束。
 
 列表按 `(first_observed_at, audit_id)` 排序并使用稳定游标，建立支持时间、Key 和用户输入正文关键词检索的查询投影与索引。列表读取有限预览或命中片段；完整正文和上下文通过详情接口读取。搜索只针对用户输入文本，不搜索前序对话，也不生成二次模型摘要。
 
-正文使用 PostgreSQL `json` 保存，保留包括 U+0000 在内的 Unicode 文本；搜索投影按每个码点编码为固定七字符 token，ASCII 大写字母只在匹配投影中转小写。这使字面子串匹配和有限预览能够在 SQL 中执行，既不使用数据库区域性的大小写转换，也不让 NUL 导致整条输入无法持久化。时间／Key 索引支持范围查询；MVP 正文子串检索扫描筛选范围内的投影，不承诺大规模全文索引性能。
+正文和结构化元数据使用 JSON 文本保存，保留包括 U+0000 在内的 Unicode 文本；记录时间使用 UTC 毫秒整数，设置值使用 BLOB，布尔值使用整数。搜索投影按每个码点编码为固定七字符 token，ASCII 大写字母只在匹配投影中转小写。这使字面子串匹配和有限预览能够在 SQL 中执行，既不使用数据库区域性的大小写转换，也不让 NUL 导致整条输入无法持久化。时间／Key 索引支持范围查询；MVP 正文子串检索扫描筛选范围内的投影，不承诺大规模全文索引性能。
 
 ### 4.4 与宿主数据库管理的关系
 
-宿主当前对所连接的 database 执行整库 `pg_dump`，没有 schema 过滤。因此，同一 database 中的审计 schema 可以进入该备份，前提是备份角色具备相应权限；另一个 database 不在这个 dump 的范围内。当前 dump 使用 `--no-owner --no-privileges`，独立角色与授权不能假定随数据恢复。[备份实现][backup]
+宿主的 PostgreSQL 与插件的 SQLite 分别管理各自的数据，宿主数据库迁移和请求记录清理不操作审计文件。插件数据目录随宿主持久数据区保留，但宿主 PostgreSQL 的 `pg_dump` 不包含 SQLite 文件。[备份实现][backup]
 
-这是由当前备份实现推导出的部署边界，不是宿主替插件提供的 schema 迁移或数据生命周期协议。审计的 72 小时保留期作用于在线数据库，备份文件中的历史数据由备份保留策略管理。
+审计的 72 小时保留期作用于在线数据库，备份文件中的历史数据由备份保留策略管理。
 
 ## 5. 审计管理页面
 
@@ -144,21 +146,22 @@ PostgreSQL 的 [autovacuum](https://www.postgresql.org/docs/current/routine-vacu
 
 详情中的本次输入按块顺序保留原文，非文本块在原位置显示类型、已有说明及“非文本内容未采集”。前序对话区分用户与 Agent，保留可用的 Agent phase；较早消息可以折叠，但必须显示数量并允许展开。没有保存的上文直接显示空状态；只保存了消息末尾时，在原文旁作简短说明。长正文分段读取时显示已读取范围与继续读取入口；尚未加载、界面折叠和采集时已截断是不同状态，不能暗示能恢复未采集内容。
 
-记录信息默认完整显示在前序对话之后，无需点击展开；详情从用户输入开始，Client Key 与记录时间、模型、其他标识保持相同的辅助信息层级。短字段以紧凑两列排列，仓库与 UA 等长字段横跨两列并自然换行，不占用输入和前序消息之前的阅读空间。字段包含 Key 当前名称与 ID、记录时间、请求模型、推理强度、审计 ID、来源请求 ID、Thread ID、Session ID、消息级 Turn ID、逐块输入类型、仓库根路径、remote URLs 和 UA。模型、推理强度与 UA 标明取自宿主记录，缺少宿主记录时说明不可用。仓库信息标明是来源请求的快照，remote URLs 按文本显示，页面不访问仓库。正文和搜索命中片段按文本安全渲染，高亮不能把用户输入转成可执行 HTML。界面不展示工具调用、数据库连接或中间件内部句柄。
+记录信息默认显示在前序对话之后，无需点击展开；详情从用户输入开始，Client Key 与记录时间、其他标识保持相同的辅助信息层级。短字段以紧凑两列排列，仓库与已加载的 UA 等长字段横跨两列并自然换行，不占用输入和前序消息之前的阅读空间。默认字段包含 Key 当前名称与 ID、记录时间、审计 ID、来源请求 ID、Thread ID、Session ID、消息级 Turn ID、逐块输入类型、仓库根路径和 remote URLs。请求模型、推理强度与 UA 仅在点击“加载请求信息”后读取，标明取自宿主记录；该区域独立显示加载、失败与重试状态，缺少宿主记录时说明不可用。打开详情与读取正文不自动加载请求信息，切换记录后旧响应不覆盖当前记录。仓库信息标明是来源请求的快照，remote URLs 按文本显示，页面不访问仓库。正文和搜索命中片段按文本安全渲染，高亮不能把用户输入转成可执行 HTML。界面不展示工具调用、数据库连接或中间件内部句柄。
 
 [UI](../frontend/)始终通过正式宿主页桥合同调用查询接口，Demo 由模拟宿主加载相同构建并转发到 [模拟服务](../demo/service.js)，启动方式见 [README](../README.md)。Demo 使用 500 条虚构输入，在本地模拟服务中执行筛选、分页和正文分段读取；浏览器只收到所需的预览、目录和内容片段。正式插件同样由服务端检索完整范围，不能只搜索已加载的一页。
 
 ### 5.3 管理 API
 
-前后端查询契约版本为 **1.0.0**。字段定义以 [`contracts/audit.js`](../contracts/audit.js) 为唯一源，UI 在读取边界解析响应，模拟服务也按该定义输出；[`contracts/openapi.json`](../contracts/openapi.json) 是供后端实现使用的 OpenAPI 3.1 导出，运行 `npm run contract:export` 生成，`npm run contract:check` 检查一致性。以下约定补充 Schema 无法表达的排序、关联与分段语义。
+前后端查询契约版本为 **2.0.0**。字段定义以 [`contracts/audit.js`](../contracts/audit.js) 为唯一源，UI 在读取边界解析响应，模拟服务也按该定义输出；[`contracts/openapi.json`](../contracts/openapi.json) 是供后端实现使用的 OpenAPI 3.1 导出，运行 `npm run contract:export` 生成，`npm run contract:check` 检查一致性。以下约定补充 Schema 无法表达的排序、关联与分段语义。
 
-宿主按 method 与相对 path 精确匹配。五个查询入口为 `GET`，通过 `window.codexProxyPlugin.request({ method: 'GET', path, query })` 调用；`path` 无前导 `/`，`query` 是 `URLSearchParams` 编码的字符串，无前导 `?`，不携带正文。时区设置使用 `PUT api/time-zone`，通过同一页桥传入 `contentType: 'application/json'` 和 UTF-8 JSON 的 `ArrayBuffer` 正文。正式 UI 不直接请求宿主管理 HTTP 地址，也不自行保存认证凭据。管理员身份由宿主校验。
+宿主按 method 与相对 path 精确匹配。六个查询入口为 `GET`，通过 `window.codexProxyPlugin.request({ method: 'GET', path, query })` 调用；`path` 无前导 `/`，`query` 是 `URLSearchParams` 编码的字符串，无前导 `?`，不携带正文。时区设置使用 `PUT api/time-zone`，通过同一页桥传入 `contentType: 'application/json'` 和 UTF-8 JSON 的 `ArrayBuffer` 正文。正式 UI 不直接请求宿主管理 HTTP 地址，也不自行保存认证凭据。管理员身份由宿主校验。
 
 | 相对路径 | Query 参数 | 成功响应 |
 | --- | --- | --- |
 | `api/view-context` | 无 | `{timeZone, today}`；已保存审计时区与服务端当天日期，供页面初始化 |
 | `api/audits` | 可选 `from`、`to`、`key`、`q`、`limit`、`cursor` | `{timeZone, items, total, nextCursor}`；每项为 `{id, recordedAt, recordedAtDisplay, keyId, keyName, preview, contextCount}` |
-| `api/audit` | 必填 `id` | `{timeZone, id, recordedAt, recordedAtDisplay, keyId, keyName, threadId, sessionId, requestId, turnId, inputKinds, repositories, requestMetadata, input, context}`；包含内容目录，不含正文 |
+| `api/audit` | 必填 `id` | `{timeZone, id, recordedAt, recordedAtDisplay, keyId, keyName, threadId, sessionId, requestId, turnId, inputKinds, repositories, input, context}`；包含内容目录，不含正文或宿主请求信息 |
+| `api/audit-request-metadata` | 必填 `id` | `{auditId, requestMetadata}`；显式加载该审计记录的宿主请求信息 |
 | `api/audit-content` | 必填 `id`、`contentId`；可选 `cursor` | `{auditId, contentId, blocks, nextCursor}`；按原顺序返回内容片段 |
 | `api/time-zone`（PUT） | 无；严格 JSON 正文 `{timeZone}` | 保存后的 `{timeZone}` |
 | `api/keys` | 可选 `cursor` | `{items, nextCursor}`；每项为 `{id, name}`，每页最多 100 项 |
@@ -169,11 +172,11 @@ PostgreSQL 的 [autovacuum](https://www.postgresql.org/docs/current/routine-vacu
 
 `repositories` 为 `[{rootPath, remotes: [{name, url}]}]`，取自来源请求的规范元数据 `workspaces`；`null` 表示未取得，`[]` 表示该请求明确报告空集合，`remotes` 同样区分二者。根路径不是客户端当前目录的推测值，URL 可为 HTTPS、SSH 或 Git 的 SCP 风格字符串，不限制为网页链接；入库前去除其中的认证凭据，不访问远端。路径、remote 名称和 URL 分别最多 4,096、256、8,192 码点，输入分类最多 256 码点；超限或无效的可选元数据按未取得处理，不截断成貌似完整的值。元数据总量仍受本节响应预算约束；采集时须预留目录空间，不能因新增元数据而使正文无法读取，省略的仓库集合返回 `null`。
 
-`requestMetadata` 为 `{userAgent, model, reasoningEffort}` 或 `null`，对应 §4.3 的宿主关联查询。存在对象时三个字段均必填、各自可空；长度上限分别为 8,192、256、80 码点，超限值返回 `null`。插件存储其来源 `requestId`，不存这三项的副本。宿主行尚未出现或被清理后，详情的这个查询投影可以变化；固定的审计输入、仓库快照与前序对话不随之改变。
+`api/audit-request-metadata` 的 `id` 是审计 ID，后端从该记录取得来源 request ID 与 Key ID，按 §4.3 查询宿主。响应的 `auditId` 必须与请求匹配，UI 在读取边界检查后使用；`requestMetadata` 为 `{userAgent, model, reasoningEffort}` 或 `null`。存在对象时三个字段均必填、各自可空；长度上限分别为 8,192、256、80 码点，超限值返回 `null`。宿主详情调用与正文读取共用 5 秒等待上限，宿主响应最多读取 512 KiB；超时、超限或关联不匹配返回 `503 unavailable`，页面只在请求信息区域显示错误。插件不保存这三项的副本。宿主行尚未出现或被清理后，再次显式加载的结果可以变化；固定的审计输入、仓库快照与前序对话不随之改变。普通 `api/audit` 与 `api/audit-content` 不包含请求信息，也不发起宿主请求详情查询。
 
-审计时区是插件在 `prompt_audit.settings` 中保存的共享、非 secret 的 IANA `timeZone`，缺省为 `UTC`。存储边界将值解析为 `chrono_tz::Tz`，每次查询读取一次后传给查询处理；同一响应的展示、日期边界与服务端当天日期始终使用这个值。`api/view-context` 的 `today` 由服务端时钟在该时区下生成，UI 先读取它以初始化起止日期，再请求列表和 Key 列表；初始化失败时显示错误并允许重试。
+审计时区是插件在私有数据库的 `settings` 表中保存的共享、非 secret 的 IANA `timeZone`，缺省为 `UTC`。存储边界将值解析为 `chrono_tz::Tz`，每次查询读取一次后传给查询处理；同一响应的展示、日期边界与服务端当天日期始终使用这个值。`api/view-context` 的 `today` 由服务端时钟在该时区下生成，UI 先读取它以初始化起止日期，再请求列表和 Key 列表；初始化失败时显示错误并允许重试。
 
-管理员在页面编辑时区，点击“使用浏览器时区”只填入检测值，检测不可用时填入 `UTC`；点击“保存”才调用 `PUT api/time-zone`。正文必须只含字符串 `timeZone`，无效 IANA 名称、缺失字段、重复字段或未知字段返回 `400 invalid_query`，保留原设置。保存后的值适用于连接同一审计 schema 的实例和管理员；持久化设置与游标签名密钥在重启后保留。保存和查询是独立请求，不触发刷新、取消、同步或自动重试，已选择的日期保持原值。列表与详情从自己的响应 `timeZone` 标注时间，可能与之后保存的设置不同。
+管理员在页面编辑时区，点击“使用浏览器时区”只填入检测值，检测不可用时填入 `UTC`；点击“保存”才调用 `PUT api/time-zone`。正文必须只含字符串 `timeZone`，无效 IANA 名称、缺失字段、重复字段或未知字段返回 `400 invalid_query`，保留原设置。保存后的值适用于使用本插件的所有管理员；持久化设置与游标签名密钥在重启后保留。保存和查询是独立请求，不触发刷新、取消、同步或自动重试，已选择的日期保持原值。列表与详情从自己的响应 `timeZone` 标注时间，可能与之后保存的设置不同。
 
 `from`、`to` 为 `YYYY-MM-DD`，均包含所选审计当地日期；缺省表示该侧无界。查询不接受客户端 `timeZone` 覆盖。后端将日期转换为当地起始日边界至结束日次日起始边界的半开区间，按该时区日历规则处理跳时及重复时刻，不能固定加 24 小时；完全跳过的当地日期边界映射到之后第一个有效时刻。列表、正文和 Key 游标均绑定该次查询的时区，设置变化后在另一时区使用旧游标返回 `400 invalid_cursor`。起始日期晚于结束日期、无效日期、重复参数、未知参数均返回 `400 invalid_query`。
 
@@ -209,29 +212,37 @@ Key 筛选列表仅包含宿主当前存在的 Key，按 `id` 升序分页，每
 
 静态资源每项最多 1 MiB、总计最多 8 MiB、最多 128 项。宿主隔离页禁止 ES Module 脚本及直接网络连接，因此 `npm run build` 生成经典 IIFE 脚本和本地 CSS，并输出 `dist/plugin/management.json` 供后端注册上述路由、非公开资源和页面。后端打包还需在插件 manifest 中声明这些资源及摘要。正式构建不含模拟数据或 HTTP 降级入口；主题沿用宿主注入的变量与变更通知，布局使用 `--cp-plugin-viewport-height`。Demo 读取同一份 `dist/plugin/management.json` 和静态资源，在 `sandbox="allow-scripts"` 的 iframe 中加载，应用同样的 CSP 网络限制，并模拟 v2 管理请求、主题及视口消息。模拟数据与 HTTP 请求只存在于外层宿主和模拟服务中，插件页面没有 Demo 分支或 URL 恢复行为。模拟器覆盖本 UI 使用的管理页桥子集，不替代在真实宿主中的集成验收。[隔离页与资源限制][frame-limit]
 
-[host-compat]: https://github.com/zyycn/codex-proxy-rs/blob/389dc63633a3b24c5b40b0002901371820bc6998/backend/crates/gateway-plugin/runtime/plugin-host-compatibility.json
-[sdk-cargo]: https://github.com/zyycn/codex-proxy-rs/blob/389dc63633a3b24c5b40b0002901371820bc6998/backend/crates/gateway-plugin/sdk/Cargo.toml
+[host-compat]: https://github.com/zyycn/codex-proxy-rs/blob/05ba116eef849a0f4fa2d1940be82182bb2f7683/backend/crates/gateway-plugin/runtime/plugin-host-compatibility.json
+[sdk-cargo]: https://github.com/zyycn/codex-proxy-rs/blob/05ba116eef849a0f4fa2d1940be82182bb2f7683/backend/crates/gateway-plugin/sdk/Cargo.toml
 [workbench]: https://github.com/zyycn/codex-proxy-plugins/tree/cfd37537f99f2c957639c6fa2c14d40dcb0c3368/examples/workbench
-[capabilities]: https://github.com/zyycn/codex-proxy-rs/blob/389dc63633a3b24c5b40b0002901371820bc6998/backend/crates/gateway-plugin/sdk/docs/capabilities.md#洋葱中间件
-[binding]: https://github.com/zyycn/codex-proxy-rs/blob/389dc63633a3b24c5b40b0002901371820bc6998/backend/crates/gateway-plugin/runtime/src/generation/configuration.rs#L35
-[manifest]: https://github.com/zyycn/codex-proxy-rs/blob/389dc63633a3b24c5b40b0002901371820bc6998/backend/crates/gateway-plugin/sdk/docs/manifest.md#完整信任
-[keys]: https://github.com/zyycn/codex-proxy-rs/blob/389dc63633a3b24c5b40b0002901371820bc6998/backend/crates/gateway-plugin/sdk/src/call/host.rs#L213
-[state-api]: https://github.com/zyycn/codex-proxy-rs/blob/389dc63633a3b24c5b40b0002901371820bc6998/backend/crates/gateway-plugin/sdk/src/call/host.rs#L379
-[state-limits]: https://github.com/zyycn/codex-proxy-rs/blob/389dc63633a3b24c5b40b0002901371820bc6998/backend/crates/gateway-plugin/sdk/src/manifest.rs#L380
-[state-schema]: https://github.com/zyycn/codex-proxy-rs/blob/389dc63633a3b24c5b40b0002901371820bc6998/backend/migrations/0018_plugins.sql#L86
-[process-env]: https://github.com/zyycn/codex-proxy-rs/blob/389dc63633a3b24c5b40b0002901371820bc6998/backend/crates/gateway-host/src/process.rs#L100
-[configuration]: https://github.com/zyycn/codex-proxy-rs/blob/389dc63633a3b24c5b40b0002901371820bc6998/backend/crates/gateway-plugin/runtime/src/generation/configuration.rs#L85
-[backup]: https://github.com/zyycn/codex-proxy-rs/blob/389dc63633a3b24c5b40b0002901371820bc6998/backend/crates/gateway-store/src/backup/pg_dump.rs#L53
-[management-types]: https://github.com/zyycn/codex-proxy-rs/blob/389dc63633a3b24c5b40b0002901371820bc6998/backend/crates/gateway-plugin/sdk/src/call/management.rs#L9
-[management-contract]: https://github.com/zyycn/codex-proxy-rs/blob/389dc63633a3b24c5b40b0002901371820bc6998/backend/crates/gateway-plugin/sdk/docs/capabilities.md#管理页面公开入口与-cli
-[sidebar]: https://github.com/zyycn/codex-proxy-rs/blob/389dc63633a3b24c5b40b0002901371820bc6998/frontend/src/layout/components/AppSidebar.vue#L143
-[admin-auth]: https://github.com/zyycn/codex-proxy-rs/blob/389dc63633a3b24c5b40b0002901371820bc6998/backend/crates/gateway-api/src/admin/plugins/management.rs#L290
-[management-runtime]: https://github.com/zyycn/codex-proxy-rs/blob/389dc63633a3b24c5b40b0002901371820bc6998/backend/crates/gateway-plugin/runtime/src/adapter/management/mod.rs#L24
-[management-validation]: https://github.com/zyycn/codex-proxy-rs/blob/389dc63633a3b24c5b40b0002901371820bc6998/backend/crates/gateway-plugin/runtime/src/adapter/management/mod.rs#L68
-[bridge-limit]: https://github.com/zyycn/codex-proxy-rs/blob/389dc63633a3b24c5b40b0002901371820bc6998/frontend/src/views/plugins/management/bridge-contract.ts#L3
-[frame-limit]: https://github.com/zyycn/codex-proxy-rs/blob/389dc63633a3b24c5b40b0002901371820bc6998/frontend/src/views/plugins/management/frame.ts#L17
+[capabilities]: https://github.com/zyycn/codex-proxy-rs/blob/05ba116eef849a0f4fa2d1940be82182bb2f7683/backend/crates/gateway-plugin/sdk/docs/capabilities.md#洋葱中间件
+[binding]: https://github.com/zyycn/codex-proxy-rs/blob/05ba116eef849a0f4fa2d1940be82182bb2f7683/backend/crates/gateway-plugin/runtime/src/generation/configuration.rs#L35
+[manifest]: https://github.com/zyycn/codex-proxy-rs/blob/05ba116eef849a0f4fa2d1940be82182bb2f7683/backend/crates/gateway-plugin/sdk/docs/manifest.md#L87
+[keys]: https://github.com/zyycn/codex-proxy-rs/blob/05ba116eef849a0f4fa2d1940be82182bb2f7683/backend/crates/gateway-plugin/sdk/src/call/host.rs#L213
+[state-api]: https://github.com/zyycn/codex-proxy-rs/blob/05ba116eef849a0f4fa2d1940be82182bb2f7683/backend/crates/gateway-plugin/sdk/src/call/host.rs#L379
+[state-limits]: https://github.com/zyycn/codex-proxy-rs/blob/05ba116eef849a0f4fa2d1940be82182bb2f7683/backend/crates/gateway-plugin/sdk/src/manifest.rs#L380
+[state-schema]: https://github.com/zyycn/codex-proxy-rs/blob/05ba116eef849a0f4fa2d1940be82182bb2f7683/backend/migrations/0018_plugins.sql#L86
+[process-env]: https://github.com/zyycn/codex-proxy-rs/blob/05ba116eef849a0f4fa2d1940be82182bb2f7683/backend/crates/gateway-host/src/process.rs#L107
+[package-cache]: https://github.com/zyycn/codex-proxy-rs/blob/05ba116eef849a0f4fa2d1940be82182bb2f7683/backend/crates/gateway-plugin/runtime/src/package/cache.rs#L13
+[plugin-cache]: https://github.com/zyycn/codex-proxy-rs/blob/05ba116eef849a0f4fa2d1940be82182bb2f7683/backend/apps/gateway/src/bootstrap/startup.rs#L35
+[sqlite-driver]: https://docs.rs/sqlx/latest/sqlx/sqlite/index.html
+[sqlite-wal]: https://sqlite.org/wal.html
+[sqlite-pragmas]: https://sqlite.org/pragma.html
+[sqlite-space]: https://sqlite.org/pragma.html#pragma_auto_vacuum
+[backup]: https://github.com/zyycn/codex-proxy-rs/blob/05ba116eef849a0f4fa2d1940be82182bb2f7683/backend/crates/gateway-store/src/backup/pg_dump.rs#L67
+[management-types]: https://github.com/zyycn/codex-proxy-rs/blob/05ba116eef849a0f4fa2d1940be82182bb2f7683/backend/crates/gateway-plugin/sdk/src/call/management.rs#L9
+[management-contract]: https://github.com/zyycn/codex-proxy-rs/blob/05ba116eef849a0f4fa2d1940be82182bb2f7683/backend/crates/gateway-plugin/sdk/docs/capabilities.md#管理页面公开入口与-cli
+[sidebar]: https://github.com/zyycn/codex-proxy-rs/blob/05ba116eef849a0f4fa2d1940be82182bb2f7683/frontend/src/layout/components/AppSidebar.vue#L143
+[admin-auth]: https://github.com/zyycn/codex-proxy-rs/blob/05ba116eef849a0f4fa2d1940be82182bb2f7683/backend/crates/gateway-api/src/admin/plugins/management.rs#L289
+[management-runtime]: https://github.com/zyycn/codex-proxy-rs/blob/05ba116eef849a0f4fa2d1940be82182bb2f7683/backend/crates/gateway-plugin/runtime/src/adapter/management/mod.rs#L24
+[management-validation]: https://github.com/zyycn/codex-proxy-rs/blob/05ba116eef849a0f4fa2d1940be82182bb2f7683/backend/crates/gateway-plugin/runtime/src/adapter/management/mod.rs#L69
+[bridge-limit]: https://github.com/zyycn/codex-proxy-rs/blob/05ba116eef849a0f4fa2d1940be82182bb2f7683/frontend/src/views/plugins/management/bridge-contract.ts#L3
+[frame-limit]: https://github.com/zyycn/codex-proxy-rs/blob/05ba116eef849a0f4fa2d1940be82182bb2f7683/frontend/src/views/plugins/management/frame.ts#L17
 
-[bridge-runtime]: https://github.com/zyycn/codex-proxy-rs/blob/389dc63633a3b24c5b40b0002901371820bc6998/frontend/src/views/plugins/management/bridge-runtime.ts
-[request-creation]: https://github.com/zyycn/codex-proxy-rs/blob/389dc63633a3b24c5b40b0002901371820bc6998/backend/crates/gateway-core/src/engine/execution/service.rs#L808
-[request-storage]: https://github.com/zyycn/codex-proxy-rs/blob/389dc63633a3b24c5b40b0002901371820bc6998/backend/crates/gateway-store/src/postgres/execution/request_observation.rs#L19
-[request-retention]: https://github.com/zyycn/codex-proxy-rs/blob/389dc63633a3b24c5b40b0002901371820bc6998/backend/crates/gateway-store/src/postgres/retention.rs#L57
+[bridge-runtime]: https://github.com/zyycn/codex-proxy-rs/blob/05ba116eef849a0f4fa2d1940be82182bb2f7683/frontend/src/views/plugins/management/bridge-runtime.ts
+[request-retention]: https://github.com/zyycn/codex-proxy-rs/blob/05ba116eef849a0f4fa2d1940be82182bb2f7683/backend/crates/gateway-store/src/postgres/retention.rs#L57
+[middleware-budget]: https://github.com/zyycn/codex-proxy-rs/blob/05ba116eef849a0f4fa2d1940be82182bb2f7683/backend/crates/gateway-plugin/sdk/docs/capabilities.md#L245
+[http-dispatch]: https://github.com/zyycn/codex-proxy-rs/blob/05ba116eef849a0f4fa2d1940be82182bb2f7683/backend/crates/gateway-plugin/sdk/docs/capabilities.md#L300
+[host-request-detail]: https://github.com/zyycn/codex-proxy-rs/blob/05ba116eef849a0f4fa2d1940be82182bb2f7683/backend/crates/gateway-api/src/admin/observability/routes.rs#L116
+[host-request-query]: https://github.com/zyycn/codex-proxy-rs/blob/05ba116eef849a0f4fa2d1940be82182bb2f7683/backend/crates/gateway-api/src/admin/observability/query.rs#L65
+[host-request-fields]: https://github.com/zyycn/codex-proxy-rs/blob/05ba116eef849a0f4fa2d1940be82182bb2f7683/backend/crates/gateway-api/src/admin/observability/presenter.rs#L374

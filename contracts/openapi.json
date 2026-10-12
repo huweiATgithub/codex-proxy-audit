@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Prompt Audit management contract",
-    "version": "1.0.0",
+    "version": "2.0.0",
     "description": "Paths are relative to the plugin instance. Transport is window.codexProxyPlugin.request; no direct HTTP base URL. See docs/design.md section 5.3 for cursor and content sequencing invariants."
   },
   "paths": {
@@ -876,7 +876,7 @@
     "/api/audit": {
       "get": {
         "operationId": "audit",
-        "summary": "Get saved audit metadata, associated host request metadata and ordered content descriptors; no full bodies.",
+        "summary": "Get saved audit metadata and ordered content descriptors; no full bodies or host request metadata.",
         "parameters": [
           {
             "name": "id",
@@ -1043,58 +1043,6 @@
                       ],
                       "description": "Repository snapshot observed on requestId, not necessarily when a historical input was written. Null means unavailable; [] means reported empty."
                     },
-                    "requestMetadata": {
-                      "anyOf": [
-                        {
-                          "type": "object",
-                          "properties": {
-                            "userAgent": {
-                              "anyOf": [
-                                {
-                                  "type": "string",
-                                  "pattern": "^[\\s\\S]{0,8192}$"
-                                },
-                                {
-                                  "type": "null"
-                                }
-                              ]
-                            },
-                            "model": {
-                              "anyOf": [
-                                {
-                                  "type": "string",
-                                  "pattern": "^[\\s\\S]{0,256}$"
-                                },
-                                {
-                                  "type": "null"
-                                }
-                              ],
-                              "description": "Host requested_model_id, not the upstream resolved model."
-                            },
-                            "reasoningEffort": {
-                              "anyOf": [
-                                {
-                                  "type": "string",
-                                  "pattern": "^[\\s\\S]{0,80}$"
-                                },
-                                {
-                                  "type": "null"
-                                }
-                              ]
-                            }
-                          },
-                          "required": [
-                            "userAgent",
-                            "model",
-                            "reasoningEffort"
-                          ]
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ],
-                      "description": "Read from the host request row matching requestId and keyId; not duplicated in audit storage. Null when no matching row exists."
-                    },
                     "input": {
                       "type": "object",
                       "properties": {
@@ -1200,9 +1148,300 @@
                     "turnId",
                     "inputKinds",
                     "repositories",
-                    "requestMetadata",
                     "input",
                     "context"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Plugin error; see docs/design.md section 5.3.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "invalid_query",
+                            "invalid_cursor",
+                            "not_found",
+                            "cursor_expired",
+                            "unavailable",
+                            "internal_error"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "pattern": "^[\\s\\S]{0,300}$"
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Host administrator session expired; body is host-defined."
+          },
+          "403": {
+            "description": "Host administrator permission denied; body is host-defined."
+          },
+          "404": {
+            "description": "Plugin error; see docs/design.md section 5.3.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "invalid_query",
+                            "invalid_cursor",
+                            "not_found",
+                            "cursor_expired",
+                            "unavailable",
+                            "internal_error"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "pattern": "^[\\s\\S]{0,300}$"
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Plugin error; see docs/design.md section 5.3.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "invalid_query",
+                            "invalid_cursor",
+                            "not_found",
+                            "cursor_expired",
+                            "unavailable",
+                            "internal_error"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "pattern": "^[\\s\\S]{0,300}$"
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Plugin error; see docs/design.md section 5.3.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "invalid_query",
+                            "invalid_cursor",
+                            "not_found",
+                            "cursor_expired",
+                            "unavailable",
+                            "internal_error"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "pattern": "^[\\s\\S]{0,300}$"
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Plugin error; see docs/design.md section 5.3.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "invalid_query",
+                            "invalid_cursor",
+                            "not_found",
+                            "cursor_expired",
+                            "unavailable",
+                            "internal_error"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "pattern": "^[\\s\\S]{0,300}$"
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/audit-request-metadata": {
+      "get": {
+        "operationId": "requestMetadata",
+        "summary": "Explicitly load host request metadata for one saved audit; no content bodies.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[\\s\\S]{1,256}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "UTF-8 JSON; at most 524288 bytes.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "auditId": {
+                      "type": "string",
+                      "pattern": "^[\\s\\S]{1,256}$"
+                    },
+                    "requestMetadata": {
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "userAgent": {
+                              "anyOf": [
+                                {
+                                  "type": "string",
+                                  "pattern": "^[\\s\\S]{0,8192}$"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            },
+                            "model": {
+                              "anyOf": [
+                                {
+                                  "type": "string",
+                                  "pattern": "^[\\s\\S]{0,256}$"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ],
+                              "description": "Host requestedModel, not the upstream resolved model."
+                            },
+                            "reasoningEffort": {
+                              "anyOf": [
+                                {
+                                  "type": "string",
+                                  "pattern": "^[\\s\\S]{0,80}$"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            }
+                          },
+                          "required": [
+                            "userAgent",
+                            "model",
+                            "reasoningEffort"
+                          ]
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "Loaded explicitly through the host request detail API matching the saved requestId and keyId; not duplicated in audit storage. Null when no matching host record exists."
+                    }
+                  },
+                  "required": [
+                    "auditId",
+                    "requestMetadata"
                   ]
                 }
               }

@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { effectScope } from 'vue';
+import { effectScope, ref } from 'vue';
 import { useAudits } from '../frontend/state/audits.js';
 import { AuditError } from '../frontend/api/client.js';
 import { useTimeZone } from '../frontend/state/time-zone.js';
+import { useRequestMetadata } from '../frontend/state/request-metadata.js';
 
 const initial = { from: '', to: '', key: '', q: '', size: 50 };
 const deferred = () => { let resolve, reject; const promise = new Promise((a, b) => { resolve = a; reject = b; }); return { promise, resolve, reject }; };
@@ -97,4 +98,65 @@ test('draft edits and saving remain independent of pending audit results and fil
     assert.equal(settings.saved.value, 'Asia/Tokyo');
     assert.equal(store.list.value.kind, 'ready');
   } finally { scope.stop(); }
+});
+
+test('request metadata waits for explicit loading and deduplicates pending and completed reads', async () => {
+  const pending = deferred();
+  const scope = effectScope();
+  const calls = [];
+  const metadata = { userAgent: 'client/1.0', model: 'model', reasoningEffort: 'high' };
+  const store = scope.run(() => useRequestMetadata({ requestMetadata: (id, signal) => { calls.push({ id, signal }); return pending.promise; } }, () => 'audit-one'));
+  try {
+    assert.equal(store.state.value.kind, 'idle');
+    assert.deepEqual(calls, []);
+    const first = store.load();
+    await store.load();
+    assert.equal(calls.length, 1);
+    assert.equal(store.state.value.kind, 'loading');
+    pending.resolve({ requestMetadata: metadata }); await first;
+    assert.deepEqual(store.state.value, { kind: 'ready', data: metadata });
+    await store.load(); assert.equal(calls.length, 1);
+  } finally { scope.stop(); }
+});
+
+test('request metadata retry, missing state, and late responses remain isolated to the open audit', async () => {
+  const scope = effectScope();
+  const auditId = ref('old');
+  const old = deferred(), current = deferred();
+  const calls = [];
+  let failures = 1;
+  const client = { requestMetadata: (id, signal) => {
+    calls.push({ id, signal });
+    if (id === 'old') return old.promise;
+    if (failures--) return Promise.reject(new AuditError('unavailable', '暂时不可用', 503));
+    return current.promise;
+  } };
+  const store = scope.run(() => useRequestMetadata(client, auditId));
+  try {
+    const pending = store.load();
+    auditId.value = 'new';
+    assert.equal(calls[0].signal.aborted, true);
+    assert.equal(store.state.value.kind, 'idle');
+    await store.load(); assert.equal(store.state.value.kind, 'error');
+    const retry = store.load();
+    current.resolve({ requestMetadata: null }); await retry;
+    assert.equal(store.state.value.kind, 'missing');
+    old.resolve({ requestMetadata: { userAgent: 'old', model: 'old-model', reasoningEffort: 'high' } }); await pending;
+    assert.equal(store.state.value.kind, 'missing');
+    await store.load(); assert.equal(calls.length, 3);
+    auditId.value = 'old'; assert.equal(store.state.value.kind, 'idle');
+    const reopening = store.load();
+    await reopening; assert.equal(calls.length, 4);
+  } finally { scope.stop(); }
+});
+
+test('closing request metadata aborts its pending read and ignores the late result', async () => {
+  const scope = effectScope(), pending = deferred();
+  let signal;
+  const store = scope.run(() => useRequestMetadata({ requestMetadata: (_id, cancellation) => { signal = cancellation; return pending.promise; } }, () => 'audit-one'));
+  const loading = store.load();
+  scope.stop(); assert.equal(signal.aborted, true);
+  pending.resolve({ requestMetadata: { userAgent: 'old', model: 'old-model', reasoningEffort: 'high' } });
+  await loading;
+  assert.equal(store.state.value.kind, 'loading');
 });

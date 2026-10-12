@@ -56,6 +56,7 @@ export function createAuditClient(host) {
     if (result.items && (new Set(result.items.map((item) => item.id)).size !== result.items.length || (!result.items.length && result.nextCursor))) throw invalidResponse();
     if (endpoint === 'audits' && (result.items.length > Number(parsedQuery.limit) || result.total < result.items.length)) throw invalidResponse();
     if (endpoint === 'audit' && (result.id !== parsedQuery.id || new Set([result.input.id, ...result.context.map((message) => message.content.id)]).size !== result.context.length + 1 || new Set(result.context.map((message) => message.id)).size !== result.context.length)) throw invalidResponse();
+    if (endpoint === 'requestMetadata' && result.auditId !== parsedQuery.id) throw invalidResponse();
     if (endpoint === 'content' && (result.auditId !== parsedQuery.id || result.contentId !== parsedQuery.contentId || (!result.blocks.length && result.nextCursor) || result.blocks.reduce((total, block) => total + (block.kind === 'text' ? Array.from(block.text).length : 0), 0) > CONTENT_CHARACTERS)) throw invalidResponse();
     return result;
   }
@@ -70,6 +71,7 @@ export function createAuditClient(host) {
     viewContext: (signal) => request('viewContext', {}, signal),
     list: (query, signal) => request('audits', query, signal),
     detail: (id, signal) => request('audit', { id }, signal),
+    requestMetadata: (id, signal) => request('requestMetadata', { id }, signal),
     content: (id, contentId, cursor, signal) => request('content', { id, contentId, cursor }, signal),
     keys: (cursor, signal) => request('keys', { cursor }, signal),
   };

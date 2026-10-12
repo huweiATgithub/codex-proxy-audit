@@ -23,7 +23,7 @@ const paths = Object.fromEntries(Object.entries(endpoints).map(([operationId, en
   } }];
 }));
 const document = {
-  openapi: '3.1.0', info: { title: 'Prompt Audit management contract', version: '1.0.0', description: 'Paths are relative to the plugin instance. Transport is window.codexProxyPlugin.request; no direct HTTP base URL. See docs/design.md section 5.3 for cursor and content sequencing invariants.' },
+  openapi: '3.1.0', info: { title: 'Prompt Audit management contract', version: '2.0.0', description: 'Paths are relative to the plugin instance. Transport is window.codexProxyPlugin.request; no direct HTTP base URL. See docs/design.md section 5.3 for cursor and content sequencing invariants.' },
   paths,
 };
 const output = JSON.stringify(document, null, 2) + '\n';

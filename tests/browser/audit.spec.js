@@ -75,6 +75,9 @@ test('details fetch bodies lazily, preserve literal HTML, and read long input in
   await expect(ui.locator('.metadata')).toContainText('/workspace/prompt-audit');
   await expect(ui.locator('.metadata')).toContainText('origin · git@example.com:demo/prompt-audit.git');
   await expect(ui.locator('.metadata')).toContainText('upstream · https://example.com/upstream/prompt-audit.git');
+  expect(requested.some((url) => url.pathname.endsWith('audit-request-metadata'))).toBe(false);
+  await expect(ui.locator('.request-metadata dt')).toHaveCount(0);
+  await ui.getByRole('button', { name: '加载请求信息', exact: true }).click();
   await expect(ui.locator('.metadata')).toContainText('模型、推理强度与 UA 取自宿主记录');
   await expect(ui.locator('.metadata')).toContainText('demo-model');
   await expect(ui.locator('.metadata')).toContainText('codex_cli_rs/0.160.1');
@@ -94,8 +97,105 @@ test('details fetch bodies lazily, preserve literal HTML, and read long input in
   await expect(ui.locator('.metadata')).toContainText('块 2 · user.image');
   await search(ui, '请整理这次接口评审');
   await ui.locator('[data-audit="PA-0012"]').click();
+  await expect(ui.locator('.metadata')).not.toContainText('来源请求记录不可用');
+  await ui.getByRole('button', { name: '加载请求信息', exact: true }).click();
   await expect(ui.locator('.metadata')).toContainText('来源请求记录不可用');
+  await expect(ui.locator('.request-metadata button')).toHaveCount(0);
   await expect(ui.locator('.input-card .body-text')).toContainText('请整理这次接口评审');
+});
+
+test('request metadata loads once per open detail and prevents duplicate pending calls', async ({ page }) => {
+  const ui = page.frameLocator('iframe');
+  const calls = [];
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  await page.route('**/__demo/api/audit-request-metadata?**', async (route) => {
+    calls.push(new URL(route.request().url()).searchParams.get('id'));
+    if (calls.length === 1) await gate;
+    await route.continue();
+  });
+  await page.goto('/'); await ready(ui);
+  await ui.locator('[data-audit="PA-0018"]').click();
+  await expect(ui.locator('.input-card .body-text')).toHaveText('请继续。');
+  await expect(ui.locator('.context-section .body-text')).toHaveCount(3);
+  await expect(ui.locator('.request-metadata dt')).toHaveCount(0);
+  expect(calls).toEqual([]);
+  try {
+    await ui.getByRole('button', { name: '加载请求信息', exact: true }).click();
+    const loading = ui.getByRole('button', { name: '正在加载请求信息…', exact: true });
+    await expect(loading).toBeDisabled();
+    await loading.evaluate((button) => { button.click(); button.click(); });
+    await expect(ui.locator('.request-metadata')).toHaveAttribute('aria-busy', 'true');
+    expect(calls).toEqual(['PA-0018']);
+  } finally { release(); }
+  await expect(ui.locator('.request-metadata dd')).toHaveText(['demo-model', 'high', 'codex_cli_rs/0.160.1 (Linux; x86_64) xterm-256color']);
+  await expect(ui.locator('.request-metadata button')).toHaveCount(0);
+  await ui.getByRole('button', { name: '关闭详情' }).click();
+  await ui.locator('[data-audit="PA-0018"]').click();
+  await expect(ui.locator('.input-card .body-text')).toHaveText('请继续。');
+  await expect(ui.getByRole('button', { name: '加载请求信息', exact: true })).toBeVisible();
+  await expect(ui.locator('.request-metadata dt')).toHaveCount(0);
+  expect(calls).toEqual(['PA-0018']);
+  await ui.getByRole('button', { name: '加载请求信息', exact: true }).click();
+  await expect(ui.locator('.request-metadata dd').first()).toHaveText('demo-model');
+  expect(calls).toEqual(['PA-0018', 'PA-0018']);
+});
+
+test('request metadata errors retry inline while input and context stay usable', async ({ page }) => {
+  const ui = page.frameLocator('iframe');
+  let calls = 0;
+  await page.route('**/__demo/api/audit-request-metadata?**', async (route) => {
+    if (++calls === 1) return route.fulfill({ status: 503, json: serviceError('unavailable', '宿主请求信息暂时不可用') });
+    return route.continue();
+  });
+  await page.goto('/'); await ready(ui);
+  await ui.locator('[data-audit="PA-0018"]').click();
+  await expect(ui.locator('.input-card .body-text')).toHaveText('请继续。');
+  await ui.getByRole('button', { name: '加载请求信息', exact: true }).click();
+  await expect(ui.locator('.request-metadata [role="alert"]')).toContainText('宿主请求信息暂时不可用');
+  await expect(ui.locator('.input-card .body-text')).toHaveText('请继续。');
+  await expect(ui.locator('.context-section .body-text')).toHaveCount(3);
+  await ui.getByRole('button', { name: '展开更早的 2 条消息' }).click();
+  await expect(ui.locator('.context-section .body-text')).toHaveCount(5);
+  await ui.getByRole('button', { name: '重试请求信息', exact: true }).click();
+  await expect(ui.locator('.request-metadata [role="alert"]')).toHaveCount(0);
+  await expect(ui.locator('.request-metadata dd').first()).toHaveText('demo-model');
+  expect(calls).toBe(2);
+});
+
+test('late request metadata from a previous detail never appears in the current detail', async ({ page }) => {
+  const ui = page.frameLocator('iframe');
+  const calls = [];
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  await page.route('**/__demo/api/audit-request-metadata?**', async (route) => {
+    const id = new URL(route.request().url()).searchParams.get('id');
+    calls.push(id);
+    if (id === 'PA-0018') {
+      await gate;
+      return route.fulfill({ json: { auditId: id, requestMetadata: { model: 'old-model', reasoningEffort: 'low', userAgent: 'old-agent' } } });
+    }
+    return route.fulfill({ json: { auditId: id, requestMetadata: { model: 'current-model', reasoningEffort: 'high', userAgent: 'current-agent' } } });
+  });
+  await page.goto('/'); await ready(ui);
+  await ui.locator('[data-audit="PA-0018"]').click();
+  await expect(ui.locator('.input-card .body-text')).toHaveText('请继续。');
+  try {
+    await ui.getByRole('button', { name: '加载请求信息', exact: true }).click();
+    await expect(ui.getByRole('button', { name: '正在加载请求信息…', exact: true })).toBeDisabled();
+    await search(ui, '审阅要求');
+    await ui.locator('[data-audit="PA-0009"]').click();
+    await expect(ui.locator('.input-card .body-text')).toContainText('审阅要求');
+    await expect(ui.getByRole('button', { name: '加载请求信息', exact: true })).toBeVisible();
+    expect(calls).toEqual(['PA-0018']);
+    await ui.getByRole('button', { name: '加载请求信息', exact: true }).click();
+    await expect(ui.locator('.request-metadata dd')).toHaveText(['current-model', 'high', 'current-agent']);
+    const complete = page.waitForResponse((response) => response.url().includes('/audit-request-metadata?') && new URL(response.url()).searchParams.get('id') === 'PA-0018');
+    release(); await complete;
+    await expect(ui.locator('.request-metadata dd')).toHaveText(['current-model', 'high', 'current-agent']);
+    await expect(ui.locator('.metadata')).not.toContainText('old-model');
+    expect(calls).toEqual(['PA-0018', 'PA-0009']);
+  } finally { release(); }
 });
 
 test('list, detail and chunk failures stay distinct from empty data and can retry', async ({ page }) => {

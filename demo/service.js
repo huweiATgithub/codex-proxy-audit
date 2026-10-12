@@ -6,6 +6,7 @@ const encodeCursor = (value) => Buffer.from(JSON.stringify(value)).toString('bas
 const bytes = (value) => Buffer.byteLength(JSON.stringify(value));
 const fail = (code, status, message) => { throw Object.assign(new Error(message), { code, status }); };
 const fold = (text) => text.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
+const boundedMetadata = (value, max) => typeof value === 'string' && Array.from(value).length <= max ? value : null;
 const sourceText = (audit) => audit.input.filter((block) => block.kind === 'text').map((block) => block.text).join('\n');
 function cursorValue(value, scope) {
   if (!value) return null;
@@ -63,15 +64,19 @@ export function createDemoService({ audits = fixtureAudits, keys = fixtureKeys, 
   }
   function detail(query) {
     const audit = getAudit(query.id);
-    const request = modelRequests.find((row) => row.id === audit.requestId && row.keyId === audit.keyId);
     return {
       timeZone, ...metadata(audit), threadId: audit.threadId ?? null, sessionId: audit.sessionId ?? null, requestId: audit.requestId ?? null,
       turnId: audit.turnId ?? null, inputKinds: audit.input.map((block) => block.inputKind ?? null),
       repositories: audit.repositories ?? null,
-      requestMetadata: request ? { userAgent: request.userAgent ?? null, model: request.model ?? null, reasoningEffort: request.reasoningEffort ?? null } : null,
       input: descriptor('input', audit.input),
       context: audit.context.map((message, index) => ({ id: `message-${index}`, role: message.role, phase: message.phase ?? null, truncated: message.truncated ?? false, content: descriptor(`context-${index}`, message.blocks) })),
     };
+  }
+  function requestMetadata(query) {
+    const audit = getAudit(query.id);
+    const request = modelRequests.find((row) => row.id === audit.requestId);
+    if (request && request.keyId !== audit.keyId) fail('unavailable', 503, '宿主请求信息暂时不可用，请重试。');
+    return { auditId: audit.id, requestMetadata: request ? { userAgent: boundedMetadata(request.userAgent, 8192), model: boundedMetadata(request.model, 256), reasoningEffort: boundedMetadata(request.reasoningEffort, 80) } : null };
   }
   function content(query) {
     const audit = getAudit(query.id);
@@ -135,7 +140,7 @@ export function createDemoService({ audits = fixtureAudits, keys = fixtureKeys, 
         timeZone = setting.timeZone; dateFormatter = nextDate; timeFormatter = nextTime;
         return { status: 200, value: { timeZone } };
       }
-      const value = { viewContext, audits: list, audit: detail, content, keys: keyList }[endpoint](query);
+      const value = { viewContext, audits: list, audit: detail, requestMetadata, content, keys: keyList }[endpoint](query);
       const parsed = endpoints[endpoint].response.parse(value);
       if (bytes(parsed) > MAX_RESPONSE_BYTES) fail('internal_error', 500, '响应超过大小限制。');
       return { status: 200, value: parsed };

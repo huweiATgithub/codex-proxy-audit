@@ -265,16 +265,27 @@ pub async fn plugin(store: Store, writer: Writer) -> anyhow::Result<ComposedPlug
             let store = store.clone();
             let secret = secret.clone();
             async move {
-                let result = QueryService::management(
-                    &store,
-                    secret,
-                    &call.request.method,
-                    &call.request.path,
-                    &call.request.query,
-                    &call.payload,
-                    CurrentKeys::fetch(&call.host),
-                )
-                .await;
+                let result = if call.request.path == "api/audit-request-metadata" {
+                    QueryService::management_metadata(
+                        &store,
+                        &call.host,
+                        &call.request.method,
+                        &call.request.query,
+                        &call.payload,
+                    )
+                    .await
+                } else {
+                    QueryService::management(
+                        &store,
+                        secret,
+                        &call.request.method,
+                        &call.request.path,
+                        &call.request.query,
+                        &call.payload,
+                        CurrentKeys::fetch(&call.host),
+                    )
+                    .await
+                };
                 log_management_failure(&call.host, result.status).await;
                 let payload = serde_json::to_vec(&result.value).map_err(|_| {
                     PluginFault::new(

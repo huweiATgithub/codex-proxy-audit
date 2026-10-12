@@ -1,16 +1,18 @@
 [package]
 name = "codex-proxy-audit"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT"
 
 [dependencies]
-gateway-plugin-sdk = { git = "https://github.com/zyycn/codex-proxy-rs", rev = "389dc63633a3b24c5b40b0002901371820bc6998", features = ["io"] }
+gateway-plugin-sdk = { git = "https://github.com/zyycn/codex-proxy-rs", rev = "05ba116eef849a0f4fa2d1940be82182bb2f7683", features = ["io"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "signal", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json"] }
+sqlx = { git = "https://github.com/launchbadge/sqlx", rev = "94aafe3a68884d923b0798a767c8d7f6cfda89d2", default-features = false, features = ["runtime-tokio", "sqlite", "chrono", "uuid", "json"] }
+# Pin the upstream SQLite 3.54.0 bundle until its next crates.io release.
+libsqlite3-sys = { version = "=0.38.1", default-features = false, features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -24,6 +26,10 @@ crossbeam-queue = "0.3"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
+tempfile = "3"
+
+[patch.crates-io]
+libsqlite3-sys = { git = "https://github.com/rusqlite/rusqlite", rev = "1d5d0ecae8b8372c2779caf5ab98847155dba153" }
 
 [profile.release]
 strip = true

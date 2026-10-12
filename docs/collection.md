@@ -37,7 +37,7 @@
 
 仓库取规范对象的 `workspaces`：每个键是客户端报告的仓库根路径，每个值仅提取 `associated_remote_urls` 中的 remote 名称与 URL。Git 信息异步补充，早期请求可能没有这一字段；缺失就留空，不从输入正文、cwd 或其他请求猜测，也不补采 commit hash、`has_changes`。URL 入库前去除认证凭据，保留仓库定位语义，不访问远端。这份快照与记录的来源 request ID 关联，不能将当前仓库状态解释为每条历史输入编写时的状态。[工作区字段][workspace-fields]、[Git 补充][git-enrichment]
 
-UA、模型和 reasoning effort 由查询层关联宿主已有请求记录，采集器不再保存副本，见[总体设计 §4.3](design.md#43-逻辑数据模型)。其余不采集的请求元数据包括客户端时间、独立的客户端版本或 originator、安装标识、分叉谱系、上下文窗口标识、请求计时、工具目录与 MCP 归因、自定义元数据、执行权限和 service tier。`reasoning.summary` 是请求中的推理摘要配置，摘要正文属于模型输出；两者均不采集。
+UA、模型和 reasoning effort 仅在管理员点击“加载请求信息”后由查询层读取宿主已有请求记录，采集器不保存副本，普通详情与正文读取也不查询这三项，见[总体设计 §4.3](design.md#43-逻辑数据模型)。其余不采集的请求元数据包括客户端时间、独立的客户端版本或 originator、安装标识、分叉谱系、上下文窗口标识、请求计时、工具目录与 MCP 归因、自定义元数据、执行权限和 service tier。`reasoning.summary` 是请求中的推理摘要配置，摘要正文属于模型输出；两者均不采集。
 
 ### 3.2 整条请求过滤
 
@@ -145,11 +145,11 @@ Key 名称使用已有缓存，请求以 `try_lock` 取得可用快照；缓存�
 
 启动必须在 4 秒内完成连接、审计迁移和游标签名密钥读取，否则进程退出，配置为 `failurePolicy: delegate` 的 middleware binding 继续原请求。正常 SDK 关闭或 SIGTERM／Ctrl+C 后尽力排空队列，插件最多等待 5 秒；宿主自身的 2 秒关闭宽限可能更早强制终止插件。强杀、进程崩溃和关机可能丢失所有尚未提交的队列项和工作批次；已提交的输入和固定上文保留。
 
-请求正文超过 **16 MiB** 的插件采集上限时不建档，不截短本条输入。队列只持有已经提取的审计任务，worker 工作批次也有数量上限，不保存完整请求或响应副本。数据库迁移边界见[总体设计 §4.3](design.md#43-逻辑数据模型)。
+请求正文超过 **16 MiB** 的插件采集上限时不建档，不截短本条输入。队列只持有已经提取的审计任务，worker 工作批次也有数量上限，不保存完整请求或响应副本。数据库存储边界见[总体设计 §4.3](design.md#43-逻辑数据模型)。
 
-[http-entry]: https://github.com/zyycn/codex-proxy-rs/blob/389dc63633a3b24c5b40b0002901371820bc6998/backend/crates/gateway-api/src/openai/responses/http.rs#L72
-[execution]: https://github.com/zyycn/codex-proxy-rs/blob/389dc63633a3b24c5b40b0002901371820bc6998/backend/crates/gateway-core/src/engine/execution/service.rs#L306
-[ws-entry]: https://github.com/zyycn/codex-proxy-rs/blob/389dc63633a3b24c5b40b0002901371820bc6998/backend/crates/gateway-api/src/openai/responses/websocket/mod.rs#L324
+[http-entry]: https://github.com/zyycn/codex-proxy-rs/blob/05ba116eef849a0f4fa2d1940be82182bb2f7683/backend/crates/gateway-api/src/openai/responses/http.rs#L72
+[execution]: https://github.com/zyycn/codex-proxy-rs/blob/05ba116eef849a0f4fa2d1940be82182bb2f7683/backend/crates/gateway-core/src/engine/execution/service.rs#L306
+[ws-entry]: https://github.com/zyycn/codex-proxy-rs/blob/05ba116eef849a0f4fa2d1940be82182bb2f7683/backend/crates/gateway-api/src/openai/responses/websocket/mod.rs#L325
 [incremental]: https://github.com/openai/codex/blob/d27764b82f7118f674371e6d6e76271d9d606edb/codex-rs/core/src/client.rs#L1994
 [metadata]: https://github.com/openai/codex/blob/d27764b82f7118f674371e6d6e76271d9d606edb/codex-rs/core/src/responses_metadata.rs#L225
 [subagent]: https://github.com/openai/codex/blob/d27764b82f7118f674371e6d6e76271d9d606edb/codex-rs/core/src/responses_metadata.rs#L458

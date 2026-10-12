@@ -1,17 +1,10 @@
-//! 独立插件进程入口；数据库连接仅取自宿主 secrets 合并后的握手
+//! 独立插件进程入口；初始化插件私有存储并管理任务生命周期
 use codex_proxy_audit::{
     runtime::{Retention, Writer, plugin},
     store::Store,
 };
 use gateway_plugin_sdk::client::{PluginSession, SessionConfig};
-use serde::Deserialize;
 use std::time::Duration;
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Configuration {
-    database_url: String,
-}
 
 #[tokio::main]
 async fn main() {
@@ -28,14 +21,12 @@ async fn run() -> anyhow::Result<()> {
         SessionConfig::default(),
     )
     .await?;
-    let configuration: Configuration =
-        serde_json::from_value(session.handshake().configuration.clone())?;
-    let (writer, handler, retention) = tokio::time::timeout(Duration::from_secs(4), async {
-        let store = Store::connect(&configuration.database_url).await?;
+    let (store, writer, handler, retention) = tokio::time::timeout(Duration::from_secs(4), async {
+        let store = Store::initialize().await?;
         let writer = Writer::start(store.clone());
         let handler = plugin(store.clone(), writer.clone()).await?;
-        let retention = Retention::start(store);
-        Ok::<_, anyhow::Error>((writer, handler, retention))
+        let retention = Retention::start(store.clone());
+        Ok::<_, anyhow::Error>((store, writer, handler, retention))
     })
     .await??;
     let result = tokio::select! {
@@ -44,6 +35,7 @@ async fn run() -> anyhow::Result<()> {
     };
     retention.stop().await;
     writer.drain().await;
+    store.close().await;
     result?;
     Ok(())
 }

@@ -104,24 +104,30 @@ test('chunk traversal preserves code points, block order, and metadata independe
   await assert.rejects(api.content(detail.id, 'missing'), (error) => error.code === 'not_found');
 });
 
-test('detail preserves message metadata and joins host facts by request and Key without retaining a copy', async () => {
+test('detail preserves saved metadata and only the explicit endpoint joins host facts by request and Key', async () => {
   const record = { ...audits[0], turnId: 'message-turn', input: [
     { kind: 'text', text: 'answer', inputKind: 'user.answered_question' },
     { kind: 'nontext', mediaType: '图片', inputKind: 'future.user_annotation' },
     { kind: 'text', text: 'unclassified' },
   ] };
   const host = { id: record.requestId, keyId: record.keyId, userAgent: 'client/1.0', model: 'requested-model', reasoningEffort: 'high' };
-  const modelRequests = [{ ...host, keyId: 'another-key', model: 'wrong-key-model' }, host];
+  const modelRequests = [{ ...host, id: 'another-request', model: 'wrong-request-model' }, host];
   const api = createAuditClient(bridge(createDemoService({ audits: [record], modelRequests })));
   const detail = await api.detail(record.id);
   assert.equal(detail.turnId, 'message-turn');
   assert.deepEqual(detail.inputKinds, ['user.answered_question', 'future.user_annotation', null]);
   assert.deepEqual(detail.repositories, record.repositories);
-  assert.deepEqual(detail.requestMetadata, { userAgent: 'client/1.0', model: 'requested-model', reasoningEffort: 'high' });
+  assert.equal(Object.hasOwn(detail, 'requestMetadata'), false);
+  assert.deepEqual(await api.requestMetadata(record.id), { auditId: record.id, requestMetadata: { userAgent: 'client/1.0', model: 'requested-model', reasoningEffort: 'high' } });
+  host.keyId = 'another-key';
+  await assert.rejects(api.requestMetadata(record.id), (error) => error.code === 'unavailable');
+  assert.deepEqual((await api.detail(record.id)).input, detail.input);
+  host.keyId = record.keyId;
   // Purging the matching host row leaves the audit and its content readable.
   modelRequests.splice(1, 1);
   const after = await api.detail(record.id);
-  assert.equal(after.requestMetadata, null);
+  assert.equal(Object.hasOwn(after, 'requestMetadata'), false);
+  assert.deepEqual(await api.requestMetadata(record.id), { auditId: record.id, requestMetadata: null });
   assert.deepEqual(after.input, detail.input); assert.deepEqual(after.repositories, detail.repositories);
   assert.equal((await api.content(record.id, detail.input.id)).blocks[0].text, 'answer');
   assert.equal((await api.list({})).total, 1);
@@ -129,6 +135,27 @@ test('detail preserves message metadata and joins host facts by request and Key 
   assert.equal(missing.turnId, null); assert.equal(missing.repositories, null);
   const bad = { ...detail, inputKinds: ['user.text'] };
   await assert.rejects(createAuditClient({ version: 2, request: async () => reply(bad) }).detail(record.id), (error) => error.code === 'invalid_response');
+});
+
+test('request metadata endpoint validates its audit identity, fields, and query independently', async () => {
+  const id = audits[0].id;
+  const metadata = { userAgent: 'client/1.0', model: 'requested-model', reasoningEffort: 'high' };
+  for (const value of [
+    { auditId: 'another-audit', requestMetadata: metadata },
+    { auditId: id, requestMetadata: { ...metadata, userAgent: 42 } },
+    { auditId: id, requestMetadata: { ...metadata, model: 'x'.repeat(257) } },
+    { auditId: id },
+  ]) await assert.rejects(createAuditClient({ version: 2, request: async () => reply(value) }).requestMetadata(id), (error) => error.code === 'invalid_response');
+  assert.deepEqual(await createAuditClient({ version: 2, request: async () => reply({ auditId: id, requestMetadata: { userAgent: null, model: null, reasoningEffort: null } }) }).requestMetadata(id), { auditId: id, requestMetadata: { userAgent: null, model: null, reasoningEffort: null } });
+  await assert.rejects(client.requestMetadata('missing-audit'), (error) => error.code === 'not_found');
+  assert.throws(() => parseQuery('requestMetadata', new URLSearchParams('id=a&id=b')));
+  assert.throws(() => parseQuery('requestMetadata', new URLSearchParams('id=a&extra=b')));
+  const record = audits[0];
+  const host = { id: record.requestId, keyId: record.keyId, userAgent: '😀'.repeat(8193), model: '界'.repeat(257), reasoningEffort: 'x'.repeat(81) };
+  const api = createAuditClient(bridge(createDemoService({ audits: [record], modelRequests: [host] })));
+  assert.deepEqual((await api.requestMetadata(id)).requestMetadata, { userAgent: null, model: null, reasoningEffort: null });
+  host.userAgent = '😀'.repeat(8192); host.model = '界'.repeat(256); host.reasoningEffort = 'x'.repeat(80);
+  assert.deepEqual((await api.requestMetadata(id)).requestMetadata, { userAgent: host.userAgent, model: host.model, reasoningEffort: host.reasoningEffort });
 });
 
 test('content rejects overlaps, gaps, changed totals, and a false end', () => {

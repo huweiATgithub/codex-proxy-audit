@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, createWriteStream } from 'node:fs';
+import { createHash, randomBytes } from 'node:crypto';
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync, createWriteStream } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
 import { once } from 'node:events';
+import { DatabaseSync } from 'node:sqlite';
 import { chromium } from '@playwright/test';
 import { endpoints, errorResponse, MAX_RESPONSE_BYTES } from '../contracts/audit.js';
 import { startUpstream, connectWebSocket } from '../tests/integration/upstream.js';
@@ -16,9 +17,12 @@ const options = Object.fromEntries(process.argv.slice(2).reduce((pairs, token, i
   return pairs;
 }, []));
 if (!options['host-binary'] || !options['host-web'] || !options.package) {
-  console.error('Usage: node scripts/integration.js --host-binary /path/codex-proxy-rs --host-web /path/frontend/dist --package /path/plugin.tar.gz [--keep] [--port 4180] [--docker-config /path]');
+  console.error('Usage: node scripts/integration.js --host-binary /path/codex-proxy-rs --host-web /path/frontend/dist --package /path/plugin.tar.gz [--keep] [--port 4180] [--docker-config /path] [--next-wait-ms 125000]');
   process.exit(2);
 }
+const nextWaitMs = options['next-wait-ms'] === undefined ? 0 : Number(options['next-wait-ms']);
+if (options['next-wait-ms'] !== undefined) assert.ok(Number.isInteger(nextWaitMs) && nextWaitMs >= 125000 && nextWaitMs <= 2147453647, '--next-wait-ms must be an integer from 125000 to 2147453647');
+const nextWaitInput = 'INTEGRATION-next-wait downstream completes beyond the SDK execution budget';
 const temporary = mkdtempSync(join(tmpdir(), 'codex-audit-integration-'));
 const suffix = randomBytes(5).toString('hex');
 const pgName = options['postgres-container'] || `codex-audit-pg-${suffix}`;
@@ -27,10 +31,10 @@ const pgPort = Number(options['postgres-port'] || 25432), redisPort = Number(opt
 const hostPort = Number(options.port || 4180), base = `http://127.0.0.1:${hostPort}`;
 const password = options['database-password'] || '0123456789abcdef0123456789abcdef0123456789abcdef';
 const pgUser = options['database-user'] || 'cpr_test', pgDatabase = options['database-name'] || (options['postgres-container'] ? `cpr_audit_${suffix}` : 'cpr_audit_test');
-const auditRole = `audit_${suffix}`, auditPassword = randomBytes(24).toString('hex');
+const auditPath = join(temporary, 'runtime/huwei.prompt-audit/audit.sqlite3');
 const adminPassword = 'audit-integration-password-2026';
 const dockerArguments = options['docker-config'] ? ['--config', options['docker-config']] : [];
-let host, cookie, view, browser, upstream, cleaned = false;
+let host, cookie, view, browser, upstream, auditDatabase, cleaned = false;
 const createdContainers = [];
 const reports = [];
 function command(binary, args, input) {
@@ -41,6 +45,11 @@ function command(binary, args, input) {
 }
 const docker = (args, input) => command('docker', [...dockerArguments, ...args], input);
 const sql = (statement) => docker(['exec', '-i', pgName, 'psql', '-X', '-qAt', '-v', 'ON_ERROR_STOP=1', '-U', pgUser, '-d', pgDatabase], statement);
+const auditRows = (statement, ...parameters) => auditDatabase.prepare(statement).all(...parameters);
+const auditValue = (statement, ...parameters) => Object.values(auditDatabase.prepare(statement).get(...parameters))[0];
+const auditExecute = (statement, ...parameters) => auditDatabase.prepare(statement).run(...parameters);
+const auditSnapshot = () => createHash('sha256').update(JSON.stringify({ audits: auditRows('SELECT * FROM audits ORDER BY id'), contents: auditRows('SELECT * FROM contents ORDER BY id') })).digest('hex');
+const signingSecret = () => Buffer.from(auditValue("SELECT value FROM settings WHERE name='query_cursor'")).toString('hex');
 const delay = (milliseconds) => new Promise((done) => setTimeout(done, milliseconds));
 async function until(action, label, milliseconds = 30000) {
   const deadline = Date.now() + milliseconds; let last;
@@ -92,8 +101,8 @@ async function management(endpoint, values = {}, expected = 200) {
 }
 const metadata = (thread, extra = {}) => ({ 'x-codex-turn-metadata': JSON.stringify({ thread_id: thread, session_id: `session-${thread}`, thread_source: 'user', workspaces: { '/workspace/integration': { associated_remote_urls: { origin: 'https://test-user:test-password@example.invalid/repo.git' } } }, ...extra }) });
 const message = (id, text, turn = 'same-turn', kinds = ['user.text']) => ({ id, type: 'message', role: 'user', content: [{ type: 'input_text', text }], internal_chat_message_metadata_passthrough: { turn_id: turn, content_item_kinds: kinds } });
-async function requestModel(key, input, thread, { stream = false, extra = {}, purpose = {}, expectedStatus = 200 } = {}) {
-  const response = await fetch(base + '/v1/responses', { method: 'POST', headers: { authorization: `Bearer ${key.plaintextKey}`, 'content-type': 'application/json', 'user-agent': 'codex-audit-integration/1.0' }, body: JSON.stringify({ model: 'gpt-5.4', store: false, stream, reasoning: { effort: 'low' }, input, client_metadata: metadata(thread, purpose), ...extra }), signal: AbortSignal.timeout(20000) });
+async function requestModel(key, input, thread, { stream = false, extra = {}, purpose = {}, expectedStatus = 200, timeoutMs = 20000 } = {}) {
+  const response = await fetch(base + '/v1/responses', { method: 'POST', headers: { authorization: `Bearer ${key.plaintextKey}`, 'content-type': 'application/json', 'user-agent': 'codex-audit-integration/1.0' }, body: JSON.stringify({ model: 'gpt-5.4', store: false, stream, reasoning: { effort: 'low' }, input, client_metadata: metadata(thread, purpose), ...extra }), signal: AbortSignal.timeout(timeoutMs) });
   const text = await response.text(); assert.equal(response.status, expectedStatus, text);
   if (expectedStatus !== 200) return JSON.parse(text);
   if (!stream) return JSON.parse(text);
@@ -103,28 +112,12 @@ async function requestModel(key, input, thread, { stream = false, extra = {}, pu
 async function listCount(q, count, key) {
   return until(async () => { const page = await management('audits', { q, ...(key ? { key: key.id } : {}) }); assert.equal(page.total, count); return page; }, `audit count ${q}=${count}`);
 }
-async function withAuditTableLock(action) {
-  const transaction = spawn('docker', [...dockerArguments, 'exec', '-i', pgName, 'psql', '-X', '-qAt', '-v', 'ON_ERROR_STOP=1', '-U', pgUser, '-d', pgDatabase], { stdio: ['pipe', 'pipe', 'pipe'] });
-  const closed = new Promise((done) => transaction.once('close', done));
-  let stderr = ''; transaction.stderr.on('data', (bytes) => { stderr += bytes; });
-  transaction.stdin.on('error', () => {});
+async function withAuditWriteLock(action) {
+  auditDatabase.exec('BEGIN IMMEDIATE');
   try {
-    await new Promise((done, reject) => {
-      let output = '';
-      const finish = (error) => { clearTimeout(timer); transaction.stdout.off('data', receive); transaction.off('error', failed); transaction.off('exit', stopped); error ? reject(error) : done(); };
-      const receive = (bytes) => { output += bytes; if (output.includes('audit-lock-ready')) finish(); };
-      const failed = (error) => finish(error), stopped = () => finish(new Error(`Audit lock transaction exited: ${stderr}`));
-      const timer = setTimeout(() => finish(new Error('Audit lock transaction did not become ready')), 20000);
-      transaction.stdout.on('data', receive); transaction.once('error', failed); transaction.once('exit', stopped);
-      transaction.stdin.write("BEGIN; SET LOCAL statement_timeout = '15s'; SET LOCAL idle_in_transaction_session_timeout = '30s'; LOCK TABLE prompt_audit.audits IN ACCESS EXCLUSIVE MODE; SELECT 'audit-lock-ready';\n");
-    });
     await action();
-    assert.equal(transaction.exitCode, null, 'Audit table remains locked until the model request has completed');
-    assert.equal(transaction.signalCode, null);
   } finally {
-    transaction.stdin.end('ROLLBACK;\n\\q\n');
-    const timer = setTimeout(() => transaction.kill('SIGKILL'), 3000);
-    try { await closed; } finally { clearTimeout(timer); }
+    auditDatabase.exec('ROLLBACK');
   }
 }
 async function textContent(auditId, descriptor) {
@@ -151,24 +144,33 @@ async function run() {
     docker(['exec', '-i', pgName, 'psql', '-X', '-v', 'ON_ERROR_STOP=1', '-U', pgUser, '-d', 'postgres'], `CREATE DATABASE "${pgDatabase}"`);
   }
   await until(() => { assert.equal(sql('SELECT 1'), '1'); }, 'PostgreSQL startup');
-  // Existing container mode still refuses an existing audit schema: this is a
-  // disposable integration database, never an in-place production installer.
-  assert.equal(sql("SELECT count(*) FROM pg_namespace WHERE nspname = 'prompt_audit'"), '0', 'integration database must not already contain prompt_audit');
-  upstream = await startUpstream();
+  upstream = await startUpstream(0, { responseDelayMs: (body) => body.input?.some((item) => item.content?.some((part) => part.text === nextWaitInput)) ? nextWaitMs : 0 });
   mkdirSync(join(temporary, 'deploy'));
   writeFileSync(join(temporary, 'deploy/config.yaml'), `schema_version: 1\nhost:\n  timezone: America/New_York\n  listen: {host: 0.0.0.0, port: ${hostPort}}\n  runtime_data_dir: ../runtime\n  logging:\n    level: info\n    stdout: true\n    file: {enabled: false, directory: ../logs, retention_days: 7, max_file_size_mb: 20}\nstore:\n  database: {url: 'postgres://${pgUser}@127.0.0.1:${pgPort}/${pgDatabase}', password: '${password}'}\n  redis: {url: 'redis://127.0.0.1:${redisPort}/', password: '${password}'}\nadmin:\n  default_username: admin@cpr.local\n  default_password: '${adminPassword}'\n  session_ttl_minutes: 10080\n  session_absolute_ttl_minutes: 43200\napi:\n  asset_directory: '${resolve(options['host-web'])}'\n  cors_allowed_origins: []\n  request_timeout_seconds: null\n  request_id_header: x-request-id\nopenai:\n  api: {base_url: '${upstream.url}/v1'}\n  stream_max_retries: 0\n`);
   await startHost(); report('real host bootstrap, PostgreSQL migrations and admin authentication');
-  const provision = readFileSync(resolve('scripts/provision.sql'), 'utf8');
-  docker(['exec', '-i', pgName, 'psql', '-X', '-v', 'ON_ERROR_STOP=1', '-v', `audit_role=${auditRole}`, '-v', `audit_password=${auditPassword}`, '-U', pgUser, '-d', pgDatabase], provision);
   await json('/api/admin/accounts/import', { provider: 'openai', data: { provider: 'openai', authentication_kind: 'api_key', name: 'Integration controlled upstream', base_url: `${upstream.url}/v1`, api_key: 'sk-integration-only', transport: 'http' } }, 201);
   const makeKey = (name) => json('/api/admin/client-keys/create', { name, groupIds: [], maxConcurrency: 0, requestsPerMinute: 0 }, 201);
   const key = await makeKey('Integration primary'), otherKey = await makeKey('Integration secondary');
   const sha = createHash('sha256').update(readFileSync(resolve(options.package))).digest('hex');
-  const install = await uploadPackage(options['upgrade-from-package'] || options.package);
-  const configured = await json('/api/admin/plugins/instances', { creationId: randomUUID(), name: 'Prompt Audit integration', artifactSha256: install.data.artifact.metadata.sha256, enabled: true, configuration: {}, secrets: { databaseUrl: `postgres://${auditRole}:${auditPassword}@127.0.0.1:${pgPort}/${pgDatabase}` }, bindings: [{ contribution: install.data.artifact.metadata.contributes.middleware.id, stage: 'request', order: -1000000, failurePolicy: 'delegate' }] }, 201);
-  instanceId = configured.id; await refreshView();
+  const install = await uploadPackage(options.package);
+  assert.equal(install.data.configurationRequired, false, 'plugin installation requires no configuration');
+  instanceId = install.data.defaultInstanceId;
+  assert.ok(instanceId, 'host installation creates the default plugin instance');
+  const defaultInstance = (await json('/api/admin/plugins/instances')).find((item) => item.id === instanceId);
+  assert.ok(defaultInstance?.enabled, 'host enables the plugin with its empty default configuration');
+  assert.deepEqual(defaultInstance.configuration, {});
+  assert.deepEqual(defaultInstance.secretFields, []);
+  await json('/api/admin/plugins/instances/update', { id: instanceId, instance: { expectedRevision: defaultInstance.revision, name: 'Prompt Audit integration', artifactSha256: install.data.artifact.metadata.sha256, enabled: true, configuration: {}, secrets: {}, bindings: [{ contribution: install.data.artifact.metadata.contributes.middleware.id, stage: 'request', order: -1000000, failurePolicy: 'delegate' }] } });
+  await refreshView();
   const instance = (await json('/api/admin/plugins/instances')).find((item) => item.id === instanceId);
   assert.equal(instance.compatibilityWarning, null, 'plugin host range and capability versions match the actual host');
+  auditDatabase = new DatabaseSync(auditPath, { timeout: 3000 });
+  auditDatabase.exec('PRAGMA foreign_keys = ON');
+  assert.equal(auditValue('PRAGMA user_version'), 1);
+  assert.equal(auditValue('PRAGMA journal_mode'), 'wal');
+  assert.deepEqual(instance.configuration, {});
+  assert.equal(sql("SELECT count(*) FROM pg_namespace WHERE nspname = 'prompt_audit'"), '0', 'plugin creates no PostgreSQL audit schema');
+  report('plugin creates its private SQLite database without database configuration');
   const context = await management('viewContext'); assert.equal(context.timeZone, 'UTC');
   assert.equal(context.today, new Date().toISOString().slice(0, 10));
   report('unmodified host installs plugin with UTC default independent of host timezone');
@@ -185,29 +187,14 @@ async function run() {
   report('administrator-only strict timezone save preserves setting on invalid input');
   const first = message('integration-input-1', 'INTEGRATION-first 请拟定数据库迁移方案。😀');
   const response1 = await requestModel(key, [first], 'thread-http');
-  if (options['upgrade-from-package']) {
-    await until(() => { assert.equal(sql('SELECT count(*) FROM prompt_audit.audits'), '1'); }, 'old package captures before any Key-directory query');
-    if (Number(sql('SELECT max(version) FROM prompt_audit.schema_migrations')) < 3) {
-      assert.equal(sql('SELECT key_name IS NULL FROM prompt_audit.audits'), 't');
-    }
-    const snapshot = () => sql("SELECT md5(jsonb_agg(to_jsonb(a)-'key_name'-'key_name_observed_at' ORDER BY a.id)::text) FROM prompt_audit.audits a") + sql("SELECT md5(jsonb_agg(to_jsonb(c) ORDER BY c.id)::text) FROM prompt_audit.contents c");
-    const before = snapshot(), signingSecret = sql("SELECT encode(value,'hex') FROM prompt_audit.settings WHERE name='query_cursor'");
-    const target = await uploadPackage(options.package);
-    await json('/api/admin/plugins/instances/switch-version', { id: instanceId, target: { artifactSha256: target.data.artifact.metadata.sha256, expectedRevision: instance.revision } });
-    await until(async () => { await refreshView(); assert.equal(view.target.artifactSha256, sha); assert.equal(sql('SELECT max(version) FROM prompt_audit.schema_migrations'), '3'); }, 'new package management registration and schema upgrade');
-    assert.equal(snapshot(), before);
-    assert.equal(sql("SELECT encode(value,'hex') FROM prompt_audit.settings WHERE name='query_cursor'"), signingSecret);
-    assert.equal((await management('viewContext')).timeZone, 'America/New_York');
-    report('packaged upgrade preserves audit facts, content, settings and signing secret');
-  }
-  assert.equal(sql("SELECT count(*) FROM information_schema.columns WHERE table_schema='prompt_audit' AND table_name='audits' AND column_name IN ('key_name','key_name_observed_at')"), '0');
-  assert.equal(sql("SELECT count(*) FROM information_schema.tables WHERE table_schema='prompt_audit' AND table_name IN ('key_directory','key_names')"), '0');
+  assert.ok(auditRows('PRAGMA table_info(audits)').every((column) => !['key_name', 'key_name_observed_at'].includes(column.name)));
+  assert.equal(auditValue("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('key_directory','key_names')"), 0);
   const cold = await listCount('INTEGRATION-first', 1);
   assert.equal(cold.items[0].keyName, 'Integration primary');
   assert.equal((await management('audit', { id: cold.items[0].id })).keyName, 'Integration primary');
   await requestModel(otherKey, [message('integration-deleted-key', 'INTEGRATION-deleted-key retained record')], 'thread-deleted-key');
   const deletedAudit = (await listCount('INTEGRATION-deleted-key', 1)).items[0];
-  report('cold capture and old unnamed records resolve current names without a directory cache');
+  report('cold capture resolves current names without a directory cache');
   await requestModel(key, [first], 'thread-http', { stream: true }); await listCount('INTEGRATION-first', 2); report('HTTP JSON/SSE collection records repeated requests separately');
   const next = message('integration-input-2', 'INTEGRATION-continue 请继续。');
   const precedingAssistant = { id: 'integration-assistant-1', type: 'message', role: 'assistant', phase: 'final_answer', content: [{ type: 'output_text', text: 'Agent 方案：先检查数据库，再执行迁移。😀' }] };
@@ -217,8 +204,13 @@ async function run() {
   assert.equal(continuation.repositories[0].remotes[0].url, 'https://example.invalid/repo.git');
   const assistant = continuation.context.find((item) => item.role === 'assistant'); assert.ok(assistant, 'the current request supplies its assistant context');
   assert.equal(await textContent(continuation.id, assistant.content), 'Agent 方案：先检查数据库，再执行迁移。😀');
-  assert.ok(continuation.requestMetadata, 'host request metadata joins with source request and Key');
-  assert.equal(continuation.requestMetadata.model, 'gpt-5.4'); assert.equal(continuation.requestMetadata.userAgent, 'codex-audit-integration/1.0'); report('current-request dialogue context and host metadata join');
+  assert.ok(!Object.hasOwn(continuation, 'requestMetadata'), 'ordinary audit detail contains no host request metadata');
+  const additional = await management('requestMetadata', { id: continuation.id });
+  assert.equal(additional.auditId, continuation.id);
+  assert.deepEqual(additional.requestMetadata, { model: 'gpt-5.4', userAgent: 'codex-audit-integration/1.0', reasoningEffort: 'low' });
+  assert.equal((await management('requestMetadata', { id: 'missing-audit' }, 404)).error.code, 'not_found');
+  assert.equal((await management('requestMetadata', { id: continuation.id, extra: 'invalid' }, 400)).error.code, 'invalid_query');
+  report('ordinary detail reads input and context; explicit metadata uses authenticated host dispatch without SQL grants');
   await requestModel(key, [message('integration-delta', 'INTEGRATION-delta no reconstructed history')], 'thread-http', { extra: { previous_response_id: response1.id } });
   const delta = await listCount('INTEGRATION-delta', 1);
   assert.equal((await management('audit', { id: delta.items[0].id })).context.length, 0); report('incremental input keeps only the context present in its request');
@@ -250,6 +242,32 @@ async function run() {
   const other = await listCount('INTEGRATION-first', 2, otherKey); assert.equal((await management('audit', { id: other.items[0].id })).context.length, 0);
   await requestModel(key, [first], 'thread-isolated', { extra: { previous_response_id: response1.id } }); await listCount('INTEGRATION-first', 5); report('request-stage capture includes later rejection and keeps request-local context');
   await Promise.all(Array.from({ length: 6 }, () => requestModel(key, [message('integration-concurrent', 'INTEGRATION-concurrent request')], 'thread-concurrent'))); await listCount('INTEGRATION-concurrent', 6); report('concurrent repeated requests each produce one audit');
+  if (nextWaitMs) {
+    let settled = false;
+    const completion = requestModel(key, [message('integration-next-wait', nextWaitInput)], 'thread-next-wait', { timeoutMs: nextWaitMs + 30000 })
+      .then((value) => ({ value }), (error) => ({ error })).finally(() => { settled = true; });
+    await until(() => { assert.ok(upstream.requests.some((body) => body.input?.some((item) => item.content?.some((part) => part.text === nextWaitInput)))); }, 'long-wait request reaches the real upstream');
+    const arrivedAt = Date.now();
+    const waitingAudit = (await listCount('INTEGRATION-next-wait', 1)).items[0];
+    assert.equal(auditValue('SELECT count(*) FROM audits WHERE id=?', waitingAudit.id), 1);
+    assert.equal(settled, false, 'audit is persisted before the downstream response');
+    assert.equal((await management('requestMetadata', { id: waitingAudit.id })).requestMetadata.model, 'gpt-5.4');
+    assert.equal(settled, false, 'host detail metadata is available for an in-progress request');
+    console.log(`Waiting ${nextWaitMs}ms for the real downstream response; audit is already persisted.`);
+    // Keep five seconds between the old budget boundary and the controlled
+    // response so management calls can be exercised while next is still waiting.
+    await delay(Math.max(0, 120100 - (Date.now() - arrivedAt)));
+    assert.equal(settled, false, 'model request remains pending beyond the former 120-second SDK budget');
+    const waitingDetail = await management('audit', { id: waitingAudit.id });
+    assert.equal(await textContent(waitingDetail.id, waitingDetail.input), nextWaitInput);
+    assert.ok((await management('keys')).items.some((item) => item.id === key.id));
+    const outcome = await completion;
+    if (outcome.error) throw outcome.error;
+    assert.equal(outcome.value.status, 'completed');
+    assert.ok(Date.now() - arrivedAt >= 120000, 'the downstream wait crosses the former SDK budget');
+    assert.equal((await management('audit', { id: waitingAudit.id })).id, waitingAudit.id);
+    report(`real downstream next wait of ${nextWaitMs}ms completes with persisted audit and responsive management`);
+  }
   // generate=false requires an upstream capable of WebSocket prewarming; the
   // HTTP-only test account intentionally cannot satisfy that transport policy.
   await json('/api/admin/accounts/import', { provider: 'openai', data: { provider: 'openai', authentication_kind: 'api_key', name: 'Integration WebSocket upstream', base_url: `${upstream.url}/v1`, api_key: 'sk-integration-websocket-only', transport: 'prefer_websocket' } }, 201);
@@ -262,8 +280,12 @@ async function run() {
   const long = 'INTEGRATION-unicode ' + '😀é汉'.repeat(900);
   await requestModel(key, [message('integration-unicode', long)], 'thread-unicode');
   const longItems = await listCount('INTEGRATION-unicode', 1), longDetail = await management('audit', { id: longItems.items[0].id }); assert.equal(await textContent(longDetail.id, longDetail.input), long); report('Unicode code point counts and contiguous lazy content segments');
-  await withAuditTableLock(() => requestModel(key, [message('integration-blocked-db', 'INTEGRATION-blocked-db best effort')], 'thread-blocked-db'));
+  await withAuditWriteLock(async () => {
+    await requestModel(key, [message('integration-blocked-db', 'INTEGRATION-blocked-db best effort')], 'thread-blocked-db');
+    assert.equal((await management('audit', { id: continuation.id })).id, continuation.id);
+  });
   report('model request completes while audit database writes are blocked');
+  report('SQLite WAL keeps existing audit records readable during a write transaction');
   for (let index = 0; index < 52; index++) await requestModel(key, [message(`integration-page-${index}`, `INTEGRATION-pagination ${index}`)], 'thread-pagination');
   const cursorFirst = await listCount('integration-PAGINATION', 52);
   assert.equal(cursorFirst.items.length, 50); assert.ok(cursorFirst.nextCursor);
@@ -287,28 +309,26 @@ async function run() {
     return date.toISOString().slice(0, 10);
   };
   const longDate = sunday(10, 1), longEnd = sunday(10, 1, 1), shortDate = sunday(2, 8), shortEnd = sunday(2, 8, 1);
-  for (const item of dated.items) sql(`UPDATE prompt_audit.audits SET first_observed_at = '${item.preview.endsWith(' start') ? `${longDate}T04:00:00Z` : `${longEnd}T05:00:00Z`}'::timestamptz WHERE id = '${item.id.replaceAll("'", "''")}'`);
+  for (const item of dated.items) auditExecute('UPDATE audits SET first_observed_at=? WHERE id=?', Date.parse(item.preview.endsWith(' start') ? `${longDate}T04:00:00Z` : `${longEnd}T05:00:00Z`), item.id);
   const day = await management('audits', { q: 'INTEGRATION-timezone', from: longDate, to: longDate, key: key.id });
   assert.equal(day.total, 1); assert.equal(day.items[0].recordedAtDisplay, `${longDate} 00:00:00`);
   report('saved plugin timezone inclusive dates across 25-hour DST day');
-  for (const item of dated.items) sql(`UPDATE prompt_audit.audits SET first_observed_at = '${item.preview.endsWith(' start') ? `${shortDate}T05:00:00Z` : `${shortEnd}T04:00:00Z`}'::timestamptz WHERE id = '${item.id.replaceAll("'", "''")}'`);
+  for (const item of dated.items) auditExecute('UPDATE audits SET first_observed_at=? WHERE id=?', Date.parse(item.preview.endsWith(' start') ? `${shortDate}T05:00:00Z` : `${shortEnd}T04:00:00Z`), item.id);
   const shortDay = await management('audits', { q: 'INTEGRATION-timezone', from: shortDate, to: shortDate, key: key.id });
   assert.equal(shortDay.total, 1); assert.equal(shortDay.timeZone, 'America/New_York');
   assert.equal(shortDay.items[0].recordedAtDisplay, `${shortDate} 00:00:00`);
   report('23-hour DST day includes its start and excludes next-day start');
-  const auditSnapshot = () => sql("SELECT md5(coalesce(jsonb_agg(to_jsonb(a) ORDER BY a.id)::text,'')) FROM prompt_audit.audits a") + sql("SELECT md5(coalesce(jsonb_agg(to_jsonb(c) ORDER BY c.id)::text,'')) FROM prompt_audit.contents c");
-  const factsBefore = auditSnapshot(), secretBefore = sql("SELECT encode(value,'hex') FROM prompt_audit.settings WHERE name='query_cursor'");
-  let inFlight;
-  await withAuditTableLock(async () => {
-    inFlight = management('audits', { q: 'INTEGRATION-continue' });
-    await until(() => { assert.equal(sql(`SELECT count(*) FROM pg_stat_activity WHERE usename='${auditRole}' AND wait_event_type='Lock' AND query LIKE 'SELECT count(*) FROM prompt_audit.audits%'`), '1'); }, 'query reads timezone before waiting for audit data');
-    await management('timeZone', { timeZone: 'Asia/Tokyo' });
-  });
-  const oldResponse = await inFlight;
-  assert.equal(oldResponse.timeZone, 'America/New_York');
+  const factsBefore = auditSnapshot(), secretBefore = signingSecret();
+  const [concurrentResponse] = await Promise.all([
+    management('audits', { q: 'INTEGRATION-continue' }),
+    management('timeZone', { timeZone: 'Asia/Tokyo' }),
+  ]);
+  assert.ok(['America/New_York', 'Asia/Tokyo'].includes(concurrentResponse.timeZone));
+  const rendered = new Intl.DateTimeFormat('sv-SE', { timeZone: concurrentResponse.timeZone, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
+  for (const item of concurrentResponse.items) assert.equal(item.recordedAtDisplay, rendered.format(new Date(item.recordedAt)));
   assert.equal((await management('viewContext')).timeZone, 'Asia/Tokyo');
   await management('timeZone', { timeZone: 'America/New_York' });
-  report('save completes during a blocked query and its response retains its original timezone');
+  report('concurrent query and timezone save retain a consistent timezone for each response');
   const contentFirst = await management('content', { id: longDetail.id, contentId: longDetail.input.id });
   assert.ok(contentFirst.nextCursor);
   // Real host Keys exercise host pagination and the plugin Key cursor.
@@ -323,41 +343,48 @@ async function run() {
   assert.equal((await management('keys', { cursor: keyFirst.nextCursor }, 400)).error.code, 'invalid_cursor');
   assert.equal((await management('audit', { id: longDetail.id })).timeZone, 'Asia/Kathmandu');
   assert.equal(auditSnapshot(), factsBefore);
-  assert.equal(sql("SELECT encode(value,'hex') FROM prompt_audit.settings WHERE name='query_cursor'"), secretBefore);
+  assert.equal(signingSecret(), secretBefore);
   await management('timeZone', { timeZone: 'America/New_York' });
   await management('keys', { cursor: keyFirst.nextCursor });
   for (let index = 0; index < cursorKeys.length; index += 10) await Promise.all(cursorKeys.slice(index, index + 10).map((key) => json('/api/admin/client-keys/delete', { id: key.id })));
   report('timezone-bound list/content/Key cursors and unchanged facts, bodies and signing secret');
   const directory = await management('keys'); assert.ok(directory.items.some((item) => item.id === key.id && item.name === 'Integration primary'));
-  const all = await management('audits'); assert.equal(Number(sql('SELECT count(*) FROM prompt_audit.audits')), all.total); assert.ok(upstream.requests.length > 0); report('five contracted management GET routes and real persisted records');
+  const all = await management('audits'); assert.equal(auditValue('SELECT count(*) FROM audits'), all.total); assert.ok(upstream.requests.length > 0); report('six contracted management GET routes and real persisted records');
+  const foreignRequest = (await management('audit', { id: deletedAudit.id })).requestId;
+  auditExecute('UPDATE audits SET request_id=? WHERE id=?', foreignRequest, continuation.id);
+  assert.equal((await management('requestMetadata', { id: continuation.id }, 503)).error.code, 'unavailable');
+  assert.equal((await management('audit', { id: continuation.id })).id, continuation.id);
+  assert.equal(await textContent(continuation.id, continuation.input), next.content[0].text);
+  auditExecute('UPDATE audits SET request_id=? WHERE id=?', continuation.requestId, continuation.id);
+  report('host Key mismatch is an independent metadata error and leaves audit content readable');
   sql(`DELETE FROM public.model_requests WHERE id = '${continuation.requestId.replaceAll("'", "''")}'`);
-  assert.equal((await management('audit', { id: continuation.id })).requestMetadata, null); assert.equal(await textContent(continuation.id, continuation.input), next.content[0].text); report('host request retention yields null metadata and preserves audit body');
-  sql(`REVOKE SELECT (id, client_api_key_ref, user_agent, requested_model_id, reasoning_effort) ON public.model_request_observations FROM "${auditRole}"`);
-  assert.equal((await management('audit', { id: continuation.id }, 500)).error.code, 'internal_error');
-  sql(`GRANT SELECT (id, client_api_key_ref, user_agent, requested_model_id, reasoning_effort) ON public.model_request_observations TO "${auditRole}"`);
-  report('host metadata SQL failure is an error rather than false missing record');
+  assert.equal((await management('requestMetadata', { id: continuation.id })).requestMetadata, null); assert.equal(await textContent(continuation.id, continuation.input), next.content[0].text); report('host request retention yields null optional metadata and preserves audit body');
   await json('/api/admin/client-keys/update', { id: key.id, name: 'Integration renamed', groupIds: [], maxConcurrency: 0, requestsPerMinute: 0 });
   assert.equal((await management('audit', { id: continuation.id })).keyName, 'Integration renamed');
   assert.ok((await management('audits', { key: key.id, q: 'INTEGRATION-continue' })).items.every((item) => item.keyName === 'Integration renamed'));
   await json('/api/admin/client-keys/delete', { id: otherKey.id });
   assert.equal((await management('audit', { id: deletedAudit.id })).keyName, null);
+  assert.equal((await management('requestMetadata', { id: deletedAudit.id })).requestMetadata.model, 'gpt-5.4');
   assert.equal((await management('audits', { key: otherKey.id })).items[0].keyName, null);
   assert.ok(!(await management('keys')).items.some((item) => item.id === otherKey.id));
   report('live renames update old rows immediately and deleted Keys retain only their audit IDs');
   await requestModel(key, [{ role: 'assistant', phase: 'commentary', content: [{ type: 'output_text', text: 'Prior context for retention' }] }, message('integration-expired', 'INTEGRATION-retention expired')], 'thread-retention');
   const expired = (await listCount('INTEGRATION-retention', 1)).items[0];
-  const expiredId = expired.id.replaceAll("'", "''");
-  assert.equal(sql(`SELECT count(*) FROM prompt_audit.contents WHERE audit_id='${expiredId}'`), '2');
+  assert.equal(auditValue('SELECT count(*) FROM contents WHERE audit_id=?', expired.id), 2);
+  const packageDirectoriesBefore = readdirSync(join(temporary, 'runtime/plugins')).filter((name) => name.startsWith('plugin-'));
+  assert.ok(packageDirectoriesBefore.length > 0);
   await stopHost();
-  sql(`UPDATE prompt_audit.audits SET first_observed_at = now() - interval '96 hours' WHERE id='${expiredId}'`);
+  auditExecute('UPDATE audits SET first_observed_at=? WHERE id=?', Date.now() - 96 * 60 * 60 * 1000, expired.id);
   await startHost(); await refreshView();
+  const packageDirectoriesAfter = readdirSync(join(temporary, 'runtime/plugins')).filter((name) => name.startsWith('plugin-'));
+  assert.ok(packageDirectoriesAfter.some((name) => !packageDirectoriesBefore.includes(name)), 'restart extracts the plugin into a new temporary directory');
   await until(async () => { assert.equal((await management('audit', { id: expired.id }, 404)).error.code, 'not_found'); }, 'startup retention removes expired audit without a model request');
-  assert.equal(sql(`SELECT count(*) FROM prompt_audit.contents WHERE audit_id='${expiredId}'`), '0');
+  assert.equal(auditValue('SELECT count(*) FROM contents WHERE audit_id=?', expired.id), 0);
   report('startup retention removes expired input and context while retaining recent audits');
   assert.equal((await management('viewContext')).timeZone, 'America/New_York');
   assert.equal(auditSnapshot(), factsBefore);
-  assert.equal(sql("SELECT encode(value,'hex') FROM prompt_audit.settings WHERE name='query_cursor'"), secretBefore);
-  await requestModel(key, [first], 'thread-http'); await listCount('INTEGRATION-first', 6); report('host/plugin restart preserves history and records a repeated request');
+  assert.equal(signingSecret(), secretBefore);
+  await requestModel(key, [first], 'thread-http'); await listCount('INTEGRATION-first', 6); report('host/plugin restart and package re-extraction preserve private SQLite history and settings');
   const currentKeys = await management('keys');
   assert.equal(currentKeys.items.find((item) => item.id === key.id).name, 'Integration renamed');
   assert.ok(!currentKeys.items.some((item) => item.id === otherKey.id));
@@ -380,6 +407,18 @@ async function run() {
   await ui.locator(`[data-audit="${continuation.id}"]`).click();
   await ui.locator('.input-card .body-text').waitFor(); assert.ok((await ui.locator('.input-card .body-text').textContent()).includes('INTEGRATION-continue'));
   await until(async () => { assert.ok((await ui.locator('.context-section').textContent()).includes('Agent 方案：先检查数据库')); }, 'real iframe reads assistant context supplied in the request');
+  const metadataRequests = () => requested.filter((url) => url.includes('/api/api/audit-request-metadata'));
+  assert.equal(metadataRequests().length, 0, 'opening real UI detail does not load host metadata');
+  await ui.getByRole('button', { name: '加载请求信息', exact: true }).click();
+  await until(async () => { assert.ok((await ui.locator('.metadata').textContent()).includes('来源请求记录不可用')); }, 'real UI displays missing optional host record');
+  assert.equal(metadataRequests().length, 1, 'one explicit click makes one metadata request');
+  await ui.locator(`[data-audit]:not([data-audit="${continuation.id}"])`).first().click();
+  await ui.locator('.input-card .body-text').waitFor();
+  assert.equal(metadataRequests().length, 1, 'navigating to another record starts with metadata unloaded');
+  await ui.getByRole('button', { name: '加载请求信息', exact: true }).click();
+  await until(async () => { assert.ok((await ui.locator('.metadata').textContent()).includes('gpt-5.4')); }, 'real UI explicitly loads host request metadata');
+  assert.equal(metadataRequests().length, 2);
+  report('real host UI loads optional metadata only on clicks and resets it when switching records');
   assert.equal(await page.locator('iframe').getAttribute('sandbox'), 'allow-scripts');
   assert.equal(await page.locator('iframe').getAttribute('src'), null, 'host owns srcdoc assembly');
   assert.ok(requested.some((url) => url.includes('/api/api/audit-content')), 'actual host page bridge called backend content endpoint');
@@ -408,12 +447,9 @@ async function run() {
   report('existing built UI through real authenticated host bridge and sandbox iframe');
   if (options['rust-tests']) {
     await stopHost();
-    const testDatabase = `rust_query_${suffix}`;
-    sql(`CREATE DATABASE "${testDatabase}" TEMPLATE "${pgDatabase}"`);
-    const testEnvironment = { ...process.env, AUDIT_TEST_DATABASE_URL: `postgres://${pgUser}:${password}@127.0.0.1:${pgPort}/${testDatabase}` };
-    const tested = spawnSync('cargo', ['test', '--manifest-path', 'backend/Cargo.toml', '--locked', '--test', 'storage', '--test', 'query', '--', '--ignored'], { env: testEnvironment, stdio: 'inherit' });
-    assert.equal(tested.status, 0, 'isolated PostgreSQL Rust storage and host-migrated query tests');
-    report('isolated PostgreSQL Rust storage and host-migrated query tests');
+    const tested = spawnSync('cargo', ['test', '--manifest-path', 'backend/Cargo.toml', '--locked', '--test', 'storage', '--test', 'query'], { stdio: 'inherit' });
+    assert.equal(tested.status, 0, 'isolated SQLite Rust storage and audit query tests');
+    report('isolated SQLite Rust storage and audit query tests');
     if (options.keep) await startHost();
   }
   writeFileSync(join(temporary, 'result.json'), JSON.stringify({ hostUrl: `http://0.0.0.0:${hostPort}`, pageUrl: `${base}/plugins/${instanceId}/${view.pages[0].id}`, reports, screenshot: join(temporary, 'real-host-ui.png'), independentSaveScreenshot: join(temporary, 'real-host-independent-save.png'), hostCommit: options['host-commit'] || null, hostBinarySha256: createHash('sha256').update(readFileSync(resolve(options['host-binary']))).digest('hex'), packageSha256: sha }, null, 2));
@@ -428,6 +464,7 @@ async function run() {
 async function cleanup() {
   if (cleaned) return; cleaned = true;
   await browser?.close(); await stopHost(); await upstream?.close();
+  auditDatabase?.close();
   for (const name of createdContainers.reverse()) { try { docker(['rm', '-f', name]); } catch {} }
 }
 try { await run(); } catch (error) { console.error(error); console.error(`Host log and evidence: ${temporary}`); process.exitCode = 1; } finally { await cleanup(); }

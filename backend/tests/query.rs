@@ -1,4 +1,4 @@
-//! 验证审计查询契约、分页和宿主元数据投影，需要隔离的宿主迁移数据库
+//! 验证审计查询契约和分页，每项测试使用独立的 SQLite 文件
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
@@ -40,23 +40,15 @@ async fn ok(service: &QueryService, path: &str, pairs: &[(&str, &str)]) -> Value
 }
 
 #[tokio::test]
-#[ignore = "requires AUDIT_TEST_DATABASE_URL pointing to isolated PostgreSQL with v3.23.0 host migrations"]
-async fn pg_queries_follow_contract_and_read_host_metadata() {
-    let url = std::env::var("AUDIT_TEST_DATABASE_URL").expect("set isolated test database URL");
-    // This ignored fixture test uses a database administrator credential;
-    // production installation provisions schema ownership separately.
-    let setup_pool = sqlx::PgPool::connect(&url).await.unwrap();
-    sqlx::query("CREATE SCHEMA IF NOT EXISTS prompt_audit")
-        .execute(&setup_pool)
-        .await
-        .unwrap();
-    setup_pool.close().await;
-    let store = Store::connect(&url).await.unwrap();
+async fn sqlite_queries_follow_contract_without_host_tables() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("audit.sqlite3");
+    let store = Store::open(path).await.unwrap();
     let key = Uuid::new_v4().to_string();
     let thread = Uuid::new_v4().to_string();
     let secret = store.secret("query_cursor").await.unwrap();
     let service = QueryService::new(
-        store.pool().clone(),
+        store.clone(),
         "America/New_York".parse().unwrap(),
         secret.clone(),
         CurrentKeys::default(),
@@ -121,7 +113,7 @@ async fn pg_queries_follow_contract_and_read_host_metadata() {
         "invalid_cursor"
     );
     let restarted = QueryService::new(
-        store.pool().clone(),
+        store.clone(),
         "America/New_York".parse().unwrap(),
         store.secret("query_cursor").await.unwrap(),
         CurrentKeys::default(),
@@ -164,7 +156,7 @@ async fn pg_queries_follow_contract_and_read_host_metadata() {
         0
     );
     let utc = QueryService::new(
-        store.pool().clone(),
+        store.clone(),
         chrono_tz::UTC,
         secret,
         CurrentKeys::default(),
@@ -236,7 +228,7 @@ async fn pg_queries_follow_contract_and_read_host_metadata() {
     );
     let audit = matching["items"][0]["id"].as_str().unwrap();
     let detail = ok(&service, "api/audit", &[("id", audit)]).await;
-    assert!(detail["requestMetadata"].is_null());
+    assert!(detail.get("requestMetadata").is_none());
     assert_eq!(detail["turnId"], "message-turn");
     assert_eq!(detail["input"]["blockCount"], 3);
     assert_eq!(
@@ -289,30 +281,6 @@ async fn pg_queries_follow_contract_and_read_host_metadata() {
         404
     );
 
-    // Host row appears after the immutable audit was saved; projections change,
-    // original input/context remain byte-for-byte identical.
-    let observation = json!({"request":{"configRevision":1,"protocol":"openai","endpoint":"/v1/responses","compact":false,"userAgent":"fixture-client/1","reasoningEffort":"high"},"routing":{"scope":"all","groupRefs":[],"groupNamesSnapshot":[]}});
-    sqlx::query("INSERT INTO public.model_requests(id,client_api_key_ref,operation,client_transport,requested_model_id,started_at,deadline_at,request_observation_json) VALUES($1,$2,'responses','http_sse','requested-model',now(),now()+interval '10 minutes',$3)").bind(&request).bind(&key).bind(observation).execute(store.pool()).await.unwrap();
-    let with_host = ok(&service, "api/audit", &[("id", audit)]).await;
-    assert_eq!(
-        with_host["requestMetadata"],
-        json!({"userAgent":"fixture-client/1","model":"requested-model","reasoningEffort":"high"})
-    );
-    assert_eq!(with_host["input"], detail["input"]);
-    assert_eq!(with_host["context"], detail["context"]);
-    sqlx::query("UPDATE public.model_requests SET client_api_key_ref=$2 WHERE id=$1")
-        .bind(&request)
-        .bind(Uuid::new_v4().to_string())
-        .execute(store.pool())
-        .await
-        .unwrap();
-    assert!(ok(&service, "api/audit", &[("id", audit)]).await["requestMetadata"].is_null());
-    sqlx::query("DELETE FROM public.model_requests WHERE id=$1")
-        .bind(&request)
-        .execute(store.pool())
-        .await
-        .unwrap();
-    assert!(ok(&service, "api/audit", &[("id", audit)]).await["requestMetadata"].is_null());
     assert_eq!(
         ok(
             &service,

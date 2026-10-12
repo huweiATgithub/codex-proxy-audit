@@ -87,7 +87,7 @@ export async function connectWebSocket(url, headers = {}) {
   });
 }
 
-export async function startUpstream(port = 0) {
+export async function startUpstream(port = 0, { responseDelayMs = () => 0 } = {}) {
   let sequence = 0;
   const requests = [];
   const upgraded = new Set();
@@ -97,6 +97,9 @@ export async function startUpstream(port = 0) {
     }
     const parts = []; for await (const part of req) parts.push(part);
     const body = JSON.parse(Buffer.concat(parts).toString('utf8')); requests.push(body);
+    const delay = responseDelayMs(body);
+    if (delay) await new Promise((done) => setTimeout(done, delay).unref());
+    if (res.destroyed) return;
     const events = eventsFor(body, `resp_integration_${++sequence}`);
     if (body.stream === false) { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(events.at(-1).response)); return; }
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
