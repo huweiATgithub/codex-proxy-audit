@@ -12,8 +12,9 @@ use chrono::Utc;
 use crossbeam_queue::ArrayQueue;
 use gateway_plugin_sdk::{
     PluginFault,
+    call::host::{LogLevel, LogRequest},
     call::management::{ManagementRegistration, ManagementResponse},
-    client::{ComposedPlugin, PluginBuilder, RequestCall, TypedReply},
+    client::{ComposedPlugin, HostClient, PluginBuilder, RequestCall, TypedReply},
 };
 use tokio::{
     sync::{Mutex, Notify, oneshot},
@@ -34,6 +35,32 @@ const MAX_OBSERVATION_BYTES: usize = 16 * 1024 * 1024;
 const RETENTION_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const RETENTION_BATCH_PAUSE: Duration = Duration::from_millis(100);
 const RETENTION_WAIT: Duration = Duration::from_secs(4);
+const LOG_WAIT: Duration = Duration::from_millis(50);
+
+async fn log_event(host: &HostClient, request: LogRequest) {
+    let Ok(params) = serde_json::to_value(request) else {
+        return;
+    };
+    // 日志只在当前父调用内发送；丢弃、失败或超时不重试、不改变业务结果。
+    let _ = tokio::time::timeout(LOG_WAIT, host.call("host.log", params, Vec::new())).await;
+}
+
+async fn log_management_failure(host: &HostClient, status: u16) {
+    let (level, event) = match status {
+        503 => (LogLevel::Warn, "audit.management.unavailable"),
+        500..=599 => (LogLevel::Error, "audit.management.failed"),
+        _ => return,
+    };
+    log_event(
+        host,
+        LogRequest {
+            event: event.into(),
+            level,
+            fields: BTreeMap::from([("status".into(), status.into())]),
+        },
+    )
+    .await;
+}
 
 /// 独立于采集和写入的清理任务；无请求时仍执行，退出时停止。
 pub struct Retention {
@@ -88,13 +115,14 @@ impl AuditQueue {
         }
     }
 
-    fn submit(&self, draft: AuditDraft) {
+    fn submit(&self, draft: AuditDraft) -> Option<AuditDraft> {
         if self.closed.load(Ordering::Acquire) {
-            return;
+            return Some(draft);
         }
         // 固定容量，满时覆盖最旧任务；请求不等待空位或数据库写入。
-        drop(self.tasks.force_push(draft));
+        let dropped = self.tasks.force_push(draft);
         self.ready.notify_one();
+        dropped
     }
 
     async fn next_batch(&self) -> Option<Vec<AuditDraft>> {
@@ -149,8 +177,8 @@ impl Writer {
         }
     }
 
-    fn submit(&self, draft: AuditDraft) {
-        self.queue.submit(draft);
+    fn submit(&self, draft: AuditDraft) -> Option<AuditDraft> {
+        self.queue.submit(draft)
     }
 
     pub async fn drain(&self) {
@@ -213,8 +241,21 @@ pub async fn plugin(store: Store, writer: Writer) -> anyhow::Result<ComposedPlug
                             .collect::<BTreeMap<_, _>>(),
                         observed_at: Utc::now(),
                     };
-                    if let Some(draft) = collect(&observation) {
-                        writer.submit(draft);
+                    if let Some(draft) = collect(&observation)
+                        && writer.submit(draft).is_some()
+                    {
+                        let (_, result) = tokio::join!(
+                            log_event(
+                                &call.host,
+                                LogRequest {
+                                    event: "audit.queue.record_dropped".into(),
+                                    level: LogLevel::Warn,
+                                    fields: BTreeMap::new(),
+                                },
+                            ),
+                            call.next.run(call.request),
+                        );
+                        return result;
                     }
                 }
                 call.next.run(call.request).await
@@ -234,6 +275,7 @@ pub async fn plugin(store: Store, writer: Writer) -> anyhow::Result<ComposedPlug
                     CurrentKeys::fetch(&call.host),
                 )
                 .await;
+                log_management_failure(&call.host, result.status).await;
                 let payload = serde_json::to_vec(&result.value).map_err(|_| {
                     PluginFault::new(
                         gateway_plugin_sdk::ErrorCode::Fault,
@@ -250,6 +292,9 @@ pub async fn plugin(store: Store, writer: Writer) -> anyhow::Result<ComposedPlug
         })?;
     Ok(builder.build()?)
 }
+
+#[cfg(test)]
+mod logging_tests;
 
 #[cfg(test)]
 mod tests {
@@ -277,7 +322,13 @@ mod tests {
     fn full_queue_overwrites_oldest_and_retains_new_tasks_in_order() {
         let queue = AuditQueue::new();
         for index in 0..QUEUE_CAPACITY + 3 {
-            queue.submit(draft(index));
+            let dropped = queue.submit(draft(index));
+            assert_eq!(
+                dropped.map(|draft| draft.request_id),
+                index
+                    .checked_sub(QUEUE_CAPACITY)
+                    .map(|index| index.to_string())
+            );
         }
         assert_eq!(queue.tasks.len(), QUEUE_CAPACITY);
         for index in 3..QUEUE_CAPACITY + 3 {
@@ -290,10 +341,13 @@ mod tests {
     async fn batches_are_bounded_and_shutdown_drains_existing_tasks() {
         let queue = AuditQueue::new();
         for index in 0..QUEUE_CAPACITY {
-            queue.submit(draft(index));
+            assert!(queue.submit(draft(index)).is_none());
         }
         queue.close();
-        queue.submit(draft(QUEUE_CAPACITY));
+        assert_eq!(
+            queue.submit(draft(QUEUE_CAPACITY)).unwrap().request_id,
+            QUEUE_CAPACITY.to_string()
+        );
         let first = queue.next_batch().await.unwrap();
         let second = queue.next_batch().await.unwrap();
         assert_eq!(first.len(), BATCH_CAPACITY);
@@ -306,7 +360,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn submission_continues_when_worker_holds_a_batch_and_is_blocked() {
         let queue = Arc::new(AuditQueue::new());
-        queue.submit(draft(0));
+        assert!(queue.submit(draft(0)).is_none());
         let (acquired, acquired_receiver) = oneshot::channel();
         let (release, release_receiver) = oneshot::channel();
         let worker_queue = queue.clone();
@@ -320,7 +374,7 @@ mod tests {
         let producer_queue = queue.clone();
         let producer = tokio::spawn(async move {
             for index in 1..=QUEUE_CAPACITY * 2 {
-                producer_queue.submit(draft(index));
+                drop(producer_queue.submit(draft(index)));
             }
         });
         tokio::time::timeout(Duration::from_secs(1), producer)
@@ -346,7 +400,7 @@ mod tests {
         });
         for index in 0..32 {
             tokio::task::yield_now().await;
-            queue.submit(draft(index));
+            assert!(queue.submit(draft(index)).is_none());
         }
         queue.close();
         let received = tokio::time::timeout(Duration::from_secs(1), worker)
