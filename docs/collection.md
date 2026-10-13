@@ -41,17 +41,23 @@ UA、模型和 reasoning effort 仅在管理员点击“加载请求信息”后
 
 ### 3.2 整条请求过滤
 
-来源分类发生在生成审计任务之前：
+来源分类发生在生成审计任务之前，用于排除非用户发起的内部任务审计；用户请求携带生成的上下文，不因此成为内部任务：
 
 | 来源证据 | 采集行为 |
 | --- | --- |
 | `subagent_kind`，或明确的 `thread_source=subagent` | 排除该请求 |
 | `x-openai-subagent` 兼容标记 | 排除对应的子代理或内部任务请求，不只匹配 `collab_spawn` |
-| 明确的内部任务来源，例如 guardian review、memory consolidation，或 `request_kind=compaction` / `memory` | 不作为用户输入，也不补入主会话 Agent 上文 |
+| 明确的内部任务来源，例如 guardian review、memory consolidation，或 `request_kind=compaction` / `memory`；Codex recap 使用的 `thread_source=system`、隐藏标题生成使用的 `thread_source=thread_title` | 不作为用户输入，也不补入主会话 Agent 上文 |
 | `thread_source=user`，且没有子代理或内部任务证据 | 按主会话规则处理；这仍不代表其中每个 `user` 内容块都是人类输入 |
 | 元数据不足或无法确认来源 | 按实际可见内容形成候选输入，不视为已确认的主会话来源 |
 
 官方的子代理兼容标记包括 `review`、`compact`、`memory_consolidation`、`collab_spawn` 以及自定义值。`subagent_kind` 中的 `thread_spawn` 与兼容 header 中的 `collab_spawn` 不是同一个字符串枚举，不能直接用一张只含后者的白名单解释所有字段。[来源生成][subagent]、[线程来源类型][thread-source]
+
+Codex 的 catch-up / recap 请求由临时 `system` 线程生成。客户端先将 recap prompt 渲染为字符串，再作为普通用户文本提交；这条路径不会保留 `recap.prompt` 分类，实际正文可标为 `role=user`、`user.text`，请求用途仍是 `request_kind=turn`。因此通过 `thread_source=system` 排除，不按提示词前缀匹配；用户引用相同提示词仍可采集。[Recap 提示词渲染][recap-render]、[Recap 请求][recap-request]、[临时请求输入][temporary-input]
+
+自动标题及重命名建议使用隐藏的 `thread_title` 线程，同样提交普通用户文本，通过线程来源排除。[标题请求][title-request]
+
+`turn_trigger` 描述整轮如何开始，不证明最后一个输入项由谁产生。自动目标推进、daemon 恢复或 heartbeat 开始的轮次仍可接收用户的新输入；不能仅凭这类 trigger 排除整条请求。恢复提示按下面的最后输入项分类判断，排队输入、实时语音输入和携带真实用户消息的预热仍按用户输入规则处理。[轮次来源保留][turn-trigger-lifetime]、[用户插入输入][steered-input]
 
 `forked_from_thread_id` 和 `parent_thread_id` 本身不能替代明确来源分类，MVP 不保存这些谱系字段。主会话中的子代理通知是消息片段，不能因此过滤整条主会话请求。
 
@@ -71,12 +77,26 @@ UA、模型和 reasoning effort 仅在管理员点击“加载请求信息”后
 | 已标注的 [`agents_md.instructions`][agents-kind]、[`environments.environment_context`][environment-kind] | 作为客户端注入上下文排除，不当作本次用户输入 |
 | 已标注的 [`multi_agent.subagent_notification`][notification-kind] | 排除该通知片段，不过滤同请求中的真实输入 |
 | 已标注的 [`user.heartbeat`][heartbeat-kind] 等自动触发内容 | 区分为自动事件，不当作新的人类输入 |
+| 最后输入项仅由 [`recap.prompt`][recap-kind] / [`daemon_recovery.internal_context`][daemon-recovery] 自动提示组成 | 跳过本次审计；同一消息含用户或未知分类的块时仍保留完整候选输入，前序对话中的这些提示也保留 |
+| 请求携带的 skill、摘要、运行期通知、额外上下文和内部证据 | 不凭这些内容分类排除审计或剥离文本；它们的存在不证明请求由自动提示发起 |
 | 未标注或尚未识别的 `user` 内容块 | 允许保留，不能认定为已确认的真人输入；后续在本文细化分类 |
 | 工具调用、工具返回、reasoning、system / developer 指令 | 不形成审计输入，也不作为普通对话上文 |
 
 不能将所有 `user.*` 分类都等同于真人发言；也不能仅靠文本以 `AGENTS.md` 或某个 XML 标签开头就删除内容，因为用户可能正在引用这些文本。分类信息缺失、与内容块数量不匹配或值未知时，保留为来源未确认的候选输入。[官方分类处理][context-classification]
 
 Codex 可因功能设置移除 content kinds，也会在非 OpenAI provider 路径移除相关内部消息元数据。采集不能依赖这些分类永远存在，更不能因缺少分类而丢弃整个请求。[发送前处理][input-preparation]
+
+Stop hook 的自动继续消息也可能使用 `role=user`，却没有内容分类或专用请求来源。插件不以 `<hook_prompt>` 等文本标记猜测来源，这类未标注内容仍可能形成候选输入。[Hook 继续消息][hook-continuation]
+
+Realtime handoff 将用户语音和转录包装为普通用户文本，不保留专用内容分类。会话结束时的 transcript-tail flush 还加入生成的交接提示，但该路径只写入历史，不发起模型推理；这些混合文本可出现在后续请求的上文中。插件不按 `realtime` trigger 或文本标签排除整个包装，以保留其中的真实语音输入。[语音包装渲染][realtime-wrapper]、[结束时保存历史][realtime-tail-history]
+
+客户端可在真实输入之后追加 [`skills.selected_skill_instructions`][skill-kind]。该分类表示随用户请求加载的 skill 正文，不表示一个独立的自动任务；即使它是最后一个原始输入项，也不因这项分类跳过审计。采集仍以最后一个原始输入项为准，不回头取前面的用户消息。[输入与注入顺序][skill-injection-order]
+
+[`compaction.summary`][summary-kind]、[`generic.turn_aborted`][aborted-kind]、[`additional_content.<key>`][additional-context-kind]、memory / guardian 证据和兼容警告可作为用户请求携带的内容保留；独立的 compaction、memory 或 guardian 请求仍由 §3.2 的来源规则排除。不能把内容由客户端生成等同于请求由客户端自动发起。[Memory 证据][memory-evidence-kind]、[Guardian 指令][guardian-retained-kind]、[兼容警告][legacy-warning-kind]
+
+[`goal.internal_context`][goal-steering] 是共享的[内部上下文分类][internal-context-kind]，既用于自动目标继续，也用于用户编辑目标之后的推进提示。仅凭它不能确认请求的发起者，因此保留这类候选输入，不按整个 `goal` trigger 排除。[用户目标变更与提示注入][goal-update-input]
+
+`user.answered_question`、`user.goal` / `user.goal.omitted` 和 `shell.user_command` 来自明确的用户交互，继续保留。`images.preparation_error`、`images.unsupported` 和 `audio.unsupported` 是用户已提交媒体的替代说明，也继续保留，不将它们当作自动任务排除。[用户目标变更][user-goal-kind]、[用户 Shell 命令][shell-kind]、[媒体替代说明][media-placeholder-kind]
 
 首期保存已保留输入块的原始分类字符串，详情以 `inputKinds` 按块顺序返回，不汇总为请求级类型或采集提示。移除注入块时同时移除它的分类；未知值原样保留，不强行归入已有枚举。分类缺失或原数组长度与原内容块数量不符时，每个保留块均记 `null`，不能将不确定的位置关系当作已知。非文本的媒体类型与这份客户端分类是两个不同字段。
 
@@ -168,3 +188,28 @@ Key 名称使用已有缓存，请求以 `try_lock` 取得可用快照；缓存�
 [workspace-fields]: https://github.com/openai/codex/blob/d27764b82f7118f674371e6d6e76271d9d606edb/codex-rs/core/src/responses_metadata.rs#L187
 [git-enrichment]: https://github.com/openai/codex/blob/d27764b82f7118f674371e6d6e76271d9d606edb/codex-rs/core/src/turn_metadata.rs#L481
 [message-metadata]: https://github.com/openai/codex/blob/d27764b82f7118f674371e6d6e76271d9d606edb/codex-rs/protocol/src/models.rs#L960
+[recap-request]: https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/tui/src/app/recap.rs#L226
+[recap-render]: https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/tui/src/app/recap.rs#L57
+[temporary-input]: https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/tui/src/temporary_structured_request.rs#L195
+[recap-kind]: https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/context-fragments/src/recap_prompt.rs#L49
+[title-request]: https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/tui/src/app/thread_title.rs#L103
+[turn-trigger-lifetime]: https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/core/src/turn_metadata.rs#L371
+[steered-input]: https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/core/src/session/turn_input.rs#L207
+[skill-kind]: https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/ext/skills/src/fragments.rs#L77
+[summary-kind]: https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/core/src/context/compaction_summary.rs#L17
+[aborted-kind]: https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/core/src/context/turn_aborted.rs#L20
+[internal-context-kind]: https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/core/src/context/internal_model_context.rs#L79
+[goal-steering]: https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/ext/goal/src/steering.rs#L45
+[goal-update-input]: https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/app-server/src/request_processors/thread_goal_processor.rs#L199
+[daemon-recovery]: https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/app-server/src/request_processors/daemon_continuation.rs#L88
+[additional-context-kind]: https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/context-fragments/src/additional_context.rs#L23
+[memory-evidence-kind]: https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/core/src/context/memory.rs#L14
+[guardian-retained-kind]: https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/core/src/context/guardian_retained_instructions.rs#L28
+[legacy-warning-kind]: https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/core/src/context/legacy_apply_patch_exec_command_warning.rs#L8
+[hook-continuation]: https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/protocol/src/items.rs#L675
+[realtime-wrapper]: https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/core/src/realtime_conversation.rs#L1882
+[realtime-tail-history]: https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/core/src/realtime_conversation/transcript_tail.rs#L21
+[skill-injection-order]: https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/core/src/session/turn.rs#L396
+[user-goal-kind]: https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/core/src/context/user_goal.rs#L15
+[shell-kind]: https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/core/src/context/user_shell_command.rs#L30
+[media-placeholder-kind]: https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/core/src/context/unsupported_media.rs#L8

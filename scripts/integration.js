@@ -121,10 +121,10 @@ async function withAuditWriteLock(action) {
   }
 }
 async function textContent(auditId, descriptor) {
-  let cursor, text = '', offset = 0;
+  let cursor, text = ''; const offsets = new Map();
   do {
     const page = await management('content', { id: auditId, contentId: descriptor.id, ...(cursor ? { cursor } : {}) });
-    for (const block of page.blocks) if (block.kind === 'text') { assert.equal(block.offset, offset); offset += [...block.text].length; text += block.text; }
+    for (const block of page.blocks) if (block.kind === 'text') { assert.equal(block.offset, offsets.get(block.index) ?? 0); offsets.set(block.index, block.offset + [...block.text].length); text += block.text; }
     cursor = page.nextCursor;
   } while (cursor);
   assert.equal([...text].length, descriptor.characterCount); return text;
@@ -234,6 +234,38 @@ async function run() {
   await requestModel(key, [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'INTEGRATION-unknown preserved' }] }], 'thread-unknown'); await listCount('INTEGRATION-unknown', 1);
   await listCount('INTEGRATION-tail', 0); report('tool and assistant tails skip carried historical user inputs');
   await listCount('INTEGRATION-filter', 0); await listCount('INTEGRATION-auto', 0); report('subagent/automatic filtering and conservative unknown classification');
+  const recapText = 'Write a brief catch-up for a user returning to this task. Return JSON with summary and nullable next_action.\n\nConversation:\nUser: INTEGRATION-recap';
+  await requestModel(key, [message('integration-recap-system', recapText)], 'thread-recap-system', { purpose: { thread_source: 'system', request_kind: 'turn' } });
+  await requestModel(key, [message('integration-recap-user', recapText)], 'thread-recap-user');
+  const quotedRecap = await listCount('INTEGRATION-recap', 1);
+  assert.equal((await management('audit', { id: quotedRecap.items[0].id })).threadId, 'thread-recap-user');
+  report('system recap request completes without an audit while identical genuine user text is preserved');
+  const titleText = 'Generate a concise, single-line task title.\n\nUser prompt:\nINTEGRATION-title';
+  await requestModel(key, [message('integration-title-generated', titleText)], 'thread-title-generated', { purpose: { thread_source: 'thread_title', request_kind: 'turn' } });
+  await requestModel(key, [message('integration-title-user', titleText)], 'thread-title-user');
+  const quotedTitle = await listCount('INTEGRATION-title', 1);
+  assert.equal((await management('audit', { id: quotedTitle.items[0].id })).threadId, 'thread-title-user');
+  report('hidden title generation is excluded while identical genuine user text is preserved');
+  await requestModel(key, [message('integration-skill-input', 'INTEGRATION-skill-tail earlier user'), message('integration-skill-injection', 'INTEGRATION-skill-tail injected instructions', 'same-turn', ['skills.selected_skill_instructions'])], 'thread-skill-tail');
+  const skillTail = await listCount('INTEGRATION-skill-tail', 1), skillDetail = await management('audit', { id: skillTail.items[0].id });
+  assert.equal(await textContent(skillDetail.id, skillDetail.input), 'INTEGRATION-skill-tail injected instructions');
+  assert.deepEqual(skillDetail.inputKinds, ['skills.selected_skill_instructions']); assert.equal(skillDetail.context.length, 1);
+  report('skill instructions carried after user input do not suppress the audit');
+  await requestModel(key, [message('integration-daemon-prompt', 'INTEGRATION-prompt-only daemon continuation', 'same-turn', ['daemon_recovery.internal_context'])], 'thread-daemon-prompt', { purpose: { turn_trigger: 'daemon_recovery' } });
+  await requestModel(key, [message('integration-recap-prompt', 'INTEGRATION-prompt-only classified recap', 'same-turn', ['recap.prompt'])], 'thread-recap-prompt');
+  await requestModel(key, [message('integration-goal-steering', 'INTEGRATION-goal-steering after user goal edit', 'same-turn', ['goal.internal_context'])], 'thread-goal-steering', { purpose: { turn_trigger: 'goal' } });
+  await listCount('INTEGRATION-goal-steering', 1);
+  const classifiedInput = message('integration-classified-input', 'INTEGRATION-classified genuine user');
+  classifiedInput.content.unshift({ type: 'input_text', text: 'INTEGRATION-runtime-generated recovery context' });
+  classifiedInput.internal_chat_message_metadata_passthrough.content_item_kinds.unshift('daemon_recovery.internal_context');
+  await requestModel(key, [message('integration-summary', 'INTEGRATION-runtime-generated summary', 'same-turn', ['compaction.summary']), message('integration-context', 'INTEGRATION-runtime-generated context', 'same-turn', ['additional_content.selected_file']), classifiedInput], 'thread-classified', { purpose: { turn_trigger: 'goal' } });
+  const classified = await listCount('INTEGRATION-classified', 1), classifiedDetail = await management('audit', { id: classified.items[0].id });
+  assert.equal(await textContent(classifiedDetail.id, classifiedDetail.input), 'INTEGRATION-runtime-generated recovery contextINTEGRATION-classified genuine user');
+  assert.deepEqual(classifiedDetail.inputKinds, ['daemon_recovery.internal_context', 'user.text']); assert.equal(classifiedDetail.context.length, 2);
+  assert.equal(await textContent(classifiedDetail.id, classifiedDetail.context[0].content), 'INTEGRATION-runtime-generated summary');
+  assert.equal(await textContent(classifiedDetail.id, classifiedDetail.context[1].content), 'INTEGRATION-runtime-generated context');
+  await listCount('INTEGRATION-prompt-only', 0);
+  report('automatic initiating prompts skip audits while carried content and ambiguous goal steering remain');
   await requestModel(otherKey, [first], 'thread-http', { extra: { previous_response_id: response1.id }, expectedStatus: 403 });
   // The host checks continuation ownership after request middleware. A later
   // execution rejection does not undo an input that crossed the audit boundary.
@@ -276,7 +308,12 @@ async function run() {
   const warmup = await wsCall([message('integration-warmup', 'INTEGRATION-warmup input')], { generate: false }); await listCount('INTEGRATION-warmup', 1);
   const generated = await wsCall([], { previous_response_id: warmup.id });
   await wsCall([message('integration-ws-next', 'INTEGRATION-ws-next incremental')], { previous_response_id: generated.id });
-  const wsItems = await listCount('INTEGRATION-ws-next', 1), wsDetail = await management('audit', { id: wsItems.items[0].id }); assert.equal(wsDetail.context.length, 0); ws.close(); report('real WebSocket warmup and incremental request-local collection');
+  const wsItems = await listCount('INTEGRATION-ws-next', 1), wsDetail = await management('audit', { id: wsItems.items[0].id }); assert.equal(wsDetail.context.length, 0); report('real WebSocket warmup and incremental request-local collection');
+  await wsCall([message('integration-ws-recap-system', recapText + '-ws')], { client_metadata: metadata('thread-ws-recap-system', { thread_source: 'system', request_kind: 'turn' }) });
+  await wsCall([message('integration-ws-recap-user', recapText + '-ws')]);
+  const wsQuotedRecap = await listCount('INTEGRATION-recap-ws', 1);
+  assert.equal((await management('audit', { id: wsQuotedRecap.items[0].id })).threadId, 'thread-ws'); ws.close();
+  report('WebSocket recap filtering uses the current response.create source and preserves genuine user input');
   const long = 'INTEGRATION-unicode ' + '😀é汉'.repeat(900);
   await requestModel(key, [message('integration-unicode', long)], 'thread-unicode');
   const longItems = await listCount('INTEGRATION-unicode', 1), longDetail = await management('audit', { id: longItems.items[0].id }); assert.equal(await textContent(longDetail.id, longDetail.input), long); report('Unicode code point counts and contiguous lazy content segments');

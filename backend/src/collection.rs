@@ -89,6 +89,13 @@ pub fn collect(observation: &RequestObservation) -> Option<AuditDraft> {
                 return None;
             }
             let blocks = parse_blocks(latest, Some(&mut input_kinds));
+            if !input_kinds.is_empty()
+                && input_kinds
+                    .iter()
+                    .all(|kind| kind.as_deref().is_some_and(automatic_prompt_kind))
+            {
+                return None;
+            }
             let turn_id = bounded(
                 latest
                     .get("internal_chat_message_metadata_passthrough")
@@ -252,6 +259,10 @@ fn excluded_kind(kind: &str) -> bool {
             | "multi_agent.subagent_notification"
             | "user.heartbeat"
     )
+}
+
+fn automatic_prompt_kind(kind: &str) -> bool {
+    matches!(kind, "recap.prompt" | "daemon_recovery.internal_context")
 }
 
 fn limit_window(mut window: Vec<ContextMessage>) -> Vec<ContextMessage> {
@@ -426,7 +437,9 @@ fn metadata(observation: &RequestObservation) -> Metadata {
     let excluded = field(&["subagent_kind", "x-codex-subagent-kind"])
         .is_some_and(|value| !value.is_empty())
         || compatible_subagent.is_some_and(|value| !value.is_empty())
-        || source.as_deref().is_some_and(internal_source)
+        || source.as_deref().is_some_and(|value| {
+            matches!(value, "system" | "thread_title") || internal_source(value)
+        })
         || kind.as_deref().is_some_and(internal_source)
         || trigger.as_deref().is_some_and(internal_source);
     let repository_source = canonical.as_ref().or(header_metadata.as_ref());
@@ -682,12 +695,14 @@ mod tests {
             let mut message = user("injected");
             message["internal_chat_message_metadata_passthrough"] =
                 json!({"content_item_kinds":[kind]});
-            assert!(collect(&observation(json!([message]))).is_none());
+            assert!(collect(&observation(json!([user("actual input"), message]))).is_none());
         }
-        let mut message = user("future kind");
-        message["internal_chat_message_metadata_passthrough"] =
-            json!({"content_item_kinds":["user.automatic_future"]});
-        assert!(collect(&observation(json!([message]))).is_some());
+        for kind in ["user.automatic_future", "extension.internal_context"] {
+            let mut message = user("future kind");
+            message["internal_chat_message_metadata_passthrough"] =
+                json!({"content_item_kinds":[kind]});
+            assert!(collect(&observation(json!([message]))).is_some());
+        }
     }
 
     #[test]
@@ -711,6 +726,242 @@ mod tests {
         assert!(collect(&request).is_none());
     }
 
+    fn catch_up() -> Value {
+        let mut message = user(
+            "Write a brief catch-up for a user returning to this task. Return JSON with summary and nullable next_action.\n\nConversation:\nUser: Please continue.\nAssistant: The changes are implemented.",
+        );
+        message["internal_chat_message_metadata_passthrough"] =
+            json!({"content_item_kinds":["user.text"]});
+        message
+    }
+
+    #[test]
+    fn system_catch_up_requests_are_excluded_across_metadata_forms() {
+        let canonical = json!({"thread_source":"system","request_kind":"turn"}).to_string();
+        for (client_metadata, headers) in [
+            (json!({"x-codex-turn-metadata":canonical}), BTreeMap::new()),
+            (
+                json!({"thread_source":"system","request_kind":"turn"}),
+                BTreeMap::new(),
+            ),
+            (
+                json!({}),
+                BTreeMap::from([("X-Codex-Turn-Metadata".to_owned(), canonical)]),
+            ),
+            (
+                json!({}),
+                BTreeMap::from([("Thread_Source".to_owned(), "system".to_owned())]),
+            ),
+            (
+                json!({}),
+                BTreeMap::from([("X-Codex-Thread-Source".to_owned(), "system".to_owned())]),
+            ),
+        ] {
+            let mut request = observation(json!([catch_up()]));
+            request.body["client_metadata"] = client_metadata;
+            request.headers = headers;
+            assert!(collect(&request).is_none());
+        }
+    }
+
+    #[test]
+    fn catch_up_text_and_unrecognized_purposes_do_not_exclude_user_inputs() {
+        for source in [None, Some("user"), Some("future_feature")] {
+            let message = catch_up();
+            let expected = vec![ContentBlock::Text {
+                text: message["content"][0]["text"].as_str().unwrap().to_owned(),
+            }];
+            let mut request = observation(json!([message]));
+            request.body["client_metadata"]["x-codex-turn-metadata"] = json!(
+                json!({"thread_source":source,"request_kind":"system","turn_trigger":"system"})
+                    .to_string()
+            );
+            let draft = collect(&request).unwrap();
+            assert_eq!(draft.input_kinds, vec![Some("user.text".to_owned())]);
+            assert_eq!(draft.blocks, expected);
+        }
+    }
+
+    #[test]
+    fn current_user_source_supersedes_system_handshake_headers() {
+        for client_metadata in [
+            json!({"x-codex-turn-metadata":json!({"thread_source":"user"}).to_string()}),
+            json!({"thread_source":"user"}),
+        ] {
+            let mut request = observation(json!([catch_up()]));
+            request.body["client_metadata"] = client_metadata;
+            request.headers = BTreeMap::from([
+                (
+                    "X-Codex-Turn-Metadata".to_owned(),
+                    json!({"thread_source":"system"}).to_string(),
+                ),
+                ("X-Codex-Thread-Source".to_owned(), "system".to_owned()),
+            ]);
+            assert!(collect(&request).is_some());
+        }
+    }
+
+    #[test]
+    fn automatic_prompt_inputs_are_skipped_without_stripping_carried_content() {
+        for kind in ["recap.prompt", "daemon_recovery.internal_context"] {
+            let mut generated = user("generated context");
+            generated["internal_chat_message_metadata_passthrough"]["content_item_kinds"] =
+                json!([kind]);
+            assert!(collect(&observation(json!([user("earlier input"), generated]))).is_none());
+            let request = observation(json!([
+                user("earlier input"),
+                generated,
+                assistant("visible progress"),
+                {
+                    "role":"user", "content":[
+                        {"type":"input_text","text":"generated context"},
+                        {"type":"input_text","text":"Please continue."}
+                    ], "internal_chat_message_metadata_passthrough":{
+                        "content_item_kinds":[kind,"user.text"]
+                    }
+                }
+            ]));
+            let draft = collect(&request).unwrap();
+            assert_eq!(
+                draft.blocks,
+                vec![
+                    ContentBlock::Text {
+                        text: "generated context".to_owned()
+                    },
+                    ContentBlock::Text {
+                        text: "Please continue.".to_owned()
+                    }
+                ]
+            );
+            assert_eq!(
+                draft.input_kinds,
+                vec![Some(kind.to_owned()), Some("user.text".to_owned())]
+            );
+            assert_eq!(
+                draft.context.iter().map(text).collect::<Vec<_>>(),
+                vec!["earlier input", "generated context", "visible progress"]
+            );
+
+            let mut future_input = request.clone();
+            future_input.body["input"][3]["internal_chat_message_metadata_passthrough"]["content_item_kinds"]
+                [1] = json!("future.user_input");
+            let future_draft = collect(&future_input).unwrap();
+            assert_eq!(future_draft.blocks, draft.blocks);
+            assert_eq!(
+                future_draft.input_kinds,
+                vec![Some(kind.to_owned()), Some("future.user_input".to_owned())]
+            );
+
+            for kinds in [
+                Value::Null,
+                json!([]),
+                json!([kind, "user.text"]),
+                json!([null]),
+            ] {
+                let mut uncertain = generated.clone();
+                uncertain["internal_chat_message_metadata_passthrough"]["content_item_kinds"] =
+                    kinds;
+                assert!(collect(&observation(json!([uncertain]))).is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn carried_context_does_not_suppress_user_initiated_audits() {
+        for kind in [
+            "skills.selected_skill_instructions",
+            "goal.internal_context",
+            "generic.turn_aborted",
+            "compaction.summary",
+            "memories.extraction_evidence",
+            "guardian.permissions",
+            "guardian.node_repl_review_evidence",
+            "guardian.context_omission",
+            "guardian.retained_instructions",
+            "guardian.sender_messages",
+            "guardian.tool_descriptions",
+            "apply_patch.legacy_exec_command_warning",
+            "model_switch.legacy_mismatch_warning",
+            "unified_exec.legacy_process_limit_warning",
+            "additional_content.selected_file",
+            "additional_content.future_client_context",
+        ] {
+            let mut carried = user("carried context");
+            carried["internal_chat_message_metadata_passthrough"]["content_item_kinds"] =
+                json!([kind]);
+            let draft = collect(&observation(json!([user("actual input"), carried]))).unwrap();
+            assert_eq!(draft.input_kinds, vec![Some(kind.to_owned())]);
+            assert_eq!(
+                draft.blocks,
+                vec![ContentBlock::Text {
+                    text: "carried context".to_owned()
+                }]
+            );
+            assert_eq!(
+                draft.context.iter().map(text).collect::<Vec<_>>(),
+                vec!["actual input"]
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_user_actions_media_placeholders_and_quoted_context_are_preserved() {
+        let quoted =
+            "<codex_internal_context source=\"goal\">quoted by user</codex_internal_context>";
+        for kind in [
+            "user.text",
+            "user.answered_question",
+            "user.goal",
+            "user.goal.omitted",
+            "shell.user_command",
+            "images.preparation_error",
+            "images.unsupported",
+            "audio.unsupported",
+            "unknown",
+        ] {
+            let request = observation(json!([{
+                "role":"user", "content":[{"type":"input_text","text":quoted}],
+                "internal_chat_message_metadata_passthrough":{"content_item_kinds":[kind]}
+            }]));
+            let draft = collect(&request).unwrap();
+            assert_eq!(
+                draft.blocks,
+                vec![ContentBlock::Text {
+                    text: quoted.to_owned()
+                }]
+            );
+            assert_eq!(draft.input_kinds, vec![Some(kind.to_owned())]);
+        }
+        let mut request = observation(json!([user(quoted)]));
+        let unknown = collect(&request).unwrap();
+        assert_eq!(
+            unknown.blocks,
+            vec![ContentBlock::Text {
+                text: quoted.to_owned()
+            }]
+        );
+        assert_eq!(unknown.input_kinds, vec![None]);
+
+        request.body["input"] = json!([{
+            "role":"user", "content":[
+                {"type":"input_image","image_url":"data:image/png;base64,not-copied"},
+                {"type":"input_audio","audio_url":"data:audio/wav;base64,not-copied"}
+            ], "internal_chat_message_metadata_passthrough":{"content_item_kinds":["user.image","user.audio"]}
+        }]);
+        let media = collect(&request).unwrap();
+        assert_eq!(media.blocks.len(), 2);
+        assert_eq!(
+            media.input_kinds,
+            vec![Some("user.image".to_owned()), Some("user.audio".to_owned())]
+        );
+        assert!(
+            media
+                .blocks
+                .iter()
+                .all(|block| matches!(block, ContentBlock::Nontext { .. }))
+        );
+    }
+
     #[test]
     fn current_source_classification_supersedes_handshake_metadata() {
         let mut request = observation(json!([user("task")]));
@@ -731,6 +982,18 @@ mod tests {
         assert!(collect(&request).is_none());
         request.body["client_metadata"]["thread_source"] = json!("user");
         assert!(collect(&request).is_some());
+    }
+
+    #[test]
+    fn hidden_title_generation_is_excluded_without_matching_user_text() {
+        let prompt =
+            "Generate a concise, single-line task title.\n\nUser prompt:\nFix the audit filter.";
+        for source in ["thread_title", "user"] {
+            let mut request = observation(json!([user(prompt)]));
+            request.body["client_metadata"]["x-codex-turn-metadata"] =
+                json!(json!({"thread_source":source,"request_kind":"turn"}).to_string());
+            assert_eq!(collect(&request).is_some(), source == "user");
+        }
     }
 
     #[test]
