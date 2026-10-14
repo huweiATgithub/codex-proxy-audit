@@ -22,7 +22,9 @@ use tokio::{
 };
 
 use crate::{
+    collection::exclusions::MAX_USER_AGENT_BYTES,
     collection::{AuditDraft, RequestObservation, collect},
+    exclusion_settings::Exclusions,
     keys::CurrentKeys,
     query::QueryService,
     store::{RETENTION_BATCH_SIZE, Store},
@@ -199,9 +201,12 @@ pub async fn plugin(store: Store, writer: Writer) -> anyhow::Result<ComposedPlug
     let registration: ManagementRegistration =
         serde_json::from_slice(include_bytes!("../../dist/plugin/management.json"))?;
     let secret = store.secret("query_cursor").await?;
+    let exclusions = Exclusions::load(store.clone()).await;
+    let collection_exclusions = exclusions.clone();
     let builder = PluginBuilder::from_json(include_bytes!("../../plugin.json"))?
         .middleware(move |call: RequestCall| {
             let writer = writer.clone();
+            let policy = collection_exclusions.snapshot();
             async move {
                 let head = &call.request.head;
                 if head.endpoint == "/v1/responses"
@@ -212,6 +217,19 @@ pub async fn plugin(store: Store, writer: Writer) -> anyhow::Result<ComposedPlug
                         key_id: head.client_key_id.clone(),
                         request_id: head.request_id.clone(),
                         body,
+                        user_agents: head
+                            .headers
+                            .iter()
+                            .filter(|header| header.name.eq_ignore_ascii_case("user-agent"))
+                            .filter_map(|header| {
+                                std::str::from_utf8(&header.value)
+                                    .ok()
+                                    .filter(|value| {
+                                        !value.is_empty() && value.len() <= MAX_USER_AGENT_BYTES
+                                    })
+                                    .map(str::to_owned)
+                            })
+                            .collect(),
                         headers: head
                             .headers
                             .iter()
@@ -241,7 +259,7 @@ pub async fn plugin(store: Store, writer: Writer) -> anyhow::Result<ComposedPlug
                             .collect::<BTreeMap<_, _>>(),
                         observed_at: Utc::now(),
                     };
-                    if let Some(draft) = collect(&observation)
+                    if let Some(draft) = collect(&observation, &policy)
                         && writer.submit(draft).is_some()
                     {
                         let (_, result) = tokio::join!(
@@ -264,8 +282,13 @@ pub async fn plugin(store: Store, writer: Writer) -> anyhow::Result<ComposedPlug
         .management(registration, move |call| {
             let store = store.clone();
             let secret = secret.clone();
+            let exclusions = exclusions.clone();
             async move {
-                let result = if call.request.path == "api/audit-request-metadata" {
+                let result = if call.request.path == "api/exclusions" {
+                    exclusions
+                        .management(&call.request.method, &call.request.query, &call.payload)
+                        .await
+                } else if call.request.path == "api/audit-request-metadata" {
                     QueryService::management_metadata(
                         &store,
                         &call.host,
@@ -306,6 +329,9 @@ pub async fn plugin(store: Store, writer: Writer) -> anyhow::Result<ComposedPlug
 
 #[cfg(test)]
 mod logging_tests;
+
+#[cfg(test)]
+mod exclusion_tests;
 
 #[cfg(test)]
 mod tests {

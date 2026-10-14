@@ -1,15 +1,23 @@
 //! 验证审计查询契约和分页，每项测试使用独立的 SQLite 文件
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 use chrono::{DateTime, Utc};
 use codex_proxy_audit::{
-    collection::{RequestObservation, collect},
+    collection::{
+        AuditDraft, RequestObservation, collect as collect_with_policy, exclusions::ExclusionPolicy,
+    },
     keys::CurrentKeys,
     query::QueryService,
     store::Store,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
+
+fn collect(observation: &RequestObservation) -> Option<AuditDraft> {
+    static POLICY: OnceLock<ExclusionPolicy> = OnceLock::new();
+    collect_with_policy(observation, POLICY.get_or_init(ExclusionPolicy::default))
+}
 
 fn query(values: &[(&str, &str)]) -> String {
     url::form_urlencoded::Serializer::new(String::new())
@@ -28,6 +36,7 @@ fn observation(
         request_id: request.to_string(),
         body: json!({"client_metadata":{"thread_id":thread},"input":input}),
         headers: BTreeMap::new(),
+        user_agents: Vec::new(),
         observed_at: DateTime::parse_from_rfc3339(time)
             .unwrap()
             .with_timezone(&Utc),

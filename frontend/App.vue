@@ -1,18 +1,24 @@
 <script setup>
 import { computed, inject, nextTick, onMounted, onUnmounted, reactive, ref } from 'vue';
 import { BaseButton, BaseIconButton, BaseInput, BaseSelect, BaseTable, BaseToast, defineTableColumns, toast } from '@codex-proxy/ui';
-import { ArrowDown, ArrowUp, ArrowDownWideNarrow, Copy, FileSearch, LoaderCircle, RefreshCw, Search, X } from '@lucide/vue';
+import { ArrowDown, ArrowUp, ArrowDownWideNarrow, Copy, FileSearch, LoaderCircle, RefreshCw, Search, Settings, X } from '@lucide/vue';
 import { PAGE_SIZES } from './audit.js';
-import { useTimeZone } from './state/time-zone.js';
 import { useAudits } from './state/audits.js';
+import { useDateRange } from './state/date-range.js';
 import AuditDetail from './components/AuditDetail.vue';
 import HighlightedText from './components/HighlightedText.vue';
+import AuditSettings from './components/AuditSettings.vue';
+import DateRangeFilter from './components/DateRangeFilter.vue';
 
 const props = defineProps({ viewContext: { type: Object, required: true } });
 const initial = { from: props.viewContext.today, to: props.viewContext.today, key: '', q: '', size: 50 };
 const client = inject('auditClient');
 const store = useAudits(client, initial);
-const { draft: timeZoneDraft, saved: savedTimeZone, state: timeZoneState, fillBrowser, save: saveTimeZone } = useTimeZone(client, props.viewContext.timeZone);
+const settingsOpen = ref(false);
+const datePickerOpen = ref(false);
+const dateRange = useDateRange(client, props.viewContext);
+const { selection: selectedRange, context: dateContext, state: dateState } = dateRange;
+let appliedRange = selectedRange.value;
 const listTimeZone = computed(() => list.value.kind === 'ready' ? list.value.data.timeZone : '');
 const { query, list, detail: detailState, keyDirectory, selectedId, pageIndex, items, canPrevious, canNext } = store;
 const filters = reactive({ from: initial.from, to: initial.to, key: initial.key, q: initial.q });
@@ -40,15 +46,21 @@ async function resetScroll() {
   await nextTick();
   recordsPanel.value?.querySelector('table')?.scrollIntoView({ block: 'start', inline: 'nearest' });
 }
-async function applyFilters() {
-  if (filters.from && filters.to && filters.from > filters.to) { filterError.value = '起始日期不能晚于结束日期。'; return; }
-  if (Array.from(filters.q.trim()).length > 200) { filterError.value = '关键词最多 200 个字符。'; return; }
-  filterError.value = ''; filters.q = filters.q.trim();
-  const loading = store.search(filters);
+async function applyFilters(range = selectedRange.value, values = filters, size = Number(query.limit)) {
+  const submitted = { ...values };
+  if (Array.from(submitted.q.trim()).length > 200) { filterError.value = '关键词最多 200 个字符。'; return; }
+  filterError.value = ''; submitted.q = submitted.q.trim();
+  if (values === filters) filters.q = submitted.q;
+  const resolved = await dateRange.resolve(range);
+  if (!resolved) return;
+  appliedRange = resolved;
+  Object.assign(submitted, { from: resolved.from, to: resolved.to });
+  Object.assign(filters, { from: resolved.from, to: resolved.to });
+  const loading = store.search(submitted, size);
   await loading; resetScroll();
 }
-async function refreshList() { await store.search(query); resetScroll(); }
-function resetFilters() { Object.assign(filters, { from: '', to: '', key: '', q: '' }); applyFilters(); }
+async function refreshList() { await applyFilters(appliedRange, query); }
+function resetFilters() { Object.assign(filters, { key: '', q: '' }); applyFilters({ kind: 'all' }); }
 async function selectRecord(id) {
   store.select(id);
   await nextTick(); detail.value?.focus({ preventScroll: true });
@@ -64,7 +76,7 @@ async function moveRecord(step) {
   recordsPanel.value?.querySelector(`[data-audit="${CSS.escape(selectedId.value)}"]`)?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
 }
 async function changePage(step) { await store.page(step); resetScroll(); }
-async function changeSize(size) { await store.search(query, Number(size)); resetScroll(); }
+async function changeSize(size) { await applyFilters(appliedRange, query, Number(size)); }
 function rowClick(event) {
   const button = event.target.closest('tbody tr')?.querySelector('[data-audit]');
   if (button && !event.target.closest('button')) selectRecord(button.dataset.audit);
@@ -83,6 +95,7 @@ async function copyReference() {
   }
 }
 function onKeydown(event) {
+  if (settingsOpen.value || datePickerOpen.value) return;
   if (event.defaultPrevented || event.ctrlKey || event.altKey || event.metaKey || event.isComposing) return;
   if (event.target.closest('input, select, textarea, [contenteditable="true"], [role="combobox"], [role="listbox"]')) return;
   if (event.key === '/') { event.preventDefault(); document.getElementById('query')?.focus(); }
@@ -104,29 +117,20 @@ onUnmounted(() => {
   <div class="audit-app">
     <header class="topbar">
       <div class="brand"><span class="brand-icon"><FileSearch :size="19" /></span><span>Codex Proxy</span><span class="brand-divider">/</span><h1>Prompt 审计</h1></div>
+      <BaseButton size="sm" variant="secondary" aria-haspopup="dialog" :aria-expanded="settingsOpen" @click="settingsOpen = true"><Settings :size="15" />设置</BaseButton>
     </header>
     <main>
-      <div class="timezone-settings" aria-label="审计时区设置">
-        <label for="time-zone">审计时区</label>
-        <BaseInput id="time-zone" class="timezone-input" v-model="timeZoneDraft" size="sm" aria-label="审计时区" placeholder="UTC" autocomplete="off" :maxlength="128" />
-        <BaseButton size="sm" variant="secondary" @click="fillBrowser">使用浏览器时区</BaseButton>
-        <BaseButton size="sm" :disabled="timeZoneState.kind === 'saving'" @click="saveTimeZone">{{ timeZoneState.kind === 'saving' ? '保存中…' : '保存' }}</BaseButton>
-        <span class="timezone-saved" role="status">已保存：{{ savedTimeZone }}<template v-if="timeZoneState.kind === 'saved'"> · 保存成功</template></span>
-        <p v-if="timeZoneState.kind === 'error'" class="filter-error" role="alert">{{ timeZoneState.error.message }}</p>
-      </div>
       <div class="filters" role="search" aria-label="筛选审计记录">
-        <BaseInput id="query" v-model="filters.q" class="search-field" size="sm" type="search" aria-label="搜索用户输入正文" placeholder="搜索用户输入正文…" autocomplete="off" :maxlength="400" @keydown.enter.prevent="applyFilters">
+        <BaseInput id="query" v-model="filters.q" class="search-field" size="sm" type="search" aria-label="搜索用户输入正文" placeholder="搜索用户输入正文…" autocomplete="off" :maxlength="400" @keydown.enter.prevent="applyFilters()">
           <template #prefix><Search :size="16" /></template><template #suffix><kbd>/</kbd></template>
         </BaseInput>
-        <div class="date-range">
-          <BaseInput id="date-from" v-model="filters.from" type="date" size="sm" aria-label="起始日期" @keydown.enter.prevent="applyFilters" /><span>—</span>
-          <BaseInput id="date-to" v-model="filters.to" type="date" size="sm" aria-label="结束日期" @keydown.enter.prevent="applyFilters" />
-        </div>
+        <DateRangeFilter v-model:open="datePickerOpen" :range="selectedRange" :today="dateContext.today" :time-zone="dateContext.timeZone" :loading="dateState.kind === 'loading'" @apply="applyFilters" />
         <BaseSelect v-model="filters.key" class="key-filter" size="sm" :options="keyOptions" :loading="keyDirectory.kind === 'loading'" :disabled="keyDirectory.kind === 'loading'" filterable aria-label="Client Key" />
-        <BaseButton variant="primary" size="sm" @click="applyFilters">检索</BaseButton>
+        <BaseButton variant="primary" size="sm" @click="applyFilters()">检索</BaseButton>
         <BaseButton variant="ghost" size="sm" @click="resetFilters">重置</BaseButton>
         <p v-if="keyDirectory.kind === 'error'" class="filter-error" role="alert">{{ keyDirectory.error.message }} <BaseButton size="sm" variant="ghost" @click="store.loadKeys">重试 Key 列表</BaseButton></p>
         <p v-if="filterError" class="filter-error" role="alert">{{ filterError }}</p>
+        <p v-if="dateState.kind === 'error'" class="filter-error" role="alert">{{ dateState.error.message }} 请重新选择时间范围或点击检索。</p>
       </div>
       <div class="results-heading">
         <div class="results-summary"><h2>用户输入</h2><span id="result-count" class="count" role="status">{{ total }} 条</span><span v-if="query.q" class="active-filter">正文包含“{{ query.q }}”</span></div>
@@ -164,6 +168,7 @@ onUnmounted(() => {
       </div>
       <footer class="page-footer"><span>每行一条用户输入 · 重复请求不另算发言</span><span><kbd>↑</kbd><kbd>↓</kbd> 连续审阅 <kbd>Esc</kbd> 关闭详情</span></footer>
     </main>
+    <AuditSettings v-model="settingsOpen" :time-zone="props.viewContext.timeZone" @time-zone-saved="dateContext = { ...dateContext, timeZone: $event }" />
     <BaseToast />
   </div>
 </template>

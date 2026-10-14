@@ -2,12 +2,13 @@
 //! 每项测试使用独立的临时数据库文件
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use codex_proxy_audit::{
-    collection::{AuditDraft, RequestObservation, collect},
+    collection::{AuditDraft, RequestObservation, collect, exclusions::ExclusionPolicy},
     keys::CurrentKeys,
     query::QueryService,
     runtime::Retention,
@@ -78,6 +79,7 @@ fn observation(key: &str, thread: &str, input: Value) -> RequestObservation {
         request_id: Uuid::new_v4().to_string(),
         body: json!({"client_metadata":{"thread_id":thread},"input":input}),
         headers: BTreeMap::new(),
+        user_agents: Vec::new(),
         observed_at: DateTime::parse_from_rfc3339("2026-10-09T03:59:59.123456Z")
             .unwrap()
             .with_timezone(&Utc),
@@ -90,7 +92,9 @@ fn user(id: &str, text: &str) -> Value {
 }
 
 fn draft(observation: &RequestObservation) -> AuditDraft {
-    collect(observation).expect("fixture ends with a collectable user message")
+    static POLICY: OnceLock<ExclusionPolicy> = OnceLock::new();
+    collect(observation, POLICY.get_or_init(ExclusionPolicy::default))
+        .expect("fixture ends with a collectable user message")
 }
 
 async fn persist(store: &Store, observation: &RequestObservation) -> Result<()> {

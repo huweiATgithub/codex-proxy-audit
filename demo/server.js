@@ -44,9 +44,10 @@ const server = createServer(async (request, response) => {
   };
   if (url.pathname.startsWith('/__demo/')) {
     const chunks = []; let length = 0;
+    const bodyLimit = url.pathname === '/__demo/api/exclusions' ? 256 * 1024 : 8192;
     for await (const chunk of request) {
       length += chunk.length;
-      if (length > 8192) return send(400, 'application/json', JSON.stringify({ error: { code: 'invalid_query', message: '请求正文过长。' } }));
+      if (length > bodyLimit) return send(400, 'application/json', JSON.stringify({ error: { code: url.pathname === '/__demo/api/exclusions' ? 'invalid_exclusions' : 'invalid_query', message: '请求正文过长。' } }));
       chunks.push(chunk);
     }
     const result = handle(url.pathname.slice('/__demo/'.length), url.searchParams, request.method, Buffer.concat(chunks));

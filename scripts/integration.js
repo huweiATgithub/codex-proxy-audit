@@ -7,7 +7,7 @@ import { resolve, join } from 'node:path';
 import { once } from 'node:events';
 import { DatabaseSync } from 'node:sqlite';
 import { chromium } from '@playwright/test';
-import { endpoints, errorResponse, MAX_RESPONSE_BYTES } from '../contracts/audit.js';
+import { endpoints, errorResponse, MAX_RESPONSE_BYTES, MAX_EXCLUSION_PATTERNS, MAX_EXCLUSION_PATTERN_BYTES } from '../contracts/audit.js';
 import { startUpstream, connectWebSocket } from '../tests/integration/upstream.js';
 
 // This harness creates its own database/services and installs the actual plugin
@@ -101,8 +101,8 @@ async function management(endpoint, values = {}, expected = 200) {
 }
 const metadata = (thread, extra = {}) => ({ 'x-codex-turn-metadata': JSON.stringify({ thread_id: thread, session_id: `session-${thread}`, thread_source: 'user', workspaces: { '/workspace/integration': { associated_remote_urls: { origin: 'https://test-user:test-password@example.invalid/repo.git' } } }, ...extra }) });
 const message = (id, text, turn = 'same-turn', kinds = ['user.text']) => ({ id, type: 'message', role: 'user', content: [{ type: 'input_text', text }], internal_chat_message_metadata_passthrough: { turn_id: turn, content_item_kinds: kinds } });
-async function requestModel(key, input, thread, { stream = false, extra = {}, purpose = {}, expectedStatus = 200, timeoutMs = 20000 } = {}) {
-  const response = await fetch(base + '/v1/responses', { method: 'POST', headers: { authorization: `Bearer ${key.plaintextKey}`, 'content-type': 'application/json', 'user-agent': 'codex-audit-integration/1.0' }, body: JSON.stringify({ model: 'gpt-5.4', store: false, stream, reasoning: { effort: 'low' }, input, client_metadata: metadata(thread, purpose), ...extra }), signal: AbortSignal.timeout(timeoutMs) });
+async function requestModel(key, input, thread, { stream = false, extra = {}, purpose = {}, expectedStatus = 200, timeoutMs = 20000, userAgent = 'codex-audit-integration/1.0' } = {}) {
+  const response = await fetch(base + '/v1/responses', { method: 'POST', headers: { authorization: `Bearer ${key.plaintextKey}`, 'content-type': 'application/json', 'user-agent': userAgent }, body: JSON.stringify({ model: 'gpt-5.4', store: false, stream, reasoning: { effort: 'low' }, input, client_metadata: metadata(thread, purpose), ...extra }), signal: AbortSignal.timeout(timeoutMs) });
   const text = await response.text(); assert.equal(response.status, expectedStatus, text);
   if (expectedStatus !== 200) return JSON.parse(text);
   if (!stream) return JSON.parse(text);
@@ -111,6 +111,20 @@ async function requestModel(key, input, thread, { stream = false, extra = {}, pu
 }
 async function listCount(q, count, key) {
   return until(async () => { const page = await management('audits', { q, ...(key ? { key: key.id } : {}) }); assert.equal(page.total, count); return page; }, `audit count ${q}=${count}`);
+}
+function assertForwardedInput(input) {
+  const text = input.at(-1).content.find((part) => part.type === 'input_text').text;
+  const observed = upstream.requests.findLast((body) => body.input?.some((item) => item.content?.some((part) => part.text === text)));
+  assert.ok(observed, `upstream receives ${text}`);
+  // The host creates its provider request after plugin middleware. Check the
+  // input carried to the provider without equating host-owned headers/body.
+  const content = (items) => items.map(({ role, content }) => ({ role, content }));
+  assert.deepEqual(content(observed.input), content(input));
+}
+async function assertExcluded(marker) {
+  await listCount(marker, 0);
+  assert.equal(auditValue('SELECT count(*) FROM audits WHERE instr(input_text, ?) > 0', marker), 0);
+  assert.equal(auditValue('SELECT count(*) FROM contents WHERE instr(blocks, ?) > 0', marker), 0, 'excluded request stores neither input nor context');
 }
 async function withAuditWriteLock(action) {
   auditDatabase.exec('BEGIN IMMEDIATE');
@@ -185,6 +199,56 @@ async function run() {
     assert.equal((await management('viewContext')).timeZone, 'America/New_York');
   }
   report('administrator-only strict timezone save preserves setting on invalid input');
+  const exclusions = { userAgentPatterns: ['(?i)^audit-excluded/', '^case-sensitive/', 'probe-agent'] };
+  assert.deepEqual(await management('exclusions'), { userAgentPatterns: [] });
+  const exclusionsPath = `/api/admin/plugins/extensions/${view.target.instanceId}/${view.target.artifactSha256}/${view.target.revision}/api/api/exclusions`;
+  for (const headers of [{}, { authorization: `Bearer ${key.plaintextKey}` }]) {
+    for (const method of ['GET', 'PUT']) {
+      const denied = await fetch(base + exclusionsPath, { method, headers: { ...headers, ...(method === 'PUT' ? { 'content-type': 'application/json' } : {}) }, ...(method === 'PUT' ? { body: JSON.stringify(exclusions) } : {}) });
+      assert.ok([401, 403].includes(denied.status), 'exclusion settings require administrator session');
+    }
+  }
+  assert.deepEqual(await management('saveExclusions', exclusions), exclusions);
+  assert.deepEqual(await management('exclusions'), exclusions);
+  for (const settings of [
+    { userAgentPatterns: ['(?i)^audit-excluded/', '('] },
+    { userAgentPatterns: ['(?=unsupported-lookaround)'] },
+    { userAgentPatterns: Array(MAX_EXCLUSION_PATTERNS + 1).fill('valid') },
+    { userAgentPatterns: ['a'.repeat(MAX_EXCLUSION_PATTERN_BYTES + 1)] },
+    { userAgentPatterns: ['汉'.repeat(Math.floor(MAX_EXCLUSION_PATTERN_BYTES / 3) + 1)] },
+    { userAgentPatterns: [''] }, { userAgentPatterns: ['   '] },
+    { userAgentPatterns: [null] }, { userAgentPatterns: null },
+    { userAgentPatterns: [], extra: true }, {},
+  ]) {
+    const rejected = await management('saveExclusions', settings, 400);
+    assert.equal(rejected.error.code, 'invalid_exclusions');
+    if (settings.userAgentPatterns?.[1] === '(') assert.equal(rejected.error.patternIndex, 1);
+    assert.deepEqual(await management('exclusions'), exclusions, 'invalid saves retain the active saved settings');
+  }
+  report('plugin-owned administrator exclusions default empty and reject invalid Rust regexes, shapes and resource limits');
+  const excludedContext = { role: 'assistant', content: [{ type: 'output_text', text: 'INTEGRATION-excluded-http prior context' }] };
+  for (const [label, stream, userAgent] of [['json', false, 'AuDiT-Excluded/1.0'], ['sse', true, 'custom/probe-agent/1.0']]) {
+    const input = [excludedContext, message(`integration-excluded-http-${label}`, `INTEGRATION-excluded-http ${label}`)];
+    assert.equal((await requestModel(key, input, `thread-excluded-http-${label}`, { stream, userAgent })).status, 'completed');
+    assertForwardedInput(input);
+  }
+  for (const [label, stream, userAgent] of [['json', false, 'prefix-audit-excluded/1.0'], ['sse', true, 'Case-Sensitive/1.0']]) {
+    const input = [message(`integration-included-http-${label}`, `INTEGRATION-included-http ${label}`)];
+    assert.equal((await requestModel(key, input, `thread-included-http-${label}`, { stream, userAgent })).status, 'completed');
+    assertForwardedInput(input);
+    await listCount(`INTEGRATION-included-http ${label}`, 1);
+  }
+  // A subsequent eligible capture confirms the writer has processed the
+  // requests preceding it before checking that excluded bodies are absent.
+  await assertExcluded('INTEGRATION-excluded-http');
+  assert.deepEqual(await management('saveExclusions', { userAgentPatterns: [] }), { userAgentPatterns: [] });
+  const clearedInput = [message('integration-exclusions-cleared', 'INTEGRATION-exclusions-cleared capture resumes')];
+  await requestModel(key, clearedInput, 'thread-exclusions-cleared', { userAgent: 'AUDIT-EXCLUDED/1.0' });
+  assertForwardedInput(clearedInput);
+  await listCount('INTEGRATION-exclusions-cleared', 1);
+  await management('saveExclusions', exclusions);
+  assert.deepEqual((await json('/api/admin/plugins/instances')).find((item) => item.id === instanceId).configuration, {});
+  report('live Rust regex exclusions skip HTTP JSON/SSE audit bodies and context while requests complete; clearing restores capture');
   const first = message('integration-input-1', 'INTEGRATION-first 请拟定数据库迁移方案。😀');
   const response1 = await requestModel(key, [first], 'thread-http');
   assert.ok(auditRows('PRAGMA table_info(audits)').every((column) => !['key_name', 'key_name_observed_at'].includes(column.name)));
@@ -304,7 +368,7 @@ async function run() {
   // HTTP-only test account intentionally cannot satisfy that transport policy.
   await json('/api/admin/accounts/import', { provider: 'openai', data: { provider: 'openai', authentication_kind: 'api_key', name: 'Integration WebSocket upstream', base_url: `${upstream.url}/v1`, api_key: 'sk-integration-websocket-only', transport: 'prefer_websocket' } }, 201);
   const ws = await connectWebSocket(base.replace('http:', 'ws:') + '/v1/responses', { authorization: `Bearer ${key.plaintextKey}`, 'user-agent': 'codex-audit-integration/ws' });
-  const wsCall = async (input, extra = {}) => { ws.send({ type: 'response.create', model: 'gpt-5.4', input, client_metadata: metadata('thread-ws'), store: false, ...extra }); for (;;) { const event = await ws.receive(); assert.notEqual(event.type, 'error', JSON.stringify(event)); if (event.type === 'response.completed') return event.response; } };
+  const wsCall = async (input, extra = {}, connection = ws) => { connection.send({ type: 'response.create', model: 'gpt-5.4', input, client_metadata: metadata('thread-ws'), store: false, ...extra }); for (;;) { const event = await connection.receive(); assert.notEqual(event.type, 'error', JSON.stringify(event)); if (event.type === 'response.completed') return event.response; } };
   const warmup = await wsCall([message('integration-warmup', 'INTEGRATION-warmup input')], { generate: false }); await listCount('INTEGRATION-warmup', 1);
   const generated = await wsCall([], { previous_response_id: warmup.id });
   await wsCall([message('integration-ws-next', 'INTEGRATION-ws-next incremental')], { previous_response_id: generated.id });
@@ -312,8 +376,30 @@ async function run() {
   await wsCall([message('integration-ws-recap-system', recapText + '-ws')], { client_metadata: metadata('thread-ws-recap-system', { thread_source: 'system', request_kind: 'turn' }) });
   await wsCall([message('integration-ws-recap-user', recapText + '-ws')]);
   const wsQuotedRecap = await listCount('INTEGRATION-recap-ws', 1);
-  assert.equal((await management('audit', { id: wsQuotedRecap.items[0].id })).threadId, 'thread-ws'); ws.close();
+  assert.equal((await management('audit', { id: wsQuotedRecap.items[0].id })).threadId, 'thread-ws');
   report('WebSocket recap filtering uses the current response.create source and preserves genuine user input');
+  const excludedWs = await connectWebSocket(base.replace('http:', 'ws:') + '/v1/responses', { authorization: `Bearer ${key.plaintextKey}`, 'user-agent': 'AUDIT-EXCLUDED/ws' });
+  const excludedWsContext = { role: 'assistant', content: [{ type: 'output_text', text: 'INTEGRATION-excluded-ws prior context' }] };
+  const excludedWsInput = [excludedWsContext, message('integration-excluded-ws-first', 'INTEGRATION-excluded-ws first')];
+  assert.equal((await wsCall(excludedWsInput, {}, excludedWs)).status, 'completed');
+  assertForwardedInput(excludedWsInput);
+  await management('saveExclusions', { userAgentPatterns: [] });
+  const clearedWsInput = [message('integration-exclusions-cleared-ws', 'INTEGRATION-exclusions-cleared-ws same connection')];
+  assert.equal((await wsCall(clearedWsInput, {}, excludedWs)).status, 'completed');
+  assertForwardedInput(clearedWsInput);
+  await listCount('INTEGRATION-exclusions-cleared-ws', 1);
+  await assertExcluded('INTEGRATION-excluded-ws');
+  await management('saveExclusions', exclusions);
+  const excludedWsAgain = [message('integration-excluded-ws-again', 'INTEGRATION-excluded-ws after live save')];
+  assert.equal((await wsCall(excludedWsAgain, {}, excludedWs)).status, 'completed');
+  assertForwardedInput(excludedWsAgain);
+  const includedWsInput = [message('integration-included-ws', 'INTEGRATION-included-ws nonmatching handshake')];
+  assert.equal((await wsCall(includedWsInput)).status, 'completed');
+  assertForwardedInput(includedWsInput);
+  await listCount('INTEGRATION-included-ws', 1);
+  await assertExcluded('INTEGRATION-excluded-ws');
+  excludedWs.close(); ws.close();
+  report('WebSocket handshake UA excludes storage while forwarding continues; live settings apply to each response.create on an open connection');
   const long = 'INTEGRATION-unicode ' + '😀é汉'.repeat(900);
   await requestModel(key, [message('integration-unicode', long)], 'thread-unicode');
   const longItems = await listCount('INTEGRATION-unicode', 1), longDetail = await management('audit', { id: longItems.items[0].id }); assert.equal(await textContent(longDetail.id, longDetail.input), long); report('Unicode code point counts and contiguous lazy content segments');
@@ -386,7 +472,7 @@ async function run() {
   for (let index = 0; index < cursorKeys.length; index += 10) await Promise.all(cursorKeys.slice(index, index + 10).map((key) => json('/api/admin/client-keys/delete', { id: key.id })));
   report('timezone-bound list/content/Key cursors and unchanged facts, bodies and signing secret');
   const directory = await management('keys'); assert.ok(directory.items.some((item) => item.id === key.id && item.name === 'Integration primary'));
-  const all = await management('audits'); assert.equal(auditValue('SELECT count(*) FROM audits'), all.total); assert.ok(upstream.requests.length > 0); report('six contracted management GET routes and real persisted records');
+  const all = await management('audits'); assert.equal(auditValue('SELECT count(*) FROM audits'), all.total); assert.ok(upstream.requests.length > 0); report('contracted management GET routes and real persisted records');
   const foreignRequest = (await management('audit', { id: deletedAudit.id })).requestId;
   auditExecute('UPDATE audits SET request_id=? WHERE id=?', foreignRequest, continuation.id);
   assert.equal((await management('requestMetadata', { id: continuation.id }, 503)).error.code, 'unavailable');
@@ -419,9 +505,16 @@ async function run() {
   assert.equal(auditValue('SELECT count(*) FROM contents WHERE audit_id=?', expired.id), 0);
   report('startup retention removes expired input and context while retaining recent audits');
   assert.equal((await management('viewContext')).timeZone, 'America/New_York');
+  assert.deepEqual(await management('exclusions'), exclusions);
+  const excludedAfterRestart = [message('integration-excluded-restart', 'INTEGRATION-excluded-restart persisted regex')];
+  assert.equal((await requestModel(key, excludedAfterRestart, 'thread-excluded-restart', { userAgent: 'AUDIT-EXCLUDED/after-restart' })).status, 'completed');
+  assertForwardedInput(excludedAfterRestart);
+  await assertExcluded('INTEGRATION-excluded-restart');
   assert.equal(auditSnapshot(), factsBefore);
   assert.equal(signingSecret(), secretBefore);
   await requestModel(key, [first], 'thread-http'); await listCount('INTEGRATION-first', 6); report('host/plugin restart and package re-extraction preserve private SQLite history and settings');
+  await assertExcluded('INTEGRATION-excluded-restart');
+  report('plugin restart reloads the saved compiled exclusion policy and preserves normal forwarding');
   const currentKeys = await management('keys');
   assert.equal(currentKeys.items.find((item) => item.id === key.id).name, 'Integration renamed');
   assert.ok(!currentKeys.items.some((item) => item.id === otherKey.id));
@@ -436,6 +529,28 @@ async function run() {
   const ui = page.frameLocator('iframe');
   await ui.locator('#result-count').waitFor({ timeout: 30000 });
   assert.deepEqual(await ui.locator('thead th').allTextContents(), ['记录时间', 'Client Key', '用户输入']);
+  const currentDates = await management('viewContext');
+  const recentStart = new Date(`${currentDates.today}T12:00:00Z`);
+  recentStart.setUTCDate(recentStart.getUTCDate() - 2);
+  const dateControls = ui.getByRole('group', { name: '时间范围', exact: true });
+  const recentQuery = page.waitForResponse((response) => new URL(response.url()).pathname.endsWith('/api/api/audits'));
+  await dateControls.getByRole('button', { name: '最近三天', exact: true }).click();
+  const recentParams = new URL((await recentQuery).url()).searchParams;
+  assert.equal(recentParams.get('from'), recentStart.toISOString().slice(0, 10));
+  assert.equal(recentParams.get('to'), currentDates.today);
+  assert.equal(await dateControls.locator('[aria-pressed="true"]').count(), 1);
+  await dateControls.getByRole('button', { name: '自定义', exact: true }).click();
+  const dateDialog = ui.getByRole('dialog', { name: '自定义时间范围', exact: true });
+  assert.equal(await dateDialog.locator('#date-from').inputValue(), recentParams.get('from'));
+  assert.equal(await dateDialog.locator('#date-to').inputValue(), currentDates.today);
+  await page.screenshot({ path: join(temporary, 'real-host-date-range.png'), fullPage: true, animations: 'disabled' });
+  await dateDialog.getByRole('button', { name: '取消', exact: true }).click();
+  const todayQuery = page.waitForResponse((response) => new URL(response.url()).pathname.endsWith('/api/api/audits'));
+  await dateControls.getByRole('button', { name: '今天', exact: true }).click();
+  const todayParams = new URL((await todayQuery).url()).searchParams;
+  assert.equal(todayParams.get('from'), currentDates.today);
+  assert.equal(todayParams.get('to'), currentDates.today);
+  report('real host UI resolves grouped date presets from server time and opens a single range calendar');
   await ui.getByRole('combobox', { name: 'Client Key', exact: true }).click();
   await ui.getByRole('option').filter({ hasText: 'Integration renamed' }).click();
   await ui.getByRole('searchbox').fill('INTEGRATION-continue'); await ui.getByRole('button', { name: '检索', exact: true }).click();
@@ -460,18 +575,20 @@ async function run() {
   assert.equal(await page.locator('iframe').getAttribute('src'), null, 'host owns srcdoc assembly');
   assert.ok(requested.some((url) => url.includes('/api/api/audit-content')), 'actual host page bridge called backend content endpoint');
   assert.ok(!requested.some((url) => url.includes('__demo')), 'Demo service never used'); assert.deepEqual(errors, []);
-  const dates = [await ui.locator('#date-from').inputValue(), await ui.locator('#date-to').inputValue()];
+  const dates = await ui.locator('.range-caption').textContent();
   const rowTime = await ui.locator('tbody time').first().textContent();
   const beforeSaveRequests = requested.filter((url) => /\/api\/api\/(audits|audit|audit-content|keys|view-context)(?:\?|$)/.test(url)).length;
+  await ui.getByRole('button', { name: '设置', exact: true }).click();
   await ui.locator('#time-zone').fill('Asia/Kathmandu');
   await ui.getByRole('button', { name: '保存', exact: true }).click();
   await until(async () => { assert.ok((await ui.locator('.timezone-saved').textContent()).includes('Asia/Kathmandu')); }, 'real iframe saves timezone through PUT bridge');
   assert.equal(requested.filter((url) => /\/api\/api\/(audits|audit|audit-content|keys|view-context)(?:\?|$)/.test(url)).length, beforeSaveRequests);
-  assert.deepEqual([await ui.locator('#date-from').inputValue(), await ui.locator('#date-to').inputValue()], dates);
+  assert.equal(await ui.locator('.range-caption').textContent(), dates);
   assert.equal(await ui.locator('tbody time').first().textContent(), rowTime);
   assert.ok((await ui.locator('.timezone').textContent()).includes('America/New_York'));
   assert.ok((await ui.locator('.metadata time').textContent()).includes('America/New_York'));
-  await page.screenshot({ path: join(temporary, 'real-host-independent-save.png'), fullPage: true });
+  await page.screenshot({ path: join(temporary, 'real-host-independent-save.png'), fullPage: true, animations: 'disabled' });
+  await ui.getByRole('dialog', { name: '设置', exact: true }).getByRole('button', { name: '关闭', exact: true }).click();
   await ui.getByRole('button', { name: '刷新列表' }).click();
   await until(async () => { assert.ok((await ui.locator('.timezone').textContent()).includes('Asia/Kathmandu')); }, 'manual refresh uses saved timezone');
   await ui.locator(`[data-audit="${continuation.id}"]`).click();
@@ -480,7 +597,30 @@ async function run() {
   await until(async () => { assert.ok((await ui.locator('.context-section').textContent()).includes('Agent 方案：先检查数据库')); }, 'refreshed detail finishes reading context');
   assert.deepEqual(errors, []);
   report('authenticated page saves independently, retains date filters and labels each response');
-  await page.screenshot({ path: join(temporary, 'real-host-ui.png'), fullPage: true }); await browser.close(); browser = null;
+  await ui.getByRole('button', { name: '设置', exact: true }).click();
+  const exclusionEditor = ui.locator('.exclusion-settings');
+  await until(async () => { assert.ok((await exclusionEditor.locator('.exclusion-status').textContent()).includes('已保存：3 条')); }, 'real iframe loads persisted exclusions');
+  const beforeExclusionSaveRequests = requested.filter((url) => /\/api\/api\/(audits|audit|audit-content|keys|view-context)(?:\?|$)/.test(url)).length;
+  const beforeExclusionSaveFacts = auditSnapshot();
+  const beforeExclusionSaveDates = await ui.locator('.range-caption').textContent();
+  await ui.getByRole('textbox', { name: 'UA 正则 1', exact: true }).fill('(');
+  await ui.getByRole('button', { name: '保存排除规则', exact: true }).click();
+  await until(async () => { assert.equal(await ui.getByRole('textbox', { name: 'UA 正则 1', exact: true }).getAttribute('aria-invalid'), 'true'); }, 'real iframe identifies invalid Rust regex row');
+  assert.deepEqual(await management('exclusions'), exclusions);
+  await ui.getByRole('textbox', { name: 'UA 正则 1', exact: true }).fill('^ui-audit-excluded/');
+  await ui.getByRole('button', { name: '保存排除规则', exact: true }).click();
+  await until(async () => { assert.deepEqual(await management('exclusions'), { userAgentPatterns: ['^ui-audit-excluded/', ...exclusions.userAgentPatterns.slice(1)] }); }, 'real iframe saves exclusions through PUT bridge');
+  for (let index = 0; index < exclusions.userAgentPatterns.length; index++) await ui.getByRole('button', { name: '移除规则 1', exact: true }).click();
+  await ui.getByRole('button', { name: '保存排除规则', exact: true }).click();
+  await until(async () => { assert.deepEqual(await management('exclusions'), { userAgentPatterns: [] }); }, 'real iframe clears exclusion rules');
+  assert.equal(requested.filter((url) => /\/api\/api\/(audits|audit|audit-content|keys|view-context)(?:\?|$)/.test(url)).length, beforeExclusionSaveRequests);
+  assert.equal(await ui.locator('.range-caption').textContent(), beforeExclusionSaveDates);
+  assert.equal(auditSnapshot(), beforeExclusionSaveFacts);
+  assert.deepEqual(errors, []);
+  report('real authenticated iframe shows Rust regex row errors and saves or clears exclusions independently of audits');
+  await page.screenshot({ path: join(temporary, 'real-host-settings.png'), fullPage: true, animations: 'disabled' });
+  await ui.getByRole('dialog', { name: '设置', exact: true }).getByRole('button', { name: '关闭', exact: true }).click();
+  await page.screenshot({ path: join(temporary, 'real-host-ui.png'), fullPage: true, animations: 'disabled' }); await browser.close(); browser = null;
   report('existing built UI through real authenticated host bridge and sandbox iframe');
   if (options['rust-tests']) {
     await stopHost();
@@ -489,7 +629,7 @@ async function run() {
     report('isolated SQLite Rust storage and audit query tests');
     if (options.keep) await startHost();
   }
-  writeFileSync(join(temporary, 'result.json'), JSON.stringify({ hostUrl: `http://0.0.0.0:${hostPort}`, pageUrl: `${base}/plugins/${instanceId}/${view.pages[0].id}`, reports, screenshot: join(temporary, 'real-host-ui.png'), independentSaveScreenshot: join(temporary, 'real-host-independent-save.png'), hostCommit: options['host-commit'] || null, hostBinarySha256: createHash('sha256').update(readFileSync(resolve(options['host-binary']))).digest('hex'), packageSha256: sha }, null, 2));
+  writeFileSync(join(temporary, 'result.json'), JSON.stringify({ hostUrl: `http://0.0.0.0:${hostPort}`, pageUrl: `${base}/plugins/${instanceId}/${view.pages[0].id}`, reports, screenshot: join(temporary, 'real-host-ui.png'), independentSaveScreenshot: join(temporary, 'real-host-independent-save.png'), settingsScreenshot: join(temporary, 'real-host-settings.png'), dateRangeScreenshot: join(temporary, 'real-host-date-range.png'), hostCommit: options['host-commit'] || null, hostBinarySha256: createHash('sha256').update(readFileSync(resolve(options['host-binary']))).digest('hex'), packageSha256: sha }, null, 2));
   console.log(`Evidence: ${temporary}`);
   if (options.keep) {
     console.log(`Remote review: http://<this-machine>:${hostPort}/plugins/${instanceId}/${view.pages[0].id}`);

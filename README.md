@@ -6,13 +6,15 @@ Codex Proxy RS 的 Prompt 审计插件：按 Client Key 记录经过网关的用
 
 审计元数据保留 thread/session ID、消息级 turn ID、逐块输入类型及来源请求报告的仓库根路径、remote URLs。UA、请求模型与 reasoning effort 仅在管理员点击“加载请求信息”后，通过来源请求 ID 和 Key ID 查询宿主已有记录，不重复存入审计数据库；打开详情和读取正文不查询这三项。宿主请求记录清理后这三项不可用，输入和前序对话按审计自身的 72 小时保留期清理。详情优先展示用户输入和前序对话，“记录信息”在其后默认显示，Client Key 与其他元数据同级排列；请求信息独立显示加载、失败及重试状态，不影响正文阅读。外层表格保持记录时间、Client Key 与用户输入三列。具体取值和排除范围见采集行为，宿主查询接口与边界见总体设计 §4。
 
-本仓库包含 [Rust 插件后端](backend/)、[前后端查询契约](contracts/openapi.json)和按契约读取数据的 [UI](frontend/)。后端在 request 阶段检查最后一个输入项，仅为可采集的用户消息提交审计任务；前序对话只取本次请求自带的内容。任务进入固定容量、满时覆盖最旧任务的环形缓冲区，由 worker 异步写入 SQLite，不等待写入确认。重复请求分别记录，后续失败或取消的请求也可能留下记录，尚未落库的任务可能丢失。后端自管数据库初始化、六个管理 GET 接口与时区设置 PUT 接口。UI 支持高密度表格、用户输入正文关键词与时间、Key 组合筛选、游标分页及按需读取的详情和前序对话。[Demo](demo/)默认提供 500 条虚构输入，也可加载脱敏 Session 样本，供独立审阅页面；模拟服务不承担真实后端验收。
+本仓库包含 [Rust 插件后端](backend/)、[前后端查询契约](contracts/openapi.json)和按契约读取数据的 [UI](frontend/)。后端在 request 阶段检查最后一个输入项，仅为可采集的用户消息提交审计任务；前序对话只取本次请求自带的内容。任务进入固定容量、满时覆盖最旧任务的环形缓冲区，由 worker 异步写入 SQLite，不等待写入确认。重复请求分别记录，后续失败或取消的请求也可能留下记录，尚未落库的任务可能丢失。后端自管数据库初始化、管理查询及共享时区与 UA 排除设置接口。UI 支持高密度表格、用户输入正文关键词与时间、Key 组合筛选、游标分页及按需读取的详情和前序对话。[Demo](demo/)默认提供 500 条虚构输入，也可加载脱敏 Session 样本，供独立审阅页面；模拟服务不承担真实后端验收。
+
+管理员可打开审计页右上角的“设置”，在“排除规则”分区编辑“UA 排除规则”，按行填写 [Rust regex](https://docs.rs/regex/latest/regex/#syntax) 正则表达式并显式保存。任一规则匹配入站 User-Agent 时，本插件跳过该请求的审计记录和前序对话保存；原请求照常转发，headers 与正文保持原样。规则默认空列表，保存在插件私有数据库；保存空列表清除自定义规则，保存失败保留已生效规则。设置与既有来源过滤共同决定采集资格，适用于后续采集，已排队任务及已有记录保持各自原有决定。具体匹配语义与限制见[采集行为 §3.2](docs/collection.md#32-整条请求过滤)。
 
 宿主兼容声明为 `~3.25.0`，接受稳定版 `>=3.25.0, <3.26.0`；SDK 与可复现构建基线固定到 upstream v3.25.0（`05ba116eef849a0f4fa2d1940be82182bb2f7683`）。
 
 Client Key 名称在列表、详情与筛选查询时直接从宿主当前 Key 列表取得，不写入审计记录或名称目录。改名后，旧记录也显示新名称；已删除的 Key 显示“名称未知”，输入与上下文仍按保留策略保存。名称查询失败会返回可重试错误。
 
-审计时区由插件在私有数据库的 `settings` 表中保存为共享、非 secret 的 IANA `timeZone`，缺省为 `UTC`。管理员可在审计页填写时区，或点击“使用浏览器时区”填入浏览器检测结果；检测不可用时填入 `UTC`。只有点击“保存”才写入共享设置，所有管理员使用该值。每次查询读取一次已保存时区，并在整个响应内用于时间展示、服务端当天日期与日期边界。保存不刷新、取消或重试查询，不改变已选择的日期；列表和详情分别标明各自响应使用的时区。
+审计时区由插件在私有数据库的 `settings` 表中保存为共享、非 secret 的 IANA `timeZone`，缺省为 `UTC`。管理员可在“设置”的“显示设置”分区填写时区，或点击“使用浏览器时区”填入浏览器检测结果；检测不可用时填入 `UTC`。只有点击“保存”才写入共享设置，所有管理员使用该值。每次查询读取一次已保存时区，并在整个响应内用于时间展示、服务端当天日期与日期边界。保存不刷新、取消或重试查询，不改变已选择的日期；列表和详情分别标明各自响应使用的时区。
 
 插件通过 SDK 的 `HostClient::dispatch_http` 按需读取宿主请求详情，私有 SQLite 只负责保存审计数据，依据见[总体设计 §4](docs/design.md#4-插件私有-sqlite-的存储设计)。插件静态链接 SQLite 3.54.0；为使用尚未进入已发布 Rust 绑定的这一版本，SQLx 与 `libsqlite3-sys` 在 [Cargo.toml](backend/Cargo.toml) 中固定到兼容的上游提交，并由 `Cargo.lock` 锁定依赖。在仓库根目录准备宿主及插件产物：
 
@@ -25,7 +27,7 @@ npm run plugin:build
 CPR_PLUGIN=../codex-proxy-audit-host/backend/target/debug/cpr-plugin npm run plugin:package
 ```
 
-正式安装包与校验文件从 [GitHub Releases](https://github.com/huweiATgithub/codex-proxy-audit/releases) 下载；本地构建输出 `dist/packages/huwei.prompt-audit-0.1.9-x86_64-unknown-linux-gnu.tar.gz`。宿主 CLI 生成资源声明、规范化能力和文件摘要，包内包含 MIT 许可证。同一版本的平台产物在宿主中不可变，修改后发布新的插件版本并使用实例的版本切换入口升级；升级保留原实例的 configuration 和 binding，审计事实继续保存在数据库中。正式包支持 Linux x86_64 GNU，要求 glibc 2.34 或更新版本；其他目标先通过 Cargo 的 `--target` 构建，再用 `AUDIT_TARGET`、`AUDIT_BINARY` 指定目标和二进制。`plugin.json` 只声明 middleware v4／management v1。宿主安装页面上传此包，接受受信任进程，configuration 保持 `{}`，secrets 保持为空。启用 request binding，order 必须小于所有会改写输入的 request 插件；建议 `-1000000`，failurePolicy 使用 `delegate`。管理页面与接口自动注册，不配置 management binding。
+正式安装包与校验文件从 [GitHub Releases](https://github.com/huweiATgithub/codex-proxy-audit/releases) 下载；本地构建输出 `dist/packages/huwei.prompt-audit-0.1.10-x86_64-unknown-linux-gnu.tar.gz`。宿主 CLI 生成资源声明、规范化能力和文件摘要，包内包含 MIT 许可证。同一版本的平台产物在宿主中不可变，修改后发布新的插件版本并使用实例的版本切换入口升级；升级保留原实例的 configuration 和 binding，审计事实继续保存在数据库中。正式包支持 Linux x86_64 GNU，要求 glibc 2.34 或更新版本；其他目标先通过 Cargo 的 `--target` 构建，再用 `AUDIT_TARGET`、`AUDIT_BINARY` 指定目标和二进制。`plugin.json` 只声明 middleware v4／management v1。宿主安装页面上传此包，接受受信任进程，configuration 保持 `{}`，secrets 保持为空。启用 request binding，order 必须小于所有会改写输入的 request 插件；建议 `-1000000`，failurePolicy 使用 `delegate`。管理页面与接口自动注册，不配置 management binding。
 
 插件初始化时自动创建 `<宿主持久数据目录>/huwei.prompt-audit/audit.sqlite3` 及所需表。数据根目录由宿主设定的启动目录 `<宿主持久数据目录>/plugins/plugin-*` 向上两级定位，数据库位于固定子目录，重启和重新解包均复用同一文件。目录不可配置；安装无需准备数据库角色、连接串或额外数据库服务。该目录应随宿主持久数据区一起保留。
 
@@ -36,7 +38,7 @@ npx playwright install chromium
 node scripts/integration.js \
   --host-binary ../codex-proxy-audit-host/backend/target/debug/codex-proxy-rs \
   --host-web ../codex-proxy-audit-host/frontend/dist \
-  --package dist/packages/huwei.prompt-audit-0.1.9-x86_64-unknown-linux-gnu.tar.gz \
+  --package dist/packages/huwei.prompt-audit-0.1.10-x86_64-unknown-linux-gnu.tar.gz \
   --next-wait-ms 125000 \
   --keep
 ```
@@ -48,9 +50,9 @@ npm ci
 npm run demo
 ```
 
-远程浏览器访问 `http://<服务器 IP>:4173`；服务监听 `0.0.0.0` 的所有 IPv4 网卡，按 `Ctrl+C` 停止。页面默认筛选已保存审计时区的服务端当天；Demo 默认使用 `UTC`，并在启动时将示例整体平移到服务器当前时间；“重置”可查看全部示例。可搜索“数据库”或“请继续”，组合时间与 Key 缩小范围，再打开一条输入阅读上文。支持每页最多 50 / 100 / 200 条、前后翻页、单行预览、上下方向键连续审阅和 Esc 关闭详情；Demo 外层的主题按钮模拟宿主切换浅色与深色主题，插件本身沿用宿主主题。Thread ID 与 Session ID 分别保留在记录信息中，不提供会话归类入口。
+远程浏览器访问 `http://<服务器 IP>:4173`；服务监听 `0.0.0.0` 的所有 IPv4 网卡，按 `Ctrl+C` 停止。时间范围控件将“今天”“最近三天”“全部”和“自定义”放在同一单选组中，快捷项点击即查询，自定义范围在一个日历面板内选定后应用。“最近三天”包括今天及前两个自然日，按插件时区和服务端日期计算；检索或刷新相对范围时重新取得当天日期，翻页沿用该次查询范围。页面默认筛选已保存审计时区的服务端当天；Demo 默认使用 `UTC`，并在启动时将示例整体平移到服务器当前时间；“重置”可查看全部示例。可搜索“数据库”或“请继续”，组合时间与 Key 缩小范围，再打开一条输入阅读上文。支持每页最多 50 / 100 / 200 条、前后翻页、单行预览、上下方向键连续审阅和 Esc 关闭详情；Demo 外层的主题按钮模拟宿主切换浅色与深色主题，插件本身沿用宿主主题。Thread ID 与 Session ID 分别保留在记录信息中，不提供会话归类入口。
 
-`npm run build` 生成正式插件静态资源到 `dist/plugin/`，使用宿主页桥、宿主主题和经典脚本；生成的 `management.json` 供后端注册页面、资源、六个查询入口及时区保存入口。正式构建必须在宿主中打开，不会回退到模拟数据。UI 统一提供“复制审计 ID”，不提供记录链接或 URL 查询恢复。
+`npm run build` 生成正式插件静态资源到 `dist/plugin/`，使用宿主页桥、宿主主题和经典脚本；生成的 `management.json` 供后端注册页面、资源、管理查询与共享设置入口。正式构建必须在宿主中打开，不会回退到模拟数据。UI 统一提供“复制审计 ID”，不提供记录链接或 URL 查询恢复。
 
 `npm run demo` 先构建正式插件，再启动模拟宿主；模拟宿主读取上述注册信息，将同一份页面资源加载进隔离 iframe，通过 v2 管理页桥转发到模拟后端。没有独立的 Demo UI 构建。修改 UI 后重新运行此命令；`npm run preview` 直接加载已有构建。可用 `npm run demo -- --time-zone America/New_York` 指定 Demo 的初始审计时区，页面可显式保存其他时区。依赖版本和完整性由 `package-lock.json` 固定。
 
@@ -68,7 +70,7 @@ npm run preview -- --fixtures .local/session-fixtures.json
 mkdir -p .local
 node scripts/seed-session-fixtures.js --base-url http://127.0.0.1:4180 --fixture tests/fixtures/codex-sessions.json > .local/seed-result.json
 node tests/integration/verify-session-fixtures.js .local/seed-result.json
-node tests/integration/update-review-host.js dist/packages/huwei.prompt-audit-0.1.9-x86_64-unknown-linux-gnu.tar.gz .local/seed-result.json
+node tests/integration/update-review-host.js dist/packages/huwei.prompt-audit-0.1.10-x86_64-unknown-linux-gnu.tar.gz .local/seed-result.json
 ```
 
 查询契约的语义见[设计文档 §5.3](docs/design.md#53-管理-api)，字段以 `contracts/audit.js` 为源；修改后运行 `npm run contract:export` 更新 OpenAPI。前端验证命令为 `npm run contract:check`、`npm test` 和 `npm run test:ui`。浏览器验证首次运行需执行 `npx playwright install chromium`，也可通过 `PLAYWRIGHT_CHROMIUM_EXECUTABLE` 指定已有 Chromium；测试自动使用 4174 端口，不占用供审阅的 4173。这组浏览器测试使用模拟服务；正式宿主验收使用上面的 `scripts/integration.js`。

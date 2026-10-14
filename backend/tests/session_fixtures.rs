@@ -1,10 +1,19 @@
 //! 使用共享的匿名会话验证最新输入、请求内上下文与多媒体采集
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 use chrono::{DateTime, Utc};
-use codex_proxy_audit::collection::{AuditDraft, ContentBlock, RequestObservation, collect};
+use codex_proxy_audit::collection::{
+    AuditDraft, ContentBlock, RequestObservation, collect as collect_with_policy,
+    exclusions::ExclusionPolicy,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
+
+fn collect(observation: &RequestObservation) -> Option<AuditDraft> {
+    static POLICY: OnceLock<ExclusionPolicy> = OnceLock::new();
+    collect_with_policy(observation, POLICY.get_or_init(ExclusionPolicy::default))
+}
 
 #[derive(Deserialize)]
 struct Fixtures {
@@ -119,6 +128,7 @@ fn observation(audit: &FixtureAudit, request_id: String) -> RequestObservation {
             }).to_string()},
         }),
         headers: BTreeMap::new(),
+        user_agents: Vec::new(),
         observed_at: DateTime::parse_from_rfc3339("2026-10-09T12:00:00.000Z")
             .unwrap()
             .with_timezone(&Utc),

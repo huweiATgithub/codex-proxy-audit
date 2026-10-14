@@ -6,9 +6,12 @@ const jsonSchema = (schema) => {
   const { $schema, ...value } = z.toJSONSchema(schema, { target: 'draft-2020-12', io: 'input' });
   return value;
 };
-const paths = Object.fromEntries(Object.entries(endpoints).map(([operationId, endpoint]) => {
+const paths = {};
+for (const [operationId, endpoint] of Object.entries(endpoints)) {
   const query = jsonSchema(endpoint.query);
-  return [`/${endpoint.path}`, { [(endpoint.method || 'GET').toLowerCase()]: {
+  const path = `/${endpoint.path}`;
+  paths[path] ||= {};
+  paths[path][(endpoint.method || 'GET').toLowerCase()] = {
     operationId, summary: endpoint.summary,
     parameters: Object.entries(query.properties).map(([name, schema]) => ({
       name, in: 'query', required: query.required?.includes(name) || false, schema,
@@ -20,8 +23,8 @@ const paths = Object.fromEntries(Object.entries(endpoints).map(([operationId, en
       401: { description: 'Host administrator session expired; body is host-defined.' },
       403: { description: 'Host administrator permission denied; body is host-defined.' },
     },
-  } }];
-}));
+  };
+}
 const document = {
   openapi: '3.1.0', info: { title: 'Prompt Audit management contract', version: '2.0.0', description: 'Paths are relative to the plugin instance. Transport is window.codexProxyPlugin.request; no direct HTTP base URL. See docs/design.md section 5.3 for cursor and content sequencing invariants.' },
   paths,

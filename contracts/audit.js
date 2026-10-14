@@ -4,6 +4,8 @@ export const PAGE_SIZES = [50, 100, 200];
 export const MAX_RESPONSE_BYTES = 512 * 1024;
 export const MAX_QUERY_BYTES = 8192;
 export const CONTENT_CHARACTERS = 1200;
+export const MAX_EXCLUSION_PATTERNS = 32;
+export const MAX_EXCLUSION_PATTERN_BYTES = 1024;
 const id = z.string().regex(/^[\s\S]{1,256}$/u);
 const cursor = z.string().regex(/^[\s\S]{1,2048}$/u);
 const count = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
@@ -13,6 +15,12 @@ const timestamp = z.iso.datetime({ precision: 3 });
 const displayTime = z.string().regex(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/).describe('Server-generated local time text; render verbatim, never parse as an instant.');
 const timeZone = z.string().min(1).max(128).describe('Shared audit IANA timezone, default UTC.');
 export const timeZoneSetting = z.object({ timeZone }).strict();
+const userAgentPattern = z.string().max(MAX_EXCLUSION_PATTERN_BYTES).regex(/\P{White_Space}/u)
+  .refine((pattern) => new TextEncoder().encode(pattern).byteLength <= MAX_EXCLUSION_PATTERN_BYTES, { message: 'Pattern exceeds UTF-8 byte limit.' })
+  .describe('Nonblank Rust regex source, at most 1024 UTF-8 bytes. Preserved verbatim; syntax is validated by the Rust backend.');
+export const exclusionSetting = z.object({
+  userAgentPatterns: z.array(userAgentPattern).max(MAX_EXCLUSION_PATTERNS).describe('Any matching pattern excludes future audit storage. An empty list clears custom exclusions.'),
+}).strict();
 const keyName = boundedText(512).nullable().describe('Current host Client Key name; null when the Key is missing or its name cannot be represented.');
 const pageQuery = { cursor: cursor.optional() };
 
@@ -89,11 +97,14 @@ export const keyPage = z.object({
   nextCursor: cursor.nullable(),
 });
 export const errorResponse = z.object({ error: z.object({
-  code: z.enum(['invalid_query', 'invalid_cursor', 'not_found', 'cursor_expired', 'unavailable', 'internal_error']),
+  code: z.enum(['invalid_query', 'invalid_exclusions', 'invalid_cursor', 'not_found', 'cursor_expired', 'unavailable', 'internal_error']),
   message: boundedText(300),
-}) });
+  patternIndex: count.optional().describe('Zero-based row of an invalid pattern; only supplied with invalid_exclusions, when available.'),
+}).refine((error) => error.patternIndex === undefined || error.code === 'invalid_exclusions', { message: 'Pattern index is only valid for invalid_exclusions.' }) });
 export const endpoints = {
   timeZone: { method: 'PUT', path: 'api/time-zone', query: z.object({}).strict(), body: timeZoneSetting, response: timeZoneSetting, summary: 'Save the shared audit timezone explicitly; does not refresh audit queries.' },
+  exclusions: { path: 'api/exclusions', query: z.object({}).strict(), response: exclusionSetting, summary: 'Get plugin-owned User-Agent exclusions for future audit storage.' },
+  saveExclusions: { method: 'PUT', path: 'api/exclusions', query: z.object({}).strict(), body: exclusionSetting, response: exclusionSetting, summary: 'Validate Rust regexes and replace the saved exclusion list; does not refresh audit queries.' },
   viewContext: { path: 'api/view-context', query: z.object({}).strict(), response: viewContext, summary: 'Get the saved audit timezone and server-local date for initial page filters.' },
   audits: { path: 'api/audits', query: auditQuery, response: auditPage, summary: 'List input excerpts using a stable descending cursor.' },
   audit: { path: 'api/audit', query: detailQuery, response: auditDetail, summary: 'Get saved audit metadata and ordered content descriptors; no full bodies or host request metadata.' },

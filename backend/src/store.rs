@@ -20,6 +20,7 @@ use sqlx::{
 };
 use uuid::Uuid;
 
+use crate::collection::exclusions::ExclusionSettings;
 use crate::collection::{AuditDraft, ContentBlock};
 use connection::{CLEANUP_WAIT, ConnectionLease, STATEMENT_WAIT, StatementBudget};
 
@@ -310,6 +311,32 @@ impl Store {
         lease.budget.start();
         sqlx::query("INSERT INTO settings (name, value) VALUES ('timeZone', ?1) ON CONFLICT (name) DO UPDATE SET value = excluded.value")
             .bind(time_zone.name().as_bytes()).execute(&mut *lease.connection).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn exclusion_settings(&self) -> StoreResult<Option<ExclusionSettings>> {
+        let mut lease = ConnectionLease::acquire(&self.pool, STATEMENT_WAIT).await?;
+        lease.budget.start();
+        let value: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT value FROM settings WHERE name = 'exclusions'")
+                .fetch_optional(&mut *lease.connection)
+                .await?;
+        value
+            .map(|value| serde_json::from_slice(&value).map_err(StoreError::internal))
+            .transpose()
+    }
+
+    pub(crate) async fn save_exclusion_settings(
+        &self,
+        settings: &ExclusionSettings,
+    ) -> StoreResult<()> {
+        let value = serde_json::to_vec(settings).map_err(StoreError::internal)?;
+        let mut lease = ConnectionLease::acquire(&self.pool, STATEMENT_WAIT).await?;
+        lease.budget.start();
+        sqlx::query("INSERT INTO settings (name, value) VALUES ('exclusions', ?1) ON CONFLICT (name) DO UPDATE SET value = excluded.value")
+            .bind(value)
+            .execute(&mut *lease.connection)
+            .await?;
         Ok(())
     }
 

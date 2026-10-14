@@ -4,7 +4,7 @@ import { createDemoService } from '../demo/service.js';
 import { createAuditClient, AuditError } from '../frontend/api/client.js';
 import { appendContent } from '../frontend/api/content.js';
 import { audits } from '../demo/fixtures.js';
-import { CONTENT_CHARACTERS, MAX_RESPONSE_BYTES, parseQuery } from '../contracts/audit.js';
+import { CONTENT_CHARACTERS, exclusionSetting, MAX_RESPONSE_BYTES, parseQuery } from '../contracts/audit.js';
 
 const reply = (value, status = 200) => ({ status, contentType: 'application/json; charset=utf-8', body: new TextEncoder().encode(JSON.stringify(value)).buffer });
 const bridge = (service) => ({ version: 2, async request({ method, path, query, body }) {
@@ -267,4 +267,76 @@ test('settings saves complete while all read slots are occupied without refetchi
   release();
   assert.ok((await Promise.all(reads)).every((value) => value.timeZone === 'UTC'));
   assert.equal(calls.length, 5);
+});
+
+test('plugin-owned exclusions preserve regex source, clear explicitly, and leave saved audits readable', async () => {
+  const api = createAuditClient(bridge(createDemoService()));
+  const before = await api.list({});
+  assert.deepEqual(await api.exclusions(), { userAgentPatterns: [] });
+  const patterns = ['(?i)^internal-bot/', ' ^space-sensitive/ ', '\\p{Greek}+'];
+  assert.deepEqual(await api.saveExclusions(patterns), { userAgentPatterns: patterns });
+  assert.deepEqual(await api.exclusions(), { userAgentPatterns: patterns });
+  await assert.rejects(api.saveExclusions(['valid', '  ']), (error) => error.code === 'invalid_exclusions' && error.patternIndex === 1);
+  assert.deepEqual(await api.exclusions(), { userAgentPatterns: patterns });
+  assert.equal((await api.list({})).total, before.total);
+  assert.deepEqual(await api.saveExclusions([]), { userAgentPatterns: [] });
+  assert.deepEqual(await api.exclusions(), { userAgentPatterns: [] });
+  assert.throws(() => parseQuery('exclusions', new URLSearchParams('extra=1')));
+  assert.throws(() => parseQuery('saveExclusions', new URLSearchParams('extra=1')));
+});
+
+test('exclusion shape and UTF-8 limits reject invalid bodies without compiling regex syntax in JavaScript', async () => {
+  assert.deepEqual(exclusionSetting.parse({ userAgentPatterns: ['(?i)^bot/', '😀'.repeat(256), 'x'.repeat(1024)] }), { userAgentPatterns: ['(?i)^bot/', '😀'.repeat(256), 'x'.repeat(1024)] });
+  assert.deepEqual(exclusionSetting.parse({ userAgentPatterns: ['['] }), { userAgentPatterns: ['['] });
+  assert.deepEqual(exclusionSetting.parse({ userAgentPatterns: ['\uFEFF'] }), { userAgentPatterns: ['\uFEFF'] });
+  for (const value of [{}, { userAgentPatterns: [42] }, { userAgentPatterns: [''] }, { userAgentPatterns: ['\n\t'] },
+    { userAgentPatterns: ['\u0085'] },
+    { userAgentPatterns: ['😀'.repeat(257)] }, { userAgentPatterns: ['x'.repeat(1025)] },
+    { userAgentPatterns: Array(33).fill('bot') }, { userAgentPatterns: [], extra: true }]) {
+    assert.equal(exclusionSetting.safeParse(value).success, false);
+  }
+  const calls = [];
+  const api = createAuditClient({ version: 2, request: async (input) => { calls.push(input); return reply(JSON.parse(new TextDecoder().decode(input.body))); } });
+  await assert.rejects(api.saveExclusions(['😀'.repeat(257)]), (error) => error.code === 'invalid_exclusions' && error.patternIndex === 0 && !error.message.includes('时区'));
+  await assert.rejects(api.saveExclusions(Array(33).fill('bot')), (error) => error.code === 'invalid_exclusions' && error.patternIndex === undefined);
+  assert.deepEqual(calls, []);
+  const largest = Array(32).fill('x'.repeat(1024));
+  assert.deepEqual(await api.saveExclusions(largest), { userAgentPatterns: largest });
+  assert.ok(calls[0].body.byteLength > 8192);
+  assert.equal(calls[0].path, 'api/exclusions');
+  assert.equal(calls[0].query, '');
+});
+
+test('exclusion responses preserve indexed Rust errors and reject malformed settings or error indices', async () => {
+  const rustError = { error: { code: 'invalid_exclusions', message: 'look-around is not supported', patternIndex: 1 } };
+  const api = createAuditClient({ version: 2, request: async () => reply(rustError, 400) });
+  await assert.rejects(api.saveExclusions(['(?i)bot', '(?=bot)']), (error) => error.code === 'invalid_exclusions' && error.patternIndex === 1 && error.status === 400 && error.message === rustError.error.message);
+  await assert.rejects(createAuditClient({ version: 2, request: async () => reply({ error: { code: 'unavailable', message: 'Cannot load', extra: 'ignored' }, extra: true }, 503) }).exclusions(), (error) => error.code === 'unavailable' && error.message === 'Cannot load');
+  for (const value of [{}, { userAgentPatterns: 'bot' }, { userAgentPatterns: [42] }, { userAgentPatterns: [], unexpected: true }]) {
+    await assert.rejects(createAuditClient({ version: 2, request: async () => reply(value) }).exclusions(), (error) => error.code === 'invalid_response');
+  }
+  for (const value of [
+    { error: { ...rustError.error, patternIndex: -1 } },
+    { error: { ...rustError.error, patternIndex: 1.5 } },
+    { error: { code: 'unavailable', message: 'Cannot load', patternIndex: 0 } },
+  ]) await assert.rejects(createAuditClient({ version: 2, request: async () => reply(value, value.error.code === 'unavailable' ? 503 : 400) }).exclusions(), (error) => error.code === 'invalid_response');
+  await assert.rejects(createAuditClient({ version: 2, request: async () => reply(rustError, 500) }).saveExclusions(['bot']), (error) => error.code === 'invalid_response');
+});
+
+test('exclusion loads and saves run while every audit read slot is occupied', async () => {
+  let release;
+  const pending = new Promise((resolve) => { release = resolve; });
+  const calls = [];
+  const api = createAuditClient({ version: 2, async request(input) {
+    calls.push(input);
+    if (input.path === 'api/exclusions') return reply(input.method === 'PUT' ? JSON.parse(new TextDecoder().decode(input.body)) : { userAgentPatterns: [] });
+    await pending;
+    return reply({ timeZone: 'UTC', items: [], total: 0, nextCursor: null });
+  } });
+  const reads = Array.from({ length: 4 }, () => api.list({}));
+  assert.deepEqual(await api.exclusions(), { userAgentPatterns: [] });
+  assert.deepEqual(await api.saveExclusions(['(?i)bot']), { userAgentPatterns: ['(?i)bot'] });
+  assert.equal(calls.length, 6);
+  release(); await Promise.all(reads);
+  assert.equal(calls.length, 6);
 });

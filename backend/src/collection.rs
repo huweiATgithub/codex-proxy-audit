@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+pub mod exclusions;
+use exclusions::{ExclusionPolicy, RequestFacts, SourceFacts};
+
 pub const WINDOW_MESSAGES: usize = 12;
 pub const WINDOW_CHARACTERS: usize = 32_000;
 const MAX_METADATA_BYTES: usize = 64 * 1024;
@@ -14,6 +17,7 @@ pub struct RequestObservation {
     pub request_id: String,
     pub body: Value,
     pub headers: BTreeMap<String, String>,
+    pub user_agents: Vec<String>,
     pub observed_at: DateTime<Utc>,
 }
 
@@ -71,11 +75,10 @@ struct Metadata {
     thread_id: Option<String>,
     session_id: Option<String>,
     repositories: Option<Vec<Repository>>,
-    excluded: bool,
 }
 
 /// Only the last raw input item can introduce a new audit
-pub fn collect(observation: &RequestObservation) -> Option<AuditDraft> {
+pub fn collect(observation: &RequestObservation, policy: &ExclusionPolicy) -> Option<AuditDraft> {
     let mut input_kinds = Vec::new();
     let (blocks, turn_id, earlier) = match observation.body.get("input")? {
         Value::String(text) => (
@@ -89,13 +92,6 @@ pub fn collect(observation: &RequestObservation) -> Option<AuditDraft> {
                 return None;
             }
             let blocks = parse_blocks(latest, Some(&mut input_kinds));
-            if !input_kinds.is_empty()
-                && input_kinds
-                    .iter()
-                    .all(|kind| kind.as_deref().is_some_and(automatic_prompt_kind))
-            {
-                return None;
-            }
             let turn_id = bounded(
                 latest
                     .get("internal_chat_message_metadata_passthrough")
@@ -111,10 +107,14 @@ pub fn collect(observation: &RequestObservation) -> Option<AuditDraft> {
     if blocks.is_empty() {
         return None;
     }
-    let metadata = metadata(observation);
-    if metadata.excluded {
-        return None;
-    }
+    let automatic_prompt = !input_kinds.is_empty()
+        && input_kinds
+            .iter()
+            .all(|kind| kind.as_deref().is_some_and(automatic_prompt_kind));
+    let metadata = policy
+        .assess(request_facts(observation, automatic_prompt))
+        .ok()?
+        .metadata;
     if input_kinds.is_empty() {
         input_kinds.resize(blocks.len(), None);
     } else if serde_json::to_vec(&input_kinds)
@@ -315,7 +315,7 @@ fn bounded(value: Option<&str>, maximum: usize) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn metadata(observation: &RequestObservation) -> Metadata {
+fn request_facts(observation: &RequestObservation, automatic_prompt: bool) -> RequestFacts<'_> {
     let flat = observation.body.get("client_metadata");
     let canonical = flat
         .and_then(|value| value.get("x-codex-turn-metadata"))
@@ -434,40 +434,27 @@ fn metadata(observation: &RequestObservation) -> Metadata {
                 })
                 .flatten()
         });
-    let excluded = field(&["subagent_kind", "x-codex-subagent-kind"])
-        .is_some_and(|value| !value.is_empty())
-        || compatible_subagent.is_some_and(|value| !value.is_empty())
-        || source.as_deref().is_some_and(|value| {
-            matches!(value, "system" | "thread_title") || internal_source(value)
-        })
-        || kind.as_deref().is_some_and(internal_source)
-        || trigger.as_deref().is_some_and(internal_source);
+    let subagent_kind = field(&["subagent_kind", "x-codex-subagent-kind"]);
     let repository_source = canonical.as_ref().or(header_metadata.as_ref());
     let repositories = repository_source
         .and_then(|value| value.get("workspaces"))
         .and_then(parse_repositories);
-    Metadata {
-        thread_id: bounded(thread_id, 256).filter(|value| !value.is_empty()),
-        session_id: bounded(session_id, 256).filter(|value| !value.is_empty()),
-        repositories,
-        excluded,
+    RequestFacts {
+        metadata: Metadata {
+            thread_id: bounded(thread_id, 256).filter(|value| !value.is_empty()),
+            session_id: bounded(session_id, 256).filter(|value| !value.is_empty()),
+            repositories,
+        },
+        source: SourceFacts {
+            source,
+            kind,
+            trigger,
+            subagent_kind,
+            compatible_subagent,
+        },
+        automatic_prompt,
+        user_agents: &observation.user_agents,
     }
-}
-
-fn internal_source(source: &str) -> bool {
-    matches!(
-        source,
-        "subagent"
-            | "compaction"
-            | "compact"
-            | "memory"
-            | "memory_consolidation"
-            | "guardian_review"
-            | "guardian"
-            | "review"
-    ) || serde_json::from_str::<Value>(source)
-        .ok()
-        .is_some_and(|value| value.get("subagent").is_some() || value.get("SubAgent").is_some())
 }
 
 fn source_string(value: &Value) -> Option<String> {
@@ -537,6 +524,12 @@ pub fn sanitize_remote(remote: &str) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::OnceLock;
+
+    fn collect(observation: &RequestObservation) -> Option<AuditDraft> {
+        static POLICY: OnceLock<ExclusionPolicy> = OnceLock::new();
+        super::collect(observation, POLICY.get_or_init(ExclusionPolicy::default))
+    }
 
     fn observation(input: Value) -> RequestObservation {
         RequestObservation {
@@ -544,6 +537,7 @@ mod tests {
             request_id: "request-a".to_owned(),
             body: json!({"input":input,"client_metadata":{"thread_id":"thread-a"}}),
             headers: BTreeMap::new(),
+            user_agents: Vec::new(),
             observed_at: DateTime::parse_from_rfc3339("2026-10-09T12:00:00.000Z")
                 .unwrap()
                 .with_timezone(&Utc),
@@ -556,6 +550,64 @@ mod tests {
 
     fn assistant(text: &str) -> Value {
         json!({"role":"assistant","content":[{"type":"output_text","text":text}],"phase":"commentary"})
+    }
+
+    #[test]
+    fn user_agent_exclusion_only_suppresses_the_audit_draft() {
+        let policy = ExclusionPolicy::compile(exclusions::ExclusionSettings {
+            user_agent_patterns: vec!["^Monitor/".to_owned()],
+        })
+        .unwrap()
+        .into();
+        let mut request = observation(json!([user("task")]));
+        request.user_agents = vec!["ordinary/1".to_owned(), "Monitor/1".to_owned()];
+        request
+            .headers
+            .insert("X-Test".to_owned(), "original".to_owned());
+        let original = request.clone();
+        assert!(super::collect(&request, &policy).is_none());
+        assert_eq!(request.body, original.body);
+        assert_eq!(request.headers, original.headers);
+        assert_eq!(request.user_agents, original.user_agents);
+        request.user_agents.pop();
+        assert!(super::collect(&request, &policy).is_some());
+        assert!(super::collect(&request, &ExclusionPolicy::unavailable()).is_none());
+    }
+
+    #[test]
+    fn configured_policy_preserves_source_precedence_and_content_filtering() {
+        let policy = ExclusionPolicy::compile(exclusions::ExclusionSettings {
+            user_agent_patterns: vec!["^Monitor/".to_owned()],
+        })
+        .unwrap()
+        .into();
+        let mut request = observation(json!([{
+            "role":"user", "content":[
+                {"type":"input_text","text":"notification"},
+                {"type":"input_text","text":"task"}
+            ], "internal_chat_message_metadata_passthrough":{
+                "content_item_kinds":["multi_agent.subagent_notification","user.text"]
+            }
+        }]));
+        request.user_agents = vec!["ordinary/1".to_owned()];
+        request
+            .headers
+            .insert("X-OpenAI-Subagent".to_owned(), "review".to_owned());
+        request.body["client_metadata"]["x-codex-turn-metadata"] =
+            json!(json!({"thread_source":"user"}).to_string());
+        let draft = super::collect(&request, &policy).unwrap();
+        assert_eq!(
+            draft.blocks,
+            vec![ContentBlock::Text {
+                text: "task".to_owned()
+            }]
+        );
+        request.body["client_metadata"]["thread_source"] = json!("subagent");
+        // Canonical current-request metadata remains authoritative over flat and header sources.
+        assert!(super::collect(&request, &policy).is_some());
+        request.body["client_metadata"]["x-codex-turn-metadata"] =
+            json!(json!({"thread_source":"subagent"}).to_string());
+        assert!(super::collect(&request, &policy).is_none());
     }
 
     fn text(message: &ContextMessage) -> String {

@@ -1,13 +1,13 @@
 import { CONTENT_CHARACTERS, endpoints, errorResponse, MAX_QUERY_BYTES, MAX_RESPONSE_BYTES, parseQuery } from '../../contracts/audit.js';
 
 export class AuditError extends Error {
-  constructor(code, message, status = 0) { super(message); this.name = 'AuditError'; this.code = code; this.status = status; }
+  constructor(code, message, status = 0, patternIndex) { super(message); this.name = 'AuditError'; this.code = code; this.status = status; if (patternIndex !== undefined) this.patternIndex = patternIndex; }
 }
 export const invalidResponse = () => new AuditError('invalid_response', '接口响应不符合审计契约，请检查插件版本。');
 const aborted = () => new DOMException('Aborted', 'AbortError');
 export const isAborted = (error) => error?.name === 'AbortError';
 
-// One queue covers all readers; settings saves run independently. Abandoned in-flight bridge calls retain their slot
+// One queue covers audit readers; exclusion settings and settings saves run independently. Abandoned in-flight bridge calls retain their slot
 // until settlement because the host does not support cancellation for management.
 export function createAuditClient(host) {
   let active = 0;
@@ -29,8 +29,15 @@ export function createAuditClient(host) {
     if (new TextEncoder().encode(query).byteLength > MAX_QUERY_BYTES) throw new AuditError('invalid_query', '查询条件过长，请缩小筛选范围。', 400);
     let body;
     if (endpoints[endpoint].body) {
-      try { body = new TextEncoder().encode(JSON.stringify(endpoints[endpoint].body.parse(values))).buffer; }
-      catch { throw new AuditError('invalid_query', '审计时区无效，请使用 IANA 时区名称。', 400); }
+      const parsedBody = endpoints[endpoint].body.safeParse(values);
+      if (!parsedBody.success) {
+        if (endpoint === 'saveExclusions') {
+          const patternIndex = parsedBody.error.issues.find((issue) => issue.path[0] === 'userAgentPatterns' && Number.isInteger(issue.path[1]))?.path[1];
+          throw new AuditError('invalid_exclusions', '最多 32 条规则；每条须非空，且不超过 1024 个 UTF-8 字节。', 400, patternIndex);
+        }
+        throw new AuditError('invalid_query', '审计时区无效，请使用 IANA 时区名称。', 400);
+      }
+      body = new TextEncoder().encode(JSON.stringify(parsedBody.data)).buffer;
     }
     let reply;
     try { reply = await host.request({ method: endpoints[endpoint].method || 'GET', path: endpoints[endpoint].path, query, ...(body ? { contentType: 'application/json', body } : {}) }); }
@@ -45,9 +52,9 @@ export function createAuditClient(host) {
     if (reply.status !== 200) {
       const parsed = errorResponse.safeParse(value);
       if (!parsed.success) throw invalidResponse();
-      const expected = { invalid_query: 400, invalid_cursor: 400, not_found: 404, cursor_expired: 410, unavailable: 503, internal_error: 500 };
+      const expected = { invalid_query: 400, invalid_exclusions: 400, invalid_cursor: 400, not_found: 404, cursor_expired: 410, unavailable: 503, internal_error: 500 };
       if (expected[parsed.data.error.code] !== reply.status) throw invalidResponse();
-      throw new AuditError(parsed.data.error.code, parsed.data.error.message, reply.status);
+      throw new AuditError(parsed.data.error.code, parsed.data.error.message, reply.status, parsed.data.error.patternIndex);
     }
     const parsed = endpoints[endpoint].response.safeParse(value);
     if (!parsed.success) throw invalidResponse();
@@ -68,6 +75,8 @@ export function createAuditClient(host) {
   }
   return {
     saveTimeZone: (timeZone) => execute('timeZone', { timeZone }),
+    exclusions: (signal) => execute('exclusions', {}, signal),
+    saveExclusions: (userAgentPatterns) => execute('saveExclusions', { userAgentPatterns }),
     viewContext: (signal) => request('viewContext', {}, signal),
     list: (query, signal) => request('audits', query, signal),
     detail: (id, signal) => request('audit', { id }, signal),

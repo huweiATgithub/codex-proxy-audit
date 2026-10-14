@@ -30,7 +30,8 @@ function descriptor(id, blocks) {
 
 // Runs in the preview server only. The browser receives the same bounded wire
 // responses as a plugin client; fixture bodies are never bundled into the UI.
-export function createDemoService({ audits = fixtureAudits, keys = fixtureKeys, modelRequests = fixtureRequests, maxListRows = 200, keyPageSize = 100, timeZone = 'UTC', now = () => new Date() } = {}) {
+export function createDemoService({ audits = fixtureAudits, keys = fixtureKeys, modelRequests = fixtureRequests, maxListRows = 200, keyPageSize = 100, timeZone = 'UTC', exclusions = { userAgentPatterns: [] }, now = () => new Date() } = {}) {
+  let exclusionSettings = endpoints.exclusions.response.parse(exclusions);
   let dateFormatter = new Intl.DateTimeFormat('sv-SE', { timeZone });
   let timeFormatter = new Intl.DateTimeFormat('sv-SE', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
   const metadata = (audit) => ({ id: audit.id, recordedAt: audit.firstObservedAt, recordedAtDisplay: timeFormatter.format(new Date(audit.firstObservedAt)), keyId: audit.keyId, keyName: keys.find((key) => key.id === audit.keyId)?.name || null });
@@ -123,10 +124,12 @@ export function createDemoService({ audits = fixtureAudits, keys = fixtureKeys, 
     return { items, nextCursor: directory.length > items.length ? encodeCursor({ scope, after: items.at(-1).id }) : null };
   }
   return function handle(path, params, method = 'GET', body) {
-    const endpoint = Object.entries(endpoints).find(([, entry]) => entry.path === path)?.[0];
+    const endpoint = Object.entries(endpoints).find(([, entry]) => entry.path === path && (entry.method || 'GET') === method)?.[0];
     try {
-      if (!endpoint) fail('not_found', 404, '接口不存在。');
-      if (method !== (endpoints[endpoint].method || 'GET')) fail('invalid_query', 400, '请求方法无效。');
+      if (!endpoint) {
+        if (Object.values(endpoints).some((entry) => entry.path === path)) fail('invalid_query', 400, '请求方法无效。');
+        fail('not_found', 404, '接口不存在。');
+      }
       let query;
       try { query = parseQuery(endpoint, params); } catch { fail('invalid_query', 400, '筛选条件无效，请检查日期、关键词和分页参数。'); }
       if (endpoint === 'timeZone') {
@@ -140,7 +143,15 @@ export function createDemoService({ audits = fixtureAudits, keys = fixtureKeys, 
         timeZone = setting.timeZone; dateFormatter = nextDate; timeFormatter = nextTime;
         return { status: 200, value: { timeZone } };
       }
-      const value = { viewContext, audits: list, audit: detail, requestMetadata, content, keys: keyList }[endpoint](query);
+      if (endpoint === 'saveExclusions') {
+        // The demo stores schema-valid fixture settings. Rust alone validates regex syntax.
+        let setting;
+        try { setting = endpoints.saveExclusions.body.parse(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(body))); }
+        catch { fail('invalid_exclusions', 400, '最多 32 条规则；每条须非空，且不超过 1024 个 UTF-8 字节。'); }
+        exclusionSettings = setting;
+        return { status: 200, value: exclusionSettings };
+      }
+      const value = { viewContext, exclusions: () => exclusionSettings, audits: list, audit: detail, requestMetadata, content, keys: keyList }[endpoint](query);
       const parsed = endpoints[endpoint].response.parse(value);
       if (bytes(parsed) > MAX_RESPONSE_BYTES) fail('internal_error', 500, '响应超过大小限制。');
       return { status: 200, value: parsed };
