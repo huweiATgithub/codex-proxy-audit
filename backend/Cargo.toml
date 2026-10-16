@@ -1,12 +1,12 @@
 [package]
 name = "codex-proxy-audit"
-version = "0.1.10"
+version = "0.1.12"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT"
 
 [dependencies]
-gateway-plugin-sdk = { git = "https://github.com/zyycn/codex-proxy-rs", rev = "05ba116eef849a0f4fa2d1940be82182bb2f7683", features = ["io"] }
+gateway-plugin-sdk = { git = "https://github.com/zyycn/codex-proxy-rs", rev = "447869860a0fb88f78109cdb700db0cb1eb5d8b5", features = ["io"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "signal", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

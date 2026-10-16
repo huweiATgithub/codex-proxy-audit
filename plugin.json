@@ -4,11 +4,11 @@
   "name": "prompt-audit",
   "displayName": "Prompt 审计",
   "description": "按 Client Key 检索用户输入及固定的前序对话",
-  "version": "0.1.10",
+  "version": "0.1.12",
   "license": "MIT",
   "runtime": "trustedProcess",
   "main": "codex-proxy-audit",
-  "engines": { "codex-proxy-rs": "~3.25.0" },
+  "engines": { "codex-proxy-rs": "~3.28.0" },
   "contributes": {
     "middleware": { "version": 4, "stages": ["request"], "inputFormats": ["openai"], "outputFormats": ["openai"] },
     "management": {}

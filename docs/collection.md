@@ -175,9 +175,9 @@ Key 名称使用已有缓存，请求以 `try_lock` 取得可用快照；缓存�
 
 请求正文超过 **16 MiB** 的插件采集上限时不建档，不截短本条输入。队列只持有已经提取的审计任务，worker 工作批次也有数量上限，不保存完整请求或响应副本。数据库存储边界见[总体设计 §4.3](design.md#43-逻辑数据模型)。
 
-[http-entry]: https://github.com/zyycn/codex-proxy-rs/blob/05ba116eef849a0f4fa2d1940be82182bb2f7683/backend/crates/gateway-api/src/openai/responses/http.rs#L72
-[execution]: https://github.com/zyycn/codex-proxy-rs/blob/05ba116eef849a0f4fa2d1940be82182bb2f7683/backend/crates/gateway-core/src/engine/execution/service.rs#L306
-[ws-entry]: https://github.com/zyycn/codex-proxy-rs/blob/05ba116eef849a0f4fa2d1940be82182bb2f7683/backend/crates/gateway-api/src/openai/responses/websocket/mod.rs#L325
+[http-entry]: https://github.com/zyycn/codex-proxy-rs/blob/447869860a0fb88f78109cdb700db0cb1eb5d8b5/backend/crates/gateway-api/src/openai/responses/http.rs#L72
+[execution]: https://github.com/zyycn/codex-proxy-rs/blob/447869860a0fb88f78109cdb700db0cb1eb5d8b5/backend/crates/gateway-core/src/engine/execution/service.rs#L317
+[ws-entry]: https://github.com/zyycn/codex-proxy-rs/blob/447869860a0fb88f78109cdb700db0cb1eb5d8b5/backend/crates/gateway-api/src/openai/responses/websocket/mod.rs#L325
 [incremental]: https://github.com/openai/codex/blob/d27764b82f7118f674371e6d6e76271d9d606edb/codex-rs/core/src/client.rs#L1994
 [metadata]: https://github.com/openai/codex/blob/d27764b82f7118f674371e6d6e76271d9d606edb/codex-rs/core/src/responses_metadata.rs#L225
 [subagent]: https://github.com/openai/codex/blob/d27764b82f7118f674371e6d6e76271d9d606edb/codex-rs/core/src/responses_metadata.rs#L458

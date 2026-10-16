@@ -10,7 +10,7 @@ Codex Proxy RS 的 Prompt 审计插件：按 Client Key 记录经过网关的用
 
 管理员可打开审计页右上角的“设置”，在“排除规则”分区编辑“UA 排除规则”，按行填写 [Rust regex](https://docs.rs/regex/latest/regex/#syntax) 正则表达式并显式保存。任一规则匹配入站 User-Agent 时，本插件跳过该请求的审计记录和前序对话保存；原请求照常转发，headers 与正文保持原样。规则默认空列表，保存在插件私有数据库；保存空列表清除自定义规则，保存失败保留已生效规则。设置与既有来源过滤共同决定采集资格，适用于后续采集，已排队任务及已有记录保持各自原有决定。具体匹配语义与限制见[采集行为 §3.2](docs/collection.md#32-整条请求过滤)。
 
-宿主兼容声明为 `~3.25.0`，接受稳定版 `>=3.25.0, <3.26.0`；SDK 与可复现构建基线固定到 upstream v3.25.0（`05ba116eef849a0f4fa2d1940be82182bb2f7683`）。
+宿主兼容声明为 `~3.28.0`，接受稳定版 `>=3.28.0, <3.29.0`；SDK 与可复现构建基线固定到 upstream v3.28.0（`447869860a0fb88f78109cdb700db0cb1eb5d8b5`）。
 
 Client Key 名称在列表、详情与筛选查询时直接从宿主当前 Key 列表取得，不写入审计记录或名称目录。改名后，旧记录也显示新名称；已删除的 Key 显示“名称未知”，输入与上下文仍按保留策略保存。名称查询失败会返回可重试错误。
 
@@ -19,15 +19,15 @@ Client Key 名称在列表、详情与筛选查询时直接从宿主当前 Key �
 插件通过 SDK 的 `HostClient::dispatch_http` 按需读取宿主请求详情，私有 SQLite 只负责保存审计数据，依据见[总体设计 §4](docs/design.md#4-插件私有-sqlite-的存储设计)。插件静态链接 SQLite 3.54.0；为使用尚未进入已发布 Rust 绑定的这一版本，SQLx 与 `libsqlite3-sys` 在 [Cargo.toml](backend/Cargo.toml) 中固定到兼容的上游提交，并由 `Cargo.lock` 锁定依赖。在仓库根目录准备宿主及插件产物：
 
 ```sh
-git clone --branch v3.25.0 --depth 1 https://github.com/zyycn/codex-proxy-rs ../codex-proxy-audit-host
-CPR_VERSION=3.25.0 cargo +1.97.0 build --manifest-path ../codex-proxy-audit-host/backend/Cargo.toml --locked -p codex-proxy-rs -p codex-proxy-plugin-cli
+git clone --branch v3.28.0 --depth 1 https://github.com/zyycn/codex-proxy-rs ../codex-proxy-audit-host
+CPR_VERSION=3.28.0 cargo +1.97.0 build --manifest-path ../codex-proxy-audit-host/backend/Cargo.toml --locked -p codex-proxy-rs -p codex-proxy-plugin-cli
 (cd ../codex-proxy-audit-host/frontend && corepack pnpm install --frozen-lockfile && corepack pnpm build)
 npm ci
 npm run plugin:build
 CPR_PLUGIN=../codex-proxy-audit-host/backend/target/debug/cpr-plugin npm run plugin:package
 ```
 
-正式安装包与校验文件从 [GitHub Releases](https://github.com/huweiATgithub/codex-proxy-audit/releases) 下载；本地构建输出 `dist/packages/huwei.prompt-audit-0.1.10-x86_64-unknown-linux-gnu.tar.gz`。宿主 CLI 生成资源声明、规范化能力和文件摘要，包内包含 MIT 许可证。同一版本的平台产物在宿主中不可变，修改后发布新的插件版本并使用实例的版本切换入口升级；升级保留原实例的 configuration 和 binding，审计事实继续保存在数据库中。正式包支持 Linux x86_64 GNU，要求 glibc 2.34 或更新版本；其他目标先通过 Cargo 的 `--target` 构建，再用 `AUDIT_TARGET`、`AUDIT_BINARY` 指定目标和二进制。`plugin.json` 只声明 middleware v4／management v1。宿主安装页面上传此包，接受受信任进程，configuration 保持 `{}`，secrets 保持为空。启用 request binding，order 必须小于所有会改写输入的 request 插件；建议 `-1000000`，failurePolicy 使用 `delegate`。管理页面与接口自动注册，不配置 management binding。
+正式安装包与校验文件从 [GitHub Releases](https://github.com/huweiATgithub/codex-proxy-audit/releases) 下载；本地构建输出 `dist/packages/huwei.prompt-audit-0.1.12-x86_64-unknown-linux-gnu.tar.gz`。宿主 CLI 生成资源声明、规范化能力和文件摘要，包内包含 MIT 许可证。同一版本的平台产物在宿主中不可变，修改后发布新的插件版本并使用实例的版本切换入口升级；升级保留原实例的 configuration 和 binding，审计事实继续保存在数据库中。正式包支持 Linux x86_64 GNU，要求 glibc 2.34 或更新版本；其他目标先通过 Cargo 的 `--target` 构建，再用 `AUDIT_TARGET`、`AUDIT_BINARY` 指定目标和二进制。`plugin.json` 只声明 middleware v4／management v1。宿主安装页面上传此包，接受受信任进程，configuration 保持 `{}`，secrets 保持为空。启用 request binding，order 必须小于所有会改写输入的 request 插件；建议 `-1000000`，failurePolicy 使用 `delegate`。管理页面与接口自动注册，不配置 management binding。
 
 插件初始化时自动创建 `<宿主持久数据目录>/huwei.prompt-audit/audit.sqlite3` 及所需表。数据根目录由宿主设定的启动目录 `<宿主持久数据目录>/plugins/plugin-*` 向上两级定位，数据库位于固定子目录，重启和重新解包均复用同一文件。目录不可配置；安装无需准备数据库角色、连接串或额外数据库服务。该目录应随宿主持久数据区一起保留。
 
@@ -38,7 +38,7 @@ npx playwright install chromium
 node scripts/integration.js \
   --host-binary ../codex-proxy-audit-host/backend/target/debug/codex-proxy-rs \
   --host-web ../codex-proxy-audit-host/frontend/dist \
-  --package dist/packages/huwei.prompt-audit-0.1.10-x86_64-unknown-linux-gnu.tar.gz \
+  --package dist/packages/huwei.prompt-audit-0.1.12-x86_64-unknown-linux-gnu.tar.gz \
   --next-wait-ms 125000 \
   --keep
 ```
@@ -70,7 +70,7 @@ npm run preview -- --fixtures .local/session-fixtures.json
 mkdir -p .local
 node scripts/seed-session-fixtures.js --base-url http://127.0.0.1:4180 --fixture tests/fixtures/codex-sessions.json > .local/seed-result.json
 node tests/integration/verify-session-fixtures.js .local/seed-result.json
-node tests/integration/update-review-host.js dist/packages/huwei.prompt-audit-0.1.10-x86_64-unknown-linux-gnu.tar.gz .local/seed-result.json
+node tests/integration/update-review-host.js dist/packages/huwei.prompt-audit-0.1.12-x86_64-unknown-linux-gnu.tar.gz .local/seed-result.json
 ```
 
 查询契约的语义见[设计文档 §5.3](docs/design.md#53-管理-api)，字段以 `contracts/audit.js` 为源；修改后运行 `npm run contract:export` 更新 OpenAPI。前端验证命令为 `npm run contract:check`、`npm test` 和 `npm run test:ui`。浏览器验证首次运行需执行 `npx playwright install chromium`，也可通过 `PLAYWRIGHT_CHROMIUM_EXECUTABLE` 指定已有 Chromium；测试自动使用 4174 端口，不占用供审阅的 4173。这组浏览器测试使用模拟服务；正式宿主验收使用上面的 `scripts/integration.js`。
