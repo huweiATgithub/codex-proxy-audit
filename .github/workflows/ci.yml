@@ -1,0 +1,168 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+    inputs:
+      release-tag:
+        description: Version tag to validate before building a release
+        type: string
+        default: ''
+    outputs:
+      version:
+        value: ${{ jobs.build.outputs.version }}
+      host-version:
+        value: ${{ jobs.build.outputs.host-version }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  frontend:
+    name: Frontend tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:ui
+      - name: Upload browser failures
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: browser-failures
+          path: test-results/
+          retention-days: 7
+
+  build:
+    name: Rust tests and plugin package
+    # Keep the release ABI compatible with the documented glibc baseline.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      host-version: ${{ steps.metadata.outputs.host-version }}
+      host-revision: ${{ steps.metadata.outputs.host-revision }}
+      archive: ${{ steps.metadata.outputs.archive }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Install repository Rust toolchain
+        run: rustup show active-toolchain
+      - name: Check versions and host baseline
+        id: metadata
+        env:
+          RELEASE_TAG: ${{ inputs.release-tag }}
+        run: |
+          if [ -n "$RELEASE_TAG" ]; then
+            node scripts/release-metadata.js --tag "$RELEASE_TAG"
+          else
+            node scripts/release-metadata.js
+          fi
+      - name: Check out matching host packaging CLI
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: zyycn/codex-proxy-rs
+          ref: ${{ steps.metadata.outputs.host-revision }}
+          path: _host
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            backend -> target
+            _host/backend -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: npm ci
+      - run: npm run build
+      - run: cargo fmt --manifest-path backend/Cargo.toml --check
+      - run: cargo clippy --manifest-path backend/Cargo.toml --all-targets --locked -- -D warnings
+      - run: cargo test --manifest-path backend/Cargo.toml --locked
+      - run: cargo build --manifest-path backend/Cargo.toml --locked --release
+      - name: Check release architecture and glibc requirement
+        run: |
+          python3 - <<'PY'
+          import pathlib, re, subprocess
+          binary = pathlib.Path('backend/target/release/codex-proxy-audit')
+          header = binary.read_bytes()[:20]
+          assert header[:6] == b'\x7fELF\x02\x01', 'Expected a 64-bit little-endian ELF'
+          assert int.from_bytes(header[18:20], 'little') == 62, 'Expected x86_64'
+          info = subprocess.check_output(['readelf', '--version-info', str(binary)], text=True)
+          versions = [tuple(map(int, v.split('.'))) for v in re.findall(r'GLIBC_(\d+(?:\.\d+)+)', info)]
+          assert versions, 'No glibc version requirements found'
+          required = max(versions)
+          assert required <= (2, 34), f'glibc requirement exceeds 2.34: {required}'
+          print('Maximum required glibc:', '.'.join(map(str, required)))
+          PY
+      - name: Build packaging CLI
+        run: cargo build --manifest-path _host/backend/Cargo.toml --locked -p codex-proxy-plugin-cli
+      - name: Package plugin
+        env:
+          CPR_PLUGIN: ${{ github.workspace }}/_host/backend/target/debug/cpr-plugin
+        run: npm run plugin:package
+      - name: Check package checksum and locked dependencies
+        run: |
+          (cd dist/packages && sha256sum --check ./*.sha256)
+          git diff --exit-code -- backend/Cargo.lock package-lock.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plugin-package
+          path: dist/packages/
+          if-no-files-found: error
+          retention-days: 14
+
+  integration:
+    name: Real host integration
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: plugin-package
+          path: dist/packages
+      - name: Verify package in the pinned host
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HOST_VERSION: ${{ needs.build.outputs.host-version }}
+          HOST_REVISION: ${{ needs.build.outputs.host-revision }}
+          PLUGIN_ARCHIVE: dist/packages/${{ needs.build.outputs.archive }}
+        run: bash scripts/ci-integration.sh
+      - name: Upload integration evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: integration-evidence
+          path: dist/verification/
+          if-no-files-found: warn
+          retention-days: 14

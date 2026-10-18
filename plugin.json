@@ -4,7 +4,7 @@
   "name": "prompt-audit",
   "displayName": "Prompt 审计",
   "description": "按 Client Key 检索用户输入及固定的前序对话",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "license": "MIT",
   "runtime": "trustedProcess",
   "main": "codex-proxy-audit",
