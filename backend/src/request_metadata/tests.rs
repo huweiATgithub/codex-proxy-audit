@@ -189,6 +189,7 @@ impl HostMock {
                 id: 1,
                 method: "management.handle".into(),
                 context: CallContext {
+                    request: None,
                     call_id: 1,
                     instance_id: "test-instance".into(),
                     generation: 1,

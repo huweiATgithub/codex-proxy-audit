@@ -26,6 +26,7 @@ async fn receive(host: &mut DuplexStream) -> Frame {
 
 fn context(id: u64, stage: Stage) -> CallContext {
     CallContext {
+        request: None,
         call_id: id,
         instance_id: "test-instance".into(),
         generation: 1,

@@ -63,6 +63,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
+
+[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -166,11 +172,11 @@ checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
 name = "codex-proxy-audit"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "arc-swap",
- "base64",
+ "base64 0.22.1",
  "chrono",
  "chrono-tz",
  "crossbeam-queue",
@@ -467,8 +473,9 @@ dependencies = [
 [[package]]
 name = "gateway-plugin-sdk"
 version = "0.1.0"
-source = "git+https://github.com/zyycn/codex-proxy-rs?rev=447869860a0fb88f78109cdb700db0cb1eb5d8b5#447869860a0fb88f78109cdb700db0cb1eb5d8b5"
+source = "git+https://github.com/zyycn/codex-proxy-rs?rev=d26bc36db5847cd8e945481fa8e2bd083fe5d4fd#d26bc36db5847cd8e945481fa8e2bd083fe5d4fd"
 dependencies = [
+ "base64 0.23.1",
  "semver",
  "serde",
  "serde_json",
@@ -1176,7 +1183,7 @@ name = "sqlx-core"
 version = "0.9.0"
 source = "git+https://github.com/launchbadge/sqlx?rev=94aafe3a68884d923b0798a767c8d7f6cfda89d2#94aafe3a68884d923b0798a767c8d7f6cfda89d2"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "cfg-if",
  "chrono",
@@ -1275,7 +1282,7 @@ version = "0.9.0"
 source = "git+https://github.com/launchbadge/sqlx?rev=94aafe3a68884d923b0798a767c8d7f6cfda89d2#94aafe3a68884d923b0798a767c8d7f6cfda89d2"
 dependencies = [
  "atoi",
- "base64",
+ "base64 0.22.1",
  "bitflags",
  "byteorder",
  "chrono",

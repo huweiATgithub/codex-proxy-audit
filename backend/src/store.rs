@@ -152,7 +152,7 @@ pub fn decode_search_text(encoded: &str) -> Result<String> {
         bail!("invalid stored audit text projection");
     }
     let mut text = String::new();
-    for token in encoded.as_bytes().chunks_exact(7) {
+    for token in encoded.as_bytes().as_chunks::<7>().0 {
         if token[0] != b'x' {
             bail!("invalid stored audit text token");
         }

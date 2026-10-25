@@ -77,6 +77,7 @@ async fn management_logs_use_severity_and_preserve_responses_without_retries() {
                         id: call_id,
                         method: "management.handle".into(),
                         context: CallContext {
+                            request: None,
                             call_id,
                             instance_id: "test-instance".into(),
                             generation: 1,
