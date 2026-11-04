@@ -12,7 +12,9 @@
 
 ## 2. 采集阶段
 
-选择 `request` 中间件作为输入采集点，在调用 `next` 之前读取该阶段可见的原始输入和会话元数据，将审计任务提交到有界环形缓冲区后继续请求。提交不等待数据库写入或写入确认。宿主已完成入口认证及初步解析，可以取得 Client Key ID；具体 Provider/account 的执行尝试尚未开始。[HTTP 入口][http-entry]、[执行入口][execution]
+选择 `request` 中间件作为输入采集点，在调用 `next` 之前读取该阶段可见的输入和会话元数据，将审计任务提交到有界环形缓冲区后继续请求。提交不等待数据库写入或写入确认。宿主已完成入口认证及初步解析，可以取得 Client Key ID；具体 Provider/account 的执行尝试尚未开始。[HTTP 入口][http-entry]、[执行入口][execution]
+
+采集范围为 `/v1/responses` 的 HTTP／WebSocket 请求和 `/v1/chat/completions` 的 HTTP 请求。宿主在进入 request 中间件之前将 Chat 的 `messages` 规范化为 Responses `input`，插件复用相同的最后输入项、来源过滤和前序对话规则，不另行转换 Chat 协议。Chat 未提供的 Codex 元数据保持缺失。[模型请求合同][model-request]
 
 插件仅以只读观察构建审计记录；过滤与正文片段选择均作用于审计副本，传给 `next` 的请求 headers、正文和执行设置保持原样。整条请求排除只决定是否提交审计任务，原请求仍调用一次 `next`。
 
@@ -25,7 +27,7 @@
 
 宿主 WebSocket 在进入 request 中间件时仍可保留客户端 `response.create` 的增量正文，历史重放准备发生在后续链中。因此不能假设该阶段已经得到完整会话。`generate=false` 的主会话预热请求也可能携带用户输入，而正式生成时只发送增量；预热不是丢弃该输入的理由。[WebSocket 入口][ws-entry]、[Codex 增量请求][incremental]
 
-审计插件安排在其他 request 输入改写插件之前；更外层 HTTP/WebSocket 插件仍可能已经改变正文，所以“原始输入”仅指本边界实际看到的内容。
+审计插件安排在其他 request 输入改写插件之前；更外层 HTTP/WebSocket 插件和宿主协议规范化仍可能已经改变正文，审计仅描述本边界实际看到的内容。
 
 ## 3. 来源判定与子代理过滤
 
@@ -167,7 +169,7 @@ Agent 工具循环携带早先的用户输入时，最后一个输入项通常�
 
 独立异步 worker 从环形缓冲区取出任务，每批最多 **32** 条，在一个数据库事务内批量保存输入及各自的固定上下文。worker 已取走的工作批次不受后续队列覆盖影响。单次批次写入最多等待 **2 秒**，数据库语句与锁分别限制为 1.5 秒和 1 秒；失败或超时的批次可以丢失，不自动重放。写入时机由 worker 决定，审计不提供入库时效保证。
 
-Key 名称使用已有缓存，请求以 `try_lock` 取得可用快照；缓存锁忙时省略名称及名称观测时间，不等待刷新。目录仅在管理 `api/keys` 查询时按需分页刷新，最多每分钟尝试一次，整次刷新限 1 秒；失败或不完整时保留上一目录，不推断 Key 删除。
+采集路径只保存 Key ID，不读取或缓存 Key 名称。列表、详情与 Key 筛选查询分别分页读取宿主当前 Key 列表，为该次响应建立临时名称映射；整次读取最多等待 5 秒，失败或不完整时返回可重试错误，不推断 Key 删除，详见[总体设计 §3](design.md#3-client-key-与审计身份)。
 
 解析或写入失败不阻止模型请求继续处理。写入诊断只包含故障类别，不含正文和凭据。容量限制、队列覆盖、进程退出、数据库不可用或写入超时均可能造成审计丢失；没有磁盘缓冲、可靠投递恢复或请求成功记录保证。
 
@@ -175,9 +177,9 @@ Key 名称使用已有缓存，请求以 `try_lock` 取得可用快照；缓存�
 
 请求正文超过 **16 MiB** 的插件采集上限时不建档，不截短本条输入。队列只持有已经提取的审计任务，worker 工作批次也有数量上限，不保存完整请求或响应副本。数据库存储边界见[总体设计 §4.3](design.md#43-逻辑数据模型)。
 
-[http-entry]: https://github.com/zyycn/codex-proxy-rs/blob/d26bc36db5847cd8e945481fa8e2bd083fe5d4fd/backend/crates/gateway-api/src/openai/responses/http.rs#L72
-[execution]: https://github.com/zyycn/codex-proxy-rs/blob/d26bc36db5847cd8e945481fa8e2bd083fe5d4fd/backend/crates/gateway-core/src/engine/execution/service.rs#L317
-[ws-entry]: https://github.com/zyycn/codex-proxy-rs/blob/d26bc36db5847cd8e945481fa8e2bd083fe5d4fd/backend/crates/gateway-api/src/openai/responses/websocket/mod.rs#L325
+[http-entry]: https://github.com/zyycn/codex-proxy-rs/blob/12c32fcdecb29da4e44a21bb33fbbf2aaf6a166d/backend/crates/gateway-api/src/openai/responses/http.rs#L67
+[execution]: https://github.com/zyycn/codex-proxy-rs/blob/12c32fcdecb29da4e44a21bb33fbbf2aaf6a166d/backend/crates/gateway-api/src/openai/middleware/request.rs#L96
+[ws-entry]: https://github.com/zyycn/codex-proxy-rs/blob/12c32fcdecb29da4e44a21bb33fbbf2aaf6a166d/backend/crates/gateway-api/src/openai/responses/websocket/mod.rs#L325
 [incremental]: https://github.com/openai/codex/blob/d27764b82f7118f674371e6d6e76271d9d606edb/codex-rs/core/src/client.rs#L1994
 [metadata]: https://github.com/openai/codex/blob/d27764b82f7118f674371e6d6e76271d9d606edb/codex-rs/core/src/responses_metadata.rs#L225
 [subagent]: https://github.com/openai/codex/blob/d27764b82f7118f674371e6d6e76271d9d606edb/codex-rs/core/src/responses_metadata.rs#L458
@@ -221,3 +223,5 @@ Key 名称使用已有缓存，请求以 `try_lock` 取得可用快照；缓存�
 [user-goal-kind]: https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/core/src/context/user_goal.rs#L15
 [shell-kind]: https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/core/src/context/user_shell_command.rs#L30
 [media-placeholder-kind]: https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/core/src/context/unsupported_media.rs#L8
+
+[model-request]: https://github.com/zyycn/codex-proxy-rs/blob/12c32fcdecb29da4e44a21bb33fbbf2aaf6a166d/backend/crates/gateway-plugin/sdk/docs/capabilities.md#L453

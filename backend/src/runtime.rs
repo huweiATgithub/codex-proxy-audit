@@ -1,4 +1,4 @@
-//! request 阶段的透传采集、有界写入调度与宿主管理入口
+//! request 阶段的透传采集、有界写入及宿主管理与维护入口
 use std::{
     collections::BTreeMap,
     sync::{
@@ -14,12 +14,13 @@ use gateway_plugin_sdk::{
     PluginFault,
     call::host::{LogLevel, LogRequest},
     call::management::{ManagementRegistration, ManagementResponse},
-    client::{ComposedPlugin, HostClient, PluginBuilder, RequestCall, TypedReply},
+    client::{ComposedPlugin, Empty, HostClient, PluginBuilder, RequestCall, TypedReply, methods},
 };
-use tokio::{
-    sync::{Mutex, Notify, oneshot},
-    task::JoinHandle,
-};
+use tokio::sync::{Mutex, Notify, oneshot};
+
+mod retention;
+
+use retention::Retention;
 
 use crate::{
     collection::exclusions::MAX_USER_AGENT_BYTES,
@@ -27,16 +28,13 @@ use crate::{
     exclusion_settings::Exclusions,
     keys::CurrentKeys,
     query::QueryService,
-    store::{RETENTION_BATCH_SIZE, Store},
+    store::Store,
 };
 
 const QUEUE_CAPACITY: usize = 64;
 const BATCH_CAPACITY: usize = 32;
 const PERSIST_WAIT: Duration = Duration::from_secs(2);
 const MAX_OBSERVATION_BYTES: usize = 16 * 1024 * 1024;
-const RETENTION_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
-const RETENTION_BATCH_PAUSE: Duration = Duration::from_millis(100);
-const RETENTION_WAIT: Duration = Duration::from_secs(4);
 const LOG_WAIT: Duration = Duration::from_millis(50);
 
 async fn log_event(host: &HostClient, request: LogRequest) {
@@ -62,44 +60,6 @@ async fn log_management_failure(host: &HostClient, status: u16) {
         },
     )
     .await;
-}
-
-/// 独立于采集和写入的清理任务；无请求时仍执行，退出时停止。
-pub struct Retention {
-    task: JoinHandle<()>,
-}
-
-impl Retention {
-    pub fn start(store: Store) -> Self {
-        let task = tokio::spawn(async move {
-            loop {
-                let delay = match tokio::time::timeout(
-                    RETENTION_WAIT,
-                    store.delete_expired_batch(Utc::now()),
-                )
-                .await
-                {
-                    Ok(Ok(deleted)) if deleted == RETENTION_BATCH_SIZE as u64 => {
-                        RETENTION_BATCH_PAUSE
-                    }
-                    Ok(Ok(_)) => RETENTION_INTERVAL,
-                    _ => {
-                        eprintln!(
-                            "audit: retention batch failed or timed out; retrying at the next daily sweep"
-                        );
-                        RETENTION_INTERVAL
-                    }
-                };
-                tokio::time::sleep(delay).await;
-            }
-        });
-        Self { task }
-    }
-
-    pub async fn stop(self) {
-        self.task.abort();
-        let _ = self.task.await;
-    }
 }
 
 struct AuditQueue {
@@ -203,14 +163,17 @@ pub async fn plugin(store: Store, writer: Writer) -> anyhow::Result<ComposedPlug
     let secret = store.secret("query_cursor").await?;
     let exclusions = Exclusions::load(store.clone()).await;
     let collection_exclusions = exclusions.clone();
+    let retention = Retention::new(store.clone());
     let builder = PluginBuilder::from_json(include_bytes!("../../plugin.json"))?
         .middleware(move |call: RequestCall| {
             let writer = writer.clone();
             let policy = collection_exclusions.snapshot();
             async move {
                 let head = &call.request.head;
-                if head.endpoint == "/v1/responses"
-                    && call.request.body.len() <= MAX_OBSERVATION_BYTES
+                if matches!(
+                    head.endpoint.as_str(),
+                    "/v1/responses" | "/v1/chat/completions"
+                ) && call.request.body.len() <= MAX_OBSERVATION_BYTES
                     && let Ok(body) = serde_json::from_slice(&call.request.body)
                 {
                     let observation = RequestObservation {
@@ -277,6 +240,13 @@ pub async fn plugin(store: Store, writer: Writer) -> anyhow::Result<ComposedPlug
                     }
                 }
                 call.next.run(call.request).await
+            }
+        })?
+        .on(methods::RECONCILE, move |call| {
+            let retention = retention.clone();
+            async move {
+                retention.reconcile(&call.host).await?;
+                Ok(TypedReply::new(Empty {}))
             }
         })?
         .management(registration, move |call| {

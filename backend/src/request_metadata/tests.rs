@@ -1,3 +1,5 @@
+//! 验证宿主请求信息关联、正文读取与失败资源回收
+use crate::test_host::receive_business_frame;
 use std::collections::BTreeMap;
 
 use super::*;
@@ -5,7 +7,7 @@ use gateway_plugin_sdk::{
     CallContext, ErrorCode, Frame, Handshake, Message, PROTOCOL_VERSION, PluginFault, Stage,
     client::{
         CallFuture, CallReply, PluginCall, PluginHandler, PluginSession, SessionConfig,
-        SessionError, read_frame, write_frame,
+        SessionError, write_frame,
     },
 };
 use serde_json::{Value, json};
@@ -180,7 +182,7 @@ impl HostMock {
         .await
         .unwrap();
         assert!(matches!(
-            read_frame(&mut stream).await.unwrap().message,
+            receive_business_frame(&mut stream).await.unwrap().message,
             Message::Ready { .. }
         ));
         write_frame(
@@ -212,10 +214,13 @@ impl HostMock {
     }
 
     async fn callback(&mut self, expected: &str) -> (u64, Value) {
-        let frame = timeout(Duration::from_secs(1), read_frame(&mut self.stream))
-            .await
-            .unwrap()
-            .unwrap();
+        let frame = timeout(
+            Duration::from_secs(1),
+            receive_business_frame(&mut self.stream),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let Message::Callback {
             id,
             parent_id,
@@ -278,10 +283,13 @@ impl HostMock {
     }
 
     async fn finish(mut self, expected: Value) {
-        let frame = timeout(Duration::from_secs(1), read_frame(&mut self.stream))
-            .await
-            .unwrap()
-            .unwrap();
+        let frame = timeout(
+            Duration::from_secs(1),
+            receive_business_frame(&mut self.stream),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(matches!(frame.message, Message::Result { id:1, result } if result == expected));
         assert!(frame.payload.is_empty());
         write_frame(&mut self.stream, &Frame::control(Message::Shutdown))

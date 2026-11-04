@@ -6,3 +6,6 @@ pub mod query;
 mod request_metadata;
 pub mod runtime;
 pub mod store;
+
+#[cfg(test)]
+mod test_host;

@@ -1,6 +1,6 @@
 //! 独立插件进程入口；初始化插件私有存储并管理任务生命周期
 use codex_proxy_audit::{
-    runtime::{Retention, Writer, plugin},
+    runtime::{Writer, plugin},
     store::Store,
 };
 use gateway_plugin_sdk::client::{PluginSession, SessionConfig};
@@ -21,19 +21,17 @@ async fn run() -> anyhow::Result<()> {
         SessionConfig::default(),
     )
     .await?;
-    let (store, writer, handler, retention) = tokio::time::timeout(Duration::from_secs(4), async {
+    let (store, writer, handler) = tokio::time::timeout(Duration::from_secs(4), async {
         let store = Store::initialize().await?;
         let writer = Writer::start(store.clone());
         let handler = plugin(store.clone(), writer.clone()).await?;
-        let retention = Retention::start(store.clone());
-        Ok::<_, anyhow::Error>((store, writer, handler, retention))
+        Ok::<_, anyhow::Error>((store, writer, handler))
     })
     .await??;
     let result = tokio::select! {
         result = session.run(handler) => result,
         _ = shutdown_signal() => Ok(()),
     };
-    retention.stop().await;
     writer.drain().await;
     store.close().await;
     result?;

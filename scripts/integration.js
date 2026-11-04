@@ -109,6 +109,13 @@ async function requestModel(key, input, thread, { stream = false, extra = {}, pu
   const events = text.split('\n').filter((line) => line.startsWith('data: ') && line !== 'data: [DONE]').map((line) => JSON.parse(line.slice(6)));
   const complete = events.find((event) => event.type === 'response.completed'); assert.ok(complete, text); return complete.response;
 }
+async function requestChat(key, messages, { stream = false, userAgent = 'codex-audit-integration/chat' } = {}) {
+  const response = await fetch(base + '/v1/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${key.plaintextKey}`, 'content-type': 'application/json', 'user-agent': userAgent }, body: JSON.stringify({ model: 'gpt-5.4', messages, stream, reasoning_effort: 'low' }), signal: AbortSignal.timeout(20000) });
+  const text = await response.text(); assert.equal(response.status, 200, text);
+  if (!stream) return JSON.parse(text).choices[0].message.content;
+  assert.ok(text.includes('data: [DONE]'), 'Chat SSE reaches its terminal event');
+  return text.split('\n').filter((line) => line.startsWith('data: ') && line !== 'data: [DONE]').map((line) => JSON.parse(line.slice(6)).choices[0]?.delta?.content || '').join('');
+}
 async function listCount(q, count, key) {
   return until(async () => { const page = await management('audits', { q, ...(key ? { key: key.id } : {}) }); assert.equal(page.total, count); return page; }, `audit count ${q}=${count}`);
 }
@@ -249,6 +256,30 @@ async function run() {
   await management('saveExclusions', exclusions);
   assert.deepEqual((await json('/api/admin/plugins/instances')).find((item) => item.id === instanceId).configuration, {});
   report('live Rust regex exclusions skip HTTP JSON/SSE audit bodies and context while requests complete; clearing restores capture');
+  for (const stream of [false, true]) {
+    const marker = `INTEGRATION-chat-${stream ? 'sse' : 'json'}`;
+    const prior = 'Chat assistant plan: inspect the database before migration.';
+    const input = `${marker} please continue`;
+    assert.equal(await requestChat(key, [{ role: 'user', content: 'Plan the migration.' }, { role: 'assistant', content: prior }, { role: 'user', content: input }], { stream }), 'Agent 方案：先检查数据库，再执行迁移。😀');
+    const collected = await listCount(marker, 1);
+    const detail = await management('audit', { id: collected.items[0].id });
+    assert.equal(await textContent(detail.id, detail.input), input);
+    assert.equal(await textContent(detail.id, detail.context.find((item) => item.role === 'assistant').content), prior);
+    assert.equal(detail.threadId, null); assert.equal(detail.turnId, null);
+    const forwarded = upstream.requests.findLast((body) => body.input?.some((item) => item.content?.some((part) => part.text === input)));
+    assert.ok(forwarded, 'Chat traverses the host Responses normalization and upstream');
+    assert.deepEqual((await management('requestMetadata', { id: detail.id })).requestMetadata, { model: 'gpt-5.4', userAgent: 'codex-audit-integration/chat', reasoningEffort: 'low' });
+  }
+  report('Chat JSON/SSE reuses normalized input collection, preceding assistant context and optional host metadata');
+  for (const messages of [
+    [{ role: 'user', content: 'INTEGRATION-chat-skipped assistant ending' }, { role: 'assistant', content: 'Already answered.' }],
+    [{ role: 'user', content: 'INTEGRATION-chat-skipped tool ending' }, { role: 'assistant', content: null, tool_calls: [{ id: 'call_chat', type: 'function', function: { name: 'inspect', arguments: '{}' } }] }, { role: 'tool', tool_call_id: 'call_chat', content: 'INTEGRATION-chat-skipped tool result' }],
+  ]) assert.equal(await requestChat(key, messages), 'Agent 方案：先检查数据库，再执行迁移。😀');
+  assert.equal(await requestChat(key, [{ role: 'user', content: 'INTEGRATION-chat-skipped UA exclusion' }], { userAgent: 'AUDIT-EXCLUDED/chat' }), 'Agent 方案：先检查数据库，再执行迁移。😀');
+  await requestChat(key, [{ role: 'user', content: 'INTEGRATION-chat-barrier eligible input' }]);
+  await listCount('INTEGRATION-chat-barrier', 1);
+  await assertExcluded('INTEGRATION-chat-skipped');
+  report('Chat assistant/tool endings and excluded User-Agents forward normally without storing audit content');
   const first = message('integration-input-1', 'INTEGRATION-first 请拟定数据库迁移方案。😀');
   const response1 = await requestModel(key, [first], 'thread-http');
   assert.ok(auditRows('PRAGMA table_info(audits)').every((column) => !['key_name', 'key_name_observed_at'].includes(column.name)));
@@ -504,6 +535,20 @@ async function run() {
   await until(async () => { assert.equal((await management('audit', { id: expired.id }, 404)).error.code, 'not_found'); }, 'startup retention removes expired audit without a model request');
   assert.equal(auditValue('SELECT count(*) FROM contents WHERE audit_id=?', expired.id), 0);
   report('startup retention removes expired input and context while retaining recent audits');
+  await requestModel(key, [message('integration-maintenance-disabled', 'INTEGRATION-maintenance-disabled expired while inactive')], 'thread-maintenance');
+  const inactiveAudit = (await listCount('INTEGRATION-maintenance-disabled', 1)).items[0];
+  const setEnabled = async (enabled) => {
+    const current = (await json('/api/admin/plugins/instances')).find((item) => item.id === instanceId);
+    await json('/api/admin/plugins/instances/update', { id: instanceId, instance: { expectedRevision: current.revision, name: current.name, artifactSha256: install.data.artifact.metadata.sha256, enabled, configuration: {}, secrets: {}, bindings: [{ contribution: install.data.artifact.metadata.contributes.middleware.id, stage: 'request', order: -1000000, failurePolicy: 'delegate' }] } });
+  };
+  await setEnabled(false);
+  auditExecute('UPDATE audits SET first_observed_at=? WHERE id=?', Date.now() - 4 * 86400000, inactiveAudit.id);
+  await delay(31000);
+  assert.equal(auditValue('SELECT count(*) FROM audits WHERE id=?', inactiveAudit.id), 1, 'disabled maintenance retains expired data');
+  await setEnabled(true); await refreshView();
+  await until(() => { assert.equal(auditValue('SELECT count(*) FROM audits WHERE id=?', inactiveAudit.id), 0); }, 'activation maintenance cleans without model traffic');
+  assert.equal(auditValue('SELECT count(*) FROM contents WHERE audit_id=?', inactiveAudit.id), 0);
+  report('host maintenance pauses while disabled and cleans expired content after reactivation without model traffic');
   assert.equal((await management('viewContext')).timeZone, 'America/New_York');
   assert.deepEqual(await management('exclusions'), exclusions);
   const excludedAfterRestart = [message('integration-excluded-restart', 'INTEGRATION-excluded-restart persisted regex')];

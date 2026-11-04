@@ -1,6 +1,7 @@
 //! Settings and collection may change storage, but must preserve the host request and response.
 use super::*;
 use crate::store::AuditListFilter;
+use crate::test_host::receive_business_frame;
 use gateway_plugin_sdk::{
     CallContext, Frame, Handshake, Message, PROTOCOL_VERSION, Stage,
     call::{
@@ -12,13 +13,13 @@ use gateway_plugin_sdk::{
             MiddlewareTransport, NEXT_METHOD,
         },
     },
-    client::{PluginSession, SessionConfig, read_frame, write_frame},
+    client::{PluginSession, SessionConfig, write_frame},
 };
 use serde_json::{Value, json};
 use tokio::io::DuplexStream;
 
 async fn receive(host: &mut DuplexStream) -> Frame {
-    tokio::time::timeout(Duration::from_secs(2), read_frame(host))
+    tokio::time::timeout(Duration::from_secs(2), receive_business_frame(host))
         .await
         .expect("audit settings must not stall request forwarding")
         .unwrap()

@@ -11,7 +11,6 @@ use codex_proxy_audit::{
     collection::{AuditDraft, RequestObservation, collect, exclusions::ExclusionPolicy},
     keys::CurrentKeys,
     query::QueryService,
-    runtime::Retention,
     store::{RETENTION_BATCH_SIZE, Store, decode_text, search_text},
 };
 use serde_json::{Value, json};
@@ -618,48 +617,6 @@ async fn interrupted_cleanup_rolls_back_and_connections_recover() -> Result<()> 
         .persist_batch(&[retention_draft(now)])
         .await?;
     assert_eq!(database.count().await?, 1);
-    database.clean().await
-}
-
-#[tokio::test]
-async fn retention_worker_catches_up_at_startup_and_runs_daily_without_requests() -> Result<()> {
-    let database = Database::create().await?;
-    let now = Utc::now();
-    let expired = retention_draft(now - chrono::TimeDelta::days(4));
-    let inputs = vec![expired.clone(); (RETENTION_BATCH_SIZE * 2 + 1) as usize];
-    for batch in inputs.chunks(32) {
-        database.store.persist_batch(batch).await?;
-    }
-    database
-        .store
-        .persist_batch(&[retention_draft(now)])
-        .await?;
-    let worker = Retention::start(database.store.clone());
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while database.count().await? != 1 {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        Ok::<_, anyhow::Error>(())
-    })
-    .await
-    .context("startup must clear more than one batch without waiting for requests")??;
-    database.store.persist_batch(&[expired]).await?;
-    // Advance the scheduler's clock, then resume it before database I/O so
-    // pool/statement timeouts still use real elapsed time.
-    tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(24 * 60 * 60 + 1)).await;
-    tokio::time::resume();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while database.count().await? != 1 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        Ok::<_, anyhow::Error>(())
-    })
-    .await
-    .context("daily cleanup must run again without incoming requests")??;
-    tokio::time::timeout(Duration::from_secs(1), worker.stop())
-        .await
-        .context("shutdown must not wait for the next retention interval")?;
     database.clean().await
 }
 

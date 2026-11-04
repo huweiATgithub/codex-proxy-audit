@@ -1,10 +1,10 @@
 //! Host logging must preserve responses when logs are suppressed, rejected or stalled.
 use super::*;
+use crate::test_host::receive_business_frame;
 use gateway_plugin_sdk::{
     CallContext, ErrorCode, Frame, Handshake, Message, PROTOCOL_VERSION, Stage,
     client::{
-        CallFuture, CallReply, PluginCall, PluginHandler, PluginSession, SessionConfig, read_frame,
-        write_frame,
+        CallFuture, CallReply, PluginCall, PluginHandler, PluginSession, SessionConfig, write_frame,
     },
 };
 use serde_json::json;
@@ -23,7 +23,7 @@ impl PluginHandler for ManagementHandler {
 }
 
 async fn receive(host: &mut DuplexStream) -> Frame {
-    tokio::time::timeout(Duration::from_secs(1), read_frame(host))
+    tokio::time::timeout(Duration::from_secs(1), receive_business_frame(host))
         .await
         .expect("logging must not hold the response indefinitely")
         .unwrap()
