@@ -271,6 +271,36 @@ async function run() {
     assert.deepEqual((await management('requestMetadata', { id: detail.id })).requestMetadata, { model: 'gpt-5.4', userAgent: 'codex-audit-integration/chat', reasoningEffort: 'low' });
   }
   report('Chat JSON/SSE reuses normalized input collection, preceding assistant context and optional host metadata');
+  for (const stream of [false, true]) {
+    const marker = `INTEGRATION-chat-media-${stream ? 'sse' : 'json'}`;
+    const fileId = 'file-audit-synthetic-reference';
+    const audio = Buffer.from('synthetic audio fixture').toString('base64');
+    assert.equal(await requestChat(key, [{ role: 'user', content: [{ type: 'text', text: marker }, { type: 'file', file: { file_id: fileId } }, { type: 'input_audio', input_audio: { data: audio, format: 'wav' } }] }], { stream }), 'Agent 方案：先检查数据库，再执行迁移。😀');
+    const detail = await management('audit', { id: (await listCount(marker, 1)).items[0].id });
+    const content = await management('content', { id: detail.id, contentId: detail.input.id });
+    assert.equal(content.nextCursor, null);
+    assert.deepEqual(content.blocks.map((block) => block.kind === 'text' ? block.text : block.mediaType), [marker, 'input_file', 'input_audio']);
+    const stored = JSON.stringify(auditRows('SELECT blocks FROM contents WHERE audit_id=?', detail.id));
+    assert.ok(!stored.includes(fileId) && !stored.includes(audio), 'media references and binary data are absent from audit content');
+    const forwarded = upstream.requests.findLast((body) => body.input?.some((item) => item.content?.some((part) => part.text === marker)));
+    assert.ok(forwarded, 'media request reaches the upstream');
+    const media = forwarded.input.at(-1).content;
+    assert.equal(media.find((part) => part.type === 'input_file').file_id, fileId);
+    assert.equal(media.find((part) => part.type === 'input_audio').audio_url, `data:audio/wav;base64,${audio}`);
+  }
+  report('Host Chat file/audio normalization reuses nontext audit placeholders without retaining media payloads');
+  const customHistory = [{ role: 'user', content: 'INTEGRATION-chat-custom-prior inspect the database' }, { role: 'assistant', content: null, tool_calls: [{ id: 'call_custom', type: 'custom', custom: { name: 'inspect', input: 'private custom tool input' } }] }, { role: 'tool', tool_call_id: 'call_custom', content: 'private custom tool result' }];
+  assert.equal(await requestChat(key, customHistory), 'Agent 方案：先检查数据库，再执行迁移。😀');
+  const customForwarded = upstream.requests.at(-1).input;
+  assert.deepEqual(customForwarded.find((item) => item.type === 'custom_tool_call'), { type: 'custom_tool_call', call_id: 'call_custom', name: 'inspect', input: 'private custom tool input' });
+  assert.deepEqual(customForwarded.find((item) => item.type === 'custom_tool_call_output'), { type: 'custom_tool_call_output', call_id: 'call_custom', output: 'private custom tool result' });
+  await requestChat(key, [...customHistory, { role: 'user', content: 'INTEGRATION-chat-custom-next continue' }]);
+  const customDetail = await management('audit', { id: (await listCount('INTEGRATION-chat-custom-next', 1)).items[0].id });
+  assert.equal(customDetail.context.length, 1);
+  assert.equal(await textContent(customDetail.id, customDetail.context[0].content), customHistory[0].content);
+  assert.ok(!JSON.stringify(auditRows('SELECT blocks FROM contents WHERE audit_id=?', customDetail.id)).includes('private custom tool'));
+  await listCount('INTEGRATION-chat-custom-prior', 0);
+  report('Host Chat custom tool calls/results forward while collection retains only user input and readable message context');
   for (const messages of [
     [{ role: 'user', content: 'INTEGRATION-chat-skipped assistant ending' }, { role: 'assistant', content: 'Already answered.' }],
     [{ role: 'user', content: 'INTEGRATION-chat-skipped tool ending' }, { role: 'assistant', content: null, tool_calls: [{ id: 'call_chat', type: 'function', function: { name: 'inspect', arguments: '{}' } }] }, { role: 'tool', tool_call_id: 'call_chat', content: 'INTEGRATION-chat-skipped tool result' }],

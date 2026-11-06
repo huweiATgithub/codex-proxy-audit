@@ -172,7 +172,7 @@ checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
 name = "codex-proxy-audit"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -473,7 +473,7 @@ dependencies = [
 [[package]]
 name = "gateway-plugin-sdk"
 version = "0.1.0"
-source = "git+https://github.com/zyycn/codex-proxy-rs?rev=12c32fcdecb29da4e44a21bb33fbbf2aaf6a166d#12c32fcdecb29da4e44a21bb33fbbf2aaf6a166d"
+source = "git+https://github.com/zyycn/codex-proxy-rs?rev=ba3baddbda7293d1d76ea066dd5e42298618c15a#ba3baddbda7293d1d76ea066dd5e42298618c15a"
 dependencies = [
  "base64 0.23.1",
  "semver",

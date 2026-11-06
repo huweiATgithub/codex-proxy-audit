@@ -177,9 +177,9 @@ Agent 工具循环携带早先的用户输入时，最后一个输入项通常�
 
 请求正文超过 **16 MiB** 的插件采集上限时不建档，不截短本条输入。队列只持有已经提取的审计任务，worker 工作批次也有数量上限，不保存完整请求或响应副本。数据库存储边界见[总体设计 §4.3](design.md#43-逻辑数据模型)。
 
-[http-entry]: https://github.com/zyycn/codex-proxy-rs/blob/12c32fcdecb29da4e44a21bb33fbbf2aaf6a166d/backend/crates/gateway-api/src/openai/responses/http.rs#L67
-[execution]: https://github.com/zyycn/codex-proxy-rs/blob/12c32fcdecb29da4e44a21bb33fbbf2aaf6a166d/backend/crates/gateway-api/src/openai/middleware/request.rs#L96
-[ws-entry]: https://github.com/zyycn/codex-proxy-rs/blob/12c32fcdecb29da4e44a21bb33fbbf2aaf6a166d/backend/crates/gateway-api/src/openai/responses/websocket/mod.rs#L325
+[http-entry]: https://github.com/zyycn/codex-proxy-rs/blob/ba3baddbda7293d1d76ea066dd5e42298618c15a/backend/crates/gateway-api/src/openai/responses/http.rs#L70
+[execution]: https://github.com/zyycn/codex-proxy-rs/blob/ba3baddbda7293d1d76ea066dd5e42298618c15a/backend/crates/gateway-api/src/openai/middleware/request.rs#L96
+[ws-entry]: https://github.com/zyycn/codex-proxy-rs/blob/ba3baddbda7293d1d76ea066dd5e42298618c15a/backend/crates/gateway-api/src/openai/responses/websocket/mod.rs#L329
 [incremental]: https://github.com/openai/codex/blob/d27764b82f7118f674371e6d6e76271d9d606edb/codex-rs/core/src/client.rs#L1994
 [metadata]: https://github.com/openai/codex/blob/d27764b82f7118f674371e6d6e76271d9d606edb/codex-rs/core/src/responses_metadata.rs#L225
 [subagent]: https://github.com/openai/codex/blob/d27764b82f7118f674371e6d6e76271d9d606edb/codex-rs/core/src/responses_metadata.rs#L458
@@ -224,4 +224,4 @@ Agent 工具循环携带早先的用户输入时，最后一个输入项通常�
 [shell-kind]: https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/core/src/context/user_shell_command.rs#L30
 [media-placeholder-kind]: https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/core/src/context/unsupported_media.rs#L8
 
-[model-request]: https://github.com/zyycn/codex-proxy-rs/blob/12c32fcdecb29da4e44a21bb33fbbf2aaf6a166d/backend/crates/gateway-plugin/sdk/docs/capabilities.md#L453
+[model-request]: https://github.com/zyycn/codex-proxy-rs/blob/ba3baddbda7293d1d76ea066dd5e42298618c15a/backend/crates/gateway-plugin/sdk/docs/capabilities.md#L458
