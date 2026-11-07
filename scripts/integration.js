@@ -678,6 +678,33 @@ async function run() {
   const beforeExclusionSaveRequests = requested.filter((url) => /\/api\/api\/(audits|audit|audit-content|keys|view-context)(?:\?|$)/.test(url)).length;
   const beforeExclusionSaveFacts = auditSnapshot();
   const beforeExclusionSaveDates = await ui.locator('.range-caption').textContent();
+  const regexDocumentation = 'https://docs.rs/regex/latest/regex/#syntax';
+  const regexHelp = ui.getByRole('link', { name: 'Rust regex 语法', exact: true });
+  const externalDialog = page.getByRole('dialog').filter({ hasText: 'docs.rs' });
+  const cancelExternal = externalDialog.getByRole('button', { name: /^(取消|Cancel)$/ });
+  await ui.getByRole('textbox', { name: 'UA 正则 1', exact: true }).fill('^external-link-draft/');
+  const pagesBeforeExternal = page.context().pages().length;
+  await regexHelp.click(); await externalDialog.waitFor();
+  assert.equal(page.context().pages().length, pagesBeforeExternal, 'accepting the bridge request does not open a tab');
+  await page.screenshot({ path: join(temporary, 'real-host-external-link.png'), fullPage: true, animations: 'disabled' });
+  await cancelExternal.click(); await externalDialog.waitFor({ state: 'detached' });
+  await page.context().grantPermissions(['clipboard-read', 'clipboard-write'], { origin: base });
+  await regexHelp.click(); await externalDialog.waitFor();
+  await externalDialog.getByRole('button', { name: /^(复制链接|Copy link)$/i }).click();
+  await until(async () => { assert.equal(await page.evaluate(() => navigator.clipboard.readText()), regexDocumentation); }, 'host copies the confirmed documentation URL');
+  await cancelExternal.click(); await externalDialog.waitFor({ state: 'detached' });
+  await page.context().route('https://docs.rs/regex/latest/regex/**', (route) => route.fulfill({ contentType: 'text/html', body: '<title>Regex documentation fixture</title>' }));
+  await regexHelp.click(); await externalDialog.waitFor();
+  const openedPage = page.context().waitForEvent('page');
+  await externalDialog.getByRole('button', { name: /^(打开|Open)$/i }).click();
+  const documentationPage = await openedPage;
+  await documentationPage.waitForLoadState('domcontentloaded');
+  assert.equal(documentationPage.url(), regexDocumentation);
+  await documentationPage.close(); await externalDialog.waitFor({ state: 'detached' });
+  assert.equal(await ui.getByRole('textbox', { name: 'UA 正则 1', exact: true }).inputValue(), '^external-link-draft/');
+  assert.deepEqual(await management('exclusions'), exclusions);
+  assert.equal(requested.filter((url) => /\/api\/api\/(audits|audit|audit-content|keys|view-context)(?:\?|$)/.test(url)).length, beforeExclusionSaveRequests);
+  report('real host external-link bridge confirms documentation open/copy/cancel and preserves unsaved exclusions and audit queries');
   await ui.getByRole('textbox', { name: 'UA 正则 1', exact: true }).fill('(');
   await ui.getByRole('button', { name: '保存排除规则', exact: true }).click();
   await until(async () => { assert.equal(await ui.getByRole('textbox', { name: 'UA 正则 1', exact: true }).getAttribute('aria-invalid'), 'true'); }, 'real iframe identifies invalid Rust regex row');
@@ -704,7 +731,7 @@ async function run() {
     report('isolated SQLite Rust storage and audit query tests');
     if (options.keep) await startHost();
   }
-  writeFileSync(join(temporary, 'result.json'), JSON.stringify({ hostUrl: `http://0.0.0.0:${hostPort}`, pageUrl: `${base}/plugins/${instanceId}/${view.pages[0].id}`, reports, screenshot: join(temporary, 'real-host-ui.png'), independentSaveScreenshot: join(temporary, 'real-host-independent-save.png'), settingsScreenshot: join(temporary, 'real-host-settings.png'), dateRangeScreenshot: join(temporary, 'real-host-date-range.png'), hostCommit: options['host-commit'] || null, hostBinarySha256: createHash('sha256').update(readFileSync(resolve(options['host-binary']))).digest('hex'), packageSha256: sha }, null, 2));
+  writeFileSync(join(temporary, 'result.json'), JSON.stringify({ hostUrl: `http://0.0.0.0:${hostPort}`, pageUrl: `${base}/plugins/${instanceId}/${view.pages[0].id}`, reports, screenshot: join(temporary, 'real-host-ui.png'), independentSaveScreenshot: join(temporary, 'real-host-independent-save.png'), settingsScreenshot: join(temporary, 'real-host-settings.png'), dateRangeScreenshot: join(temporary, 'real-host-date-range.png'), externalLinkScreenshot: join(temporary, 'real-host-external-link.png'), hostCommit: options['host-commit'] || null, hostBinarySha256: createHash('sha256').update(readFileSync(resolve(options['host-binary']))).digest('hex'), packageSha256: sha }, null, 2));
   console.log(`Evidence: ${temporary}`);
   if (options.keep) {
     console.log(`Remote review: http://<this-machine>:${hostPort}/plugins/${instanceId}/${view.pages[0].id}`);

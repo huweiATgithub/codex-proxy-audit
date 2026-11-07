@@ -11,12 +11,22 @@
     button { font: inherit; color: inherit; background: var(--cp-color-bg-container, white); border: 1px solid var(--cp-color-border-secondary, #e2e8f0); border-radius: 5px; padding: 4px 10px; cursor: pointer; }
     iframe { display: block; width: 100%; flex: 1; min-height: 0; border: 0; }
     #error { padding: 24px; }
+    dialog { width: min(28rem, calc(100vw - 32px)); color: inherit; background: var(--cp-color-bg-container, white); border: 1px solid var(--cp-color-border-secondary, #e2e8f0); border-radius: 10px; padding: 20px; }
+    dialog::backdrop { background: #0006; }
+    dialog h2 { margin: 0 0 14px; font-size: 16px; }
+    dialog p { margin: 0 0 20px; overflow-wrap: anywhere; }
+    .external-actions { display: flex; justify-content: flex-end; gap: 8px; }
   </style>
 </head>
 <body>
   <header><span>Demo · 模拟宿主 · 500 条虚构输入</span><button id="theme" type="button">切换深色主题</button></header>
   <iframe title="Prompt 审计插件" sandbox="allow-scripts"></iframe>
   <p id="error" role="alert" hidden></p>
+  <dialog id="external-link" aria-labelledby="external-title" aria-describedby="external-host">
+    <h2 id="external-title">打开外部链接</h2>
+    <p id="external-host" dir="ltr"></p>
+    <div class="external-actions"><button id="external-cancel" type="button">取消</button><button id="external-copy" type="button">复制链接</button><button id="external-open" type="button">打开链接</button></div>
+  </dialog>
   <script type="module" src="/shell.js"></script>
 </body>
 </html>

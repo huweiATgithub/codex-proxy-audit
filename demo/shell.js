@@ -29,17 +29,19 @@ function installBridge(initial) {
     if (message.ok) operation.resolve(message.payload);
     else operation.reject(new Error(message.error));
   });
+  function invoke(type, payload) {
+    if (pending.size >= 8) return Promise.reject(new Error('Too many management requests'));
+    return new Promise((resolve, reject) => {
+      const id = ++sequence;
+      const timer = setTimeout(() => { pending.delete(id); reject(new Error('Management request timed out')); }, 30000);
+      pending.set(id, { resolve, reject, timer });
+      parent.postMessage({ target: initial.target, version: initial.version, channel: initial.channel, session: initial.session, type, id, payload }, initial.parentOrigin);
+    });
+  }
   const api = Object.freeze({ version: 2, plugin: Object.freeze(initial.plugin), page: Object.freeze(initial.page),
     get theme() { return theme; },
-    request(input) {
-      if (pending.size >= 8) return Promise.reject(new Error('Too many management requests'));
-      return new Promise((resolve, reject) => {
-        const id = ++sequence;
-        const timer = setTimeout(() => { pending.delete(id); reject(new Error('Management request timed out')); }, 30000);
-        pending.set(id, { resolve, reject, timer });
-        parent.postMessage({ target: initial.target, version: initial.version, channel: initial.channel, session: initial.session, type: 'request', id, payload: input }, initial.parentOrigin);
-      });
-    },
+    request: input => invoke('request', input),
+    openExternal: url => invoke('open-external', url),
     resourceUrl(path) {
       if (!Object.hasOwn(initial.resourceUrls, path)) throw new Error('Unregistered resource');
       return initial.resourceUrls[path];
@@ -56,6 +58,21 @@ async function start() {
   const resourceUrls = Object.fromEntries(Object.entries(resources).map(([path, resource]) => [path, `data:${resource.contentType};base64,${resource.body}`]));
   const page = registration.pages[0];
   const send = (type, payload) => frame.contentWindow.postMessage({ ...envelope, type, payload }, '*');
+  const externalDialog = document.querySelector('#external-link');
+  let externalLink;
+  externalDialog.addEventListener('close', () => { externalLink = undefined; });
+  document.querySelector('#external-cancel').addEventListener('click', () => externalDialog.close());
+  document.querySelector('#external-copy').addEventListener('click', async () => {
+    const link = externalLink;
+    const url = link.href;
+    try { await navigator.clipboard.writeText(url); }
+    catch { if (externalLink === link) document.querySelector('#external-host').textContent = url; }
+  });
+  document.querySelector('#external-open').addEventListener('click', () => {
+    window.open(externalLink.href, '_blank', 'noopener,noreferrer');
+    externalDialog.close();
+  });
+  window.addEventListener('pagehide', () => externalDialog.close(), { once: true });
   let theme = 'light';
   const applyTheme = () => {
     document.documentElement.dataset.theme = theme;
@@ -66,9 +83,20 @@ async function start() {
   button.addEventListener('click', () => { theme = theme === 'light' ? 'dark' : 'light'; applyTheme(); });
   applyTheme();
   window.addEventListener('message', async (event) => {
-    if (event.source !== frame.contentWindow || !matches(event.data) || event.data.type !== 'request') return;
+    if (event.source !== frame.contentWindow || event.origin !== 'null' || !matches(event.data) || !['request', 'open-external'].includes(event.data.type)) return;
     const { id, payload } = event.data;
     try {
+      if (event.data.type === 'open-external') {
+        if (externalLink) throw new Error('已有链接等待确认');
+        if (!navigator.userActivation?.isActive || document.activeElement !== frame) throw new Error('请在插件页面中点击链接或按钮');
+        const url = typeof payload === 'string' ? URL.parse(payload) : null;
+        if (!url || url.protocol !== 'https:' || url.username || url.password) throw new Error('外部链接地址无效');
+        externalLink = url;
+        document.querySelector('#external-host').textContent = url.host;
+        externalDialog.showModal();
+        frame.contentWindow.postMessage({ ...envelope, type: 'result', id, ok: true }, '*');
+        return;
+      }
       if (!registration.routes.some((route) => route.method === payload.method && route.path === payload.path)
         || (payload.body !== undefined && (!(payload.body instanceof ArrayBuffer) || payload.contentType !== 'application/json')) || typeof payload.query !== 'string' || payload.query.startsWith('?') || payload.query.includes('#')
         || new TextEncoder().encode(payload.query).byteLength > 8192) throw new Error('Invalid management request');

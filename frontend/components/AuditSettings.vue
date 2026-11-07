@@ -1,5 +1,5 @@
 <script setup>
-import { inject, watch } from 'vue';
+import { inject, ref, watch } from 'vue';
 import { BaseButton, BaseInput, BaseModal } from '@codex-proxy/ui';
 import { MAX_EXCLUSION_PATTERNS, MAX_EXCLUSION_PATTERN_BYTES } from '../../contracts/audit.js';
 import { useExclusions } from '../state/exclusions.js';
@@ -9,6 +9,14 @@ const props = defineProps({ timeZone: { type: String, required: true } });
 const emit = defineEmits(['time-zone-saved']);
 const open = defineModel({ type: Boolean, default: false });
 const client = inject('auditClient');
+const regexDocumentation = 'https://docs.rs/regex/latest/regex/#syntax';
+const externalLinkError = ref('');
+async function openRegexDocumentation() {
+  externalLinkError.value = '';
+  try { await client.openExternal(regexDocumentation); }
+  catch (error) { externalLinkError.value = error.message; }
+}
+watch(open, () => { externalLinkError.value = ''; });
 const { draft: timeZoneDraft, saved: savedTimeZone, state: timeZoneState, fillBrowser, save: saveTimeZone } = useTimeZone(client, props.timeZone);
 const { draft, saved, loadState, saveState, dirty, load, save, rowError } = useExclusions(client);
 watch(savedTimeZone, (timeZone) => emit('time-zone-saved', timeZone));
@@ -48,7 +56,8 @@ load();
             </span>
           </div>
           <div class="exclusion-editor" aria-label="UA 排除规则设置">
-            <p class="exclusion-help">使用 <a href="https://docs.rs/regex/latest/regex/#syntax" target="_blank" rel="noopener noreferrer">Rust regex 语法</a>：默认区分大小写，在任意位置匹配；可用 <code>^</code>、<code>$</code> 和 <code>(?i)</code>。最多 {{ MAX_EXCLUSION_PATTERNS }} 条，每条不超过 {{ MAX_EXCLUSION_PATTERN_BYTES }} 个 UTF-8 字节。</p>
+            <p class="exclusion-help">使用 <a :href="regexDocumentation" @click.prevent="openRegexDocumentation">Rust regex 语法</a>：默认区分大小写，在任意位置匹配；可用 <code>^</code>、<code>$</code> 和 <code>(?i)</code>。最多 {{ MAX_EXCLUSION_PATTERNS }} 条，每条不超过 {{ MAX_EXCLUSION_PATTERN_BYTES }} 个 UTF-8 字节。</p>
+            <p v-if="externalLinkError" class="inline-error" role="alert">{{ externalLinkError }}：<code>{{ regexDocumentation }}</code></p>
             <p v-if="loadState.kind === 'error'" class="inline-error" role="alert">{{ loadState.error.message }} <BaseButton size="sm" variant="ghost" :disabled="saveState.kind === 'saving'" @click="load">重试加载排除规则</BaseButton><span>也可直接编辑并保存以替换配置。</span></p>
             <p v-if="loadState.kind === 'loading'" class="exclusion-help" role="status">正在加载已保存规则…</p>
             <div class="exclusion-patterns">

@@ -74,6 +74,11 @@ export function createAuditClient(host) {
     });
   }
   return {
+    async openExternal(url) {
+      if (!host || host.version !== 2 || typeof host.openExternal !== 'function') throw new AuditError('host_unsupported', '当前宿主不支持打开外部链接，请复制地址访问');
+      try { await host.openExternal(url); }
+      catch { throw new AuditError('external_link_failed', '无法请求打开链接，请重试或复制地址访问'); }
+    },
     saveTimeZone: (timeZone) => execute('timeZone', { timeZone }),
     exclusions: (signal) => execute('exclusions', {}, signal),
     saveExclusions: (userAgentPatterns) => execute('saveExclusions', { userAgentPatterns }),
