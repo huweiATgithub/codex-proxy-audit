@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
   workflow_call:
     inputs:
       release-tag:
@@ -13,8 +14,16 @@ on:
     outputs:
       version:
         value: ${{ jobs.build.outputs.version }}
-      host-version:
-        value: ${{ jobs.build.outputs.host-version }}
+      archive:
+        value: ${{ jobs.build.outputs.archive }}
+      host-range:
+        value: ${{ jobs.build.outputs.host-range }}
+      sdk-revision:
+        value: ${{ jobs.build.outputs.sdk-revision }}
+      primary-host:
+        value: ${{ jobs.build.outputs.primary-host }}
+      host-matrix:
+        value: ${{ jobs.build.outputs.host-matrix }}
 
 permissions:
   contents: read
@@ -58,8 +67,10 @@ jobs:
     timeout-minutes: 45
     outputs:
       version: ${{ steps.metadata.outputs.version }}
-      host-version: ${{ steps.metadata.outputs.host-version }}
-      host-revision: ${{ steps.metadata.outputs.host-revision }}
+      host-range: ${{ steps.metadata.outputs.host-range }}
+      sdk-revision: ${{ steps.metadata.outputs.sdk-revision }}
+      primary-host: ${{ steps.metadata.outputs.primary-host }}
+      host-matrix: ${{ steps.metadata.outputs.host-matrix }}
       archive: ${{ steps.metadata.outputs.archive }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -71,7 +82,7 @@ jobs:
           cache: npm
       - name: Install repository Rust toolchain
         run: rustup show active-toolchain
-      - name: Check versions and host baseline
+      - name: Check versions, SDK pin and verification hosts
         id: metadata
         env:
           RELEASE_TAG: ${{ inputs.release-tag }}
@@ -85,7 +96,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: zyycn/codex-proxy-rs
-          ref: ${{ steps.metadata.outputs.host-revision }}
+          ref: ${{ steps.metadata.outputs.sdk-revision }}
           path: _host
           persist-credentials: false
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -133,10 +144,13 @@ jobs:
           retention-days: 14
 
   integration:
-    name: Real host integration
+    name: Real host integration (${{ matrix.version }})
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.build.outputs.host-matrix) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -151,18 +165,19 @@ jobs:
         with:
           name: plugin-package
           path: dist/packages
-      - name: Verify package in the pinned host
+      - name: Verify the shared package in this host
         env:
           GH_TOKEN: ${{ github.token }}
-          HOST_VERSION: ${{ needs.build.outputs.host-version }}
-          HOST_REVISION: ${{ needs.build.outputs.host-revision }}
+          HOST_VERSION: ${{ matrix.version }}
+          HOST_REVISION: ${{ matrix.revision }}
+          EXPECT_OPEN_EXTERNAL: ${{ matrix.openExternal }}
           PLUGIN_ARCHIVE: dist/packages/${{ needs.build.outputs.archive }}
         run: bash scripts/ci-integration.sh
       - name: Upload integration evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: integration-evidence
+          name: integration-evidence-${{ matrix.version }}
           path: dist/verification/
           if-no-files-found: warn
           retention-days: 14

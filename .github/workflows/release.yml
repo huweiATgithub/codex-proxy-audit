@@ -34,21 +34,59 @@ jobs:
           path: dist/release
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: integration-evidence
+          pattern: integration-evidence-*
+          merge-multiple: true
           path: dist/verification
       - name: Prepare release assets
         env:
           VERSION: ${{ needs.verify.outputs.version }}
+          PLUGIN_ARCHIVE: ${{ needs.verify.outputs.archive }}
+          HOST_RANGE: ${{ needs.verify.outputs.host-range }}
+          SDK_REVISION: ${{ needs.verify.outputs.sdk-revision }}
+          PRIMARY_HOST: ${{ needs.verify.outputs.primary-host }}
+          HOST_MATRIX: ${{ needs.verify.outputs.host-matrix }}
         run: |
-          test -s dist/verification/result.json
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, shutil
+          root = pathlib.Path('dist/verification')
+          release = pathlib.Path('dist/release')
+          archive = os.environ['PLUGIN_ARCHIVE']
+          digest = hashlib.sha256((release / archive).read_bytes()).hexdigest()
+          hosts = json.loads(os.environ['HOST_MATRIX'])['include']
+          entries = []
+          for host in hosts:
+              directory = root / host['version']
+              result = json.loads((directory / 'result.json').read_text())
+              assert result['hostVersion'] == host['version'], 'Evidence Host version differs'
+              assert result['hostCommit'] == host['revision'], 'Evidence Host revision differs'
+              assert result['openExternal'] is host['openExternal'], 'Evidence page bridge capability differs'
+              assert result['packageSha256'] == digest, 'Hosts did not verify the release package'
+              screenshots = sorted(path.relative_to(root).as_posix() for path in directory.glob('*.png'))
+              for field in ['screenshot', 'independentSaveScreenshot', 'settingsScreenshot',
+                            'dateRangeScreenshot', 'externalLinkScreenshot']:
+                  name = result[field]
+                  assert pathlib.Path(name).name == name, 'Screenshot paths must be relative filenames'
+                  assert f"{host['version']}/{name}" in screenshots, f'Missing screenshot: {name}'
+              entries.append({**host, 'result': f"{host['version']}/result.json", 'screenshots': screenshots})
+          index = {'package': {'archive': archive, 'sha256': digest},
+                   'hostRange': os.environ['HOST_RANGE'], 'sdkRevision': os.environ['SDK_REVISION'],
+                   'primaryHost': os.environ['PRIMARY_HOST'], 'hosts': entries}
+          (root / 'index.json').write_text(json.dumps(index, indent=2) + '\n')
+          for name in ['real-host-ui.png', 'real-host-independent-save.png', 'real-host-settings.png',
+                       'real-host-date-range.png', 'real-host-external-link.png']:
+              shutil.copyfile(root / os.environ['PRIMARY_HOST'] / name, release / name)
+          PY
           tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
             -czf "dist/release/huwei.prompt-audit-$VERSION-verification.tar.gz" -C dist/verification .
-          cp LICENSE dist/verification/*.png dist/release/
+          cp LICENSE dist/release/
           (cd dist/release && sha256sum --check ./*.sha256 && sha256sum ./*.tar.gz ./*.sha256 ./LICENSE ./*.png > SHA256SUMS)
       - name: Publish and verify GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
-          HOST_VERSION: ${{ needs.verify.outputs.host-version }}
+          HOST_RANGE: ${{ needs.verify.outputs.host-range }}
+          SDK_REVISION: ${{ needs.verify.outputs.sdk-revision }}
+          PRIMARY_HOST: ${{ needs.verify.outputs.primary-host }}
+          HOST_MATRIX: ${{ needs.verify.outputs.host-matrix }}
         run: bash scripts/publish-release.sh

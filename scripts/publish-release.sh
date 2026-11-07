@@ -1,14 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${RELEASE_TAG:?}" "${HOST_VERSION:?}" "${GH_REPO:?}" "${RUNNER_TEMP:?}"
+: "${RELEASE_TAG:?}" "${HOST_RANGE:?}" "${SDK_REVISION:?}" "${PRIMARY_HOST:?}" "${HOST_MATRIX:?}" "${GH_REPO:?}" "${RUNNER_TEMP:?}"
 assets=$(realpath dist/release)
 download=$(mktemp -d "$RUNNER_TEMP/release-download.XXXXXX")
 notes="$RUNNER_TEMP/release-notes.md"
 
 cat > "$notes" <<EOF
 Linux x86_64 GNU plugin package; requires glibc 2.34 or newer.
-Compatible with codex-proxy-rs ~$HOST_VERSION.
+Compatible with codex-proxy-rs \`$HOST_RANGE\`.
+SDK and packaging CLI pinned to \`$SDK_REVISION\`.
+
+The same plugin package was verified against:
+EOF
+python3 - <<'PY' >> "$notes"
+import json, os
+for host in json.loads(os.environ['HOST_MATRIX'])['include']:
+    print(f"- Host {host['version']} (`{host['revision']}`)")
+PY
+cat >> "$notes" <<EOF
+
+The verification archive contains \`index.json\` and a separate result and screenshots directory for each host.
+Public screenshots come from Host $PRIMARY_HOST.
 
 Built and tested by [GitHub Actions]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID), including real-host integration.
 Verify downloads with \`sha256sum --check SHA256SUMS\`.

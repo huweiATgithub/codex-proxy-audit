@@ -1,0 +1,15 @@
+{
+  "primaryHost": "3.42.1",
+  "hosts": [
+    {
+      "version": "3.41.2",
+      "revision": "ba3baddbda7293d1d76ea066dd5e42298618c15a",
+      "openExternal": false
+    },
+    {
+      "version": "3.42.1",
+      "revision": "e0a3dc20dd907071fc78f81cfba9a58f00a27521",
+      "openExternal": true
+    }
+  ]
+}

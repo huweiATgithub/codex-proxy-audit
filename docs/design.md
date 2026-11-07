@@ -40,7 +40,9 @@ flowchart LR
 | 官方 Codex | `0.160.1`，`d27764b82f7118f674371e6d6e76271d9d606edb` | 输入结构、子代理来源、增量请求及 turn 行为 |
 | codex-proxy-plugins | `cfd37537f99f2c957639c6fa2c14d40dcb0c3368` | 独立插件组织方式与管理页面示例 |
 
-宿主兼容声明为 `~3.42.1`，接受稳定版 `>=3.42.1, <3.43.0`。目标宿主合同为 manifest v2、进程协议 v7、middleware v6、management v2 和 maintenance v1。插件使用 upstream 仓库的 Rust `gateway-plugin-sdk`，Git 依赖固定到上表宿主提交。SDK 当前标记为 `0.1.0`，不能仅凭这个版本号表达兼容性。[宿主兼容表][host-compat]、[SDK 清单][sdk-cargo]
+宿主兼容声明为 `>=3.41.2, <4.0.0`。所用合同为 manifest v2、进程协议 v7、middleware v6、management v2 和 maintenance v1。插件使用 upstream 仓库的 Rust `gateway-plugin-sdk`，Git 依赖固定到上表宿主提交，打包 CLI 使用同一提交；构建基线独立于宿主兼容范围。SDK 当前标记为 `0.1.0`，不能仅凭这个版本号表达兼容性。[宿主兼容表][host-compat]、[SDK 清单][sdk-cargo]
+
+[host-compatibility.json](../host-compatibility.json) 单独列出验收宿主及其源码提交，当前同一正式包在 3.41.2 与 3.42.1 验收，`primaryHost` 为 3.42.1。后续 3.x 宿主若保持所用合同兼容，继续验证和复用该安装包，无需随宿主次版本升级 SDK 或发布插件；兼容判断同时覆盖 RPC、所用能力、宿主 Key／请求详情接口和管理页桥，并跟踪宿主[接口弃用清单][host-deprecations]。声明范围不表示对未来所有 3.x 版本无条件兼容，合同变化需要适配时再发布插件。
 
 中间件调用的 `timeout_ms` 限制插件自身处理时间，默认预算为 120 秒。父处理任务挂起时，SDK 归还执行名额，收到宿主恢复授权后继续；只有驻留回调全部为 `next` 时暂停这份预算，普通宿主回调及其恢复排队仍计时。入站与返回处理共享同一预算，`HostClient::remaining_budget()` 提供当前剩余值。请求总期限、下游操作超时与取消信号独立生效，客户端取消或插件退出仍会结束等待并回收资源。[调用预算与调度][middleware-budget]
 
@@ -261,3 +263,5 @@ Key 筛选列表仅包含宿主当前存在的 Key，按 `id` 升序分页，每
 [maintenance]: https://github.com/zyycn/codex-proxy-rs/blob/e0a3dc20dd907071fc78f81cfba9a58f00a27521/backend/crates/gateway-plugin/sdk/docs/capabilities.md#自有资源与维护
 
 [external-links]: https://github.com/zyycn/codex-proxy-rs/blob/e0a3dc20dd907071fc78f81cfba9a58f00a27521/backend/crates/gateway-plugin/sdk/docs/capabilities.md#L697
+
+[host-deprecations]: https://github.com/zyycn/codex-proxy-rs/blob/e0a3dc20dd907071fc78f81cfba9a58f00a27521/backend/crates/gateway-plugin/runtime/plugin-api-deprecations.json

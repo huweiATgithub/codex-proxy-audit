@@ -16,10 +16,13 @@ const options = Object.fromEntries(process.argv.slice(2).reduce((pairs, token, i
   if (token.startsWith('--')) pairs.push([token.slice(2), args[index + 1]?.startsWith('--') || !args[index + 1] ? true : args[index + 1]]);
   return pairs;
 }, []));
-if (!options['host-binary'] || !options['host-web'] || !options.package) {
-  console.error('Usage: node scripts/integration.js --host-binary /path/codex-proxy-rs --host-web /path/frontend/dist --package /path/plugin.tar.gz [--keep] [--port 4180] [--docker-config /path] [--next-wait-ms 125000]');
+if (!options['host-binary'] || !options['host-web'] || !options.package || !options['host-version'] || !['true', 'false'].includes(options['expect-open-external'])) {
+  console.error('Usage: node scripts/integration.js --host-binary /path/codex-proxy-rs --host-web /path/frontend/dist --package /path/plugin.tar.gz --host-version X.Y.Z --expect-open-external true|false [--keep] [--port 4180] [--docker-config /path] [--next-wait-ms 125000]');
   process.exit(2);
 }
+const hostVersion = options['host-version'];
+assert.match(hostVersion, /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/, '--host-version must be a stable X.Y.Z version');
+const expectOpenExternal = options['expect-open-external'] === 'true';
 const nextWaitMs = options['next-wait-ms'] === undefined ? 0 : Number(options['next-wait-ms']);
 if (options['next-wait-ms'] !== undefined) assert.ok(Number.isInteger(nextWaitMs) && nextWaitMs >= 125000 && nextWaitMs <= 2147453647, '--next-wait-ms must be an integer from 125000 to 2147453647');
 const nextWaitInput = 'INTEGRATION-next-wait downstream completes beyond the SDK execution budget';
@@ -682,29 +685,44 @@ async function run() {
   const regexHelp = ui.getByRole('link', { name: 'Rust regex 语法', exact: true });
   const externalDialog = page.getByRole('dialog').filter({ hasText: 'docs.rs' });
   const cancelExternal = externalDialog.getByRole('button', { name: /^(取消|Cancel)$/ });
+  assert.equal(await ui.locator('body').evaluate(() => typeof window.codexProxyPlugin.openExternal === 'function'), expectOpenExternal, 'Host bridge matches the explicitly expected interface');
   await ui.getByRole('textbox', { name: 'UA 正则 1', exact: true }).fill('^external-link-draft/');
   const pagesBeforeExternal = page.context().pages().length;
-  await regexHelp.click(); await externalDialog.waitFor();
-  assert.equal(page.context().pages().length, pagesBeforeExternal, 'accepting the bridge request does not open a tab');
-  await page.screenshot({ path: join(temporary, 'real-host-external-link.png'), fullPage: true, animations: 'disabled' });
-  await cancelExternal.click(); await externalDialog.waitFor({ state: 'detached' });
-  await page.context().grantPermissions(['clipboard-read', 'clipboard-write'], { origin: base });
-  await regexHelp.click(); await externalDialog.waitFor();
-  await externalDialog.getByRole('button', { name: /^(复制链接|Copy link)$/i }).click();
-  await until(async () => { assert.equal(await page.evaluate(() => navigator.clipboard.readText()), regexDocumentation); }, 'host copies the confirmed documentation URL');
-  await cancelExternal.click(); await externalDialog.waitFor({ state: 'detached' });
-  await page.context().route('https://docs.rs/regex/latest/regex/**', (route) => route.fulfill({ contentType: 'text/html', body: '<title>Regex documentation fixture</title>' }));
-  await regexHelp.click(); await externalDialog.waitFor();
-  const openedPage = page.context().waitForEvent('page');
-  await externalDialog.getByRole('button', { name: /^(打开|Open)$/i }).click();
-  const documentationPage = await openedPage;
-  await documentationPage.waitForLoadState('domcontentloaded');
-  assert.equal(documentationPage.url(), regexDocumentation);
-  await documentationPage.close(); await externalDialog.waitFor({ state: 'detached' });
+  await regexHelp.click();
+  if (expectOpenExternal) {
+    await externalDialog.waitFor();
+    assert.equal(page.context().pages().length, pagesBeforeExternal, 'accepting the bridge request does not open a tab');
+    await page.screenshot({ path: join(temporary, 'real-host-external-link.png'), fullPage: true, animations: 'disabled' });
+    await cancelExternal.click(); await externalDialog.waitFor({ state: 'detached' });
+    await page.context().grantPermissions(['clipboard-read', 'clipboard-write'], { origin: base });
+    await regexHelp.click(); await externalDialog.waitFor();
+    await externalDialog.getByRole('button', { name: /^(复制链接|Copy link)$/i }).click();
+    await until(async () => { assert.equal(await page.evaluate(() => navigator.clipboard.readText()), regexDocumentation); }, 'host copies the confirmed documentation URL');
+    await cancelExternal.click(); await externalDialog.waitFor({ state: 'detached' });
+    await page.context().route('https://docs.rs/regex/latest/regex/**', (route) => route.fulfill({ contentType: 'text/html', body: '<title>Regex documentation fixture</title>' }));
+    await regexHelp.click(); await externalDialog.waitFor();
+    const openedPage = page.context().waitForEvent('page');
+    await externalDialog.getByRole('button', { name: /^(打开|Open)$/i }).click();
+    const documentationPage = await openedPage;
+    await documentationPage.waitForLoadState('domcontentloaded');
+    assert.equal(documentationPage.url(), regexDocumentation);
+    await documentationPage.close(); await externalDialog.waitFor({ state: 'detached' });
+  } else {
+    const error = ui.locator('.exclusion-editor > [role="alert"]');
+    await until(async () => {
+      assert.match(await error.textContent(), /当前宿主不支持打开外部链接/);
+      assert.equal(await error.locator('code').textContent(), regexDocumentation);
+    }, 'older Host exposes the documentation address for copying');
+    assert.equal(await externalDialog.count(), 0, 'older Host does not show an external-link confirmation');
+    assert.equal(page.context().pages().length, pagesBeforeExternal, 'fallback does not open a tab');
+    await page.screenshot({ path: join(temporary, 'real-host-external-link.png'), fullPage: true, animations: 'disabled' });
+  }
   assert.equal(await ui.getByRole('textbox', { name: 'UA 正则 1', exact: true }).inputValue(), '^external-link-draft/');
   assert.deepEqual(await management('exclusions'), exclusions);
   assert.equal(requested.filter((url) => /\/api\/api\/(audits|audit|audit-content|keys|view-context)(?:\?|$)/.test(url)).length, beforeExclusionSaveRequests);
-  report('real host external-link bridge confirms documentation open/copy/cancel and preserves unsaved exclusions and audit queries');
+  report(expectOpenExternal
+    ? 'real host external-link bridge confirms documentation open/copy/cancel and preserves unsaved exclusions and audit queries'
+    : 'older real host exposes the documentation address without opening a tab and preserves unsaved exclusions and audit queries');
   await ui.getByRole('textbox', { name: 'UA 正则 1', exact: true }).fill('(');
   await ui.getByRole('button', { name: '保存排除规则', exact: true }).click();
   await until(async () => { assert.equal(await ui.getByRole('textbox', { name: 'UA 正则 1', exact: true }).getAttribute('aria-invalid'), 'true'); }, 'real iframe identifies invalid Rust regex row');
@@ -731,7 +749,7 @@ async function run() {
     report('isolated SQLite Rust storage and audit query tests');
     if (options.keep) await startHost();
   }
-  writeFileSync(join(temporary, 'result.json'), JSON.stringify({ hostUrl: `http://0.0.0.0:${hostPort}`, pageUrl: `${base}/plugins/${instanceId}/${view.pages[0].id}`, reports, screenshot: join(temporary, 'real-host-ui.png'), independentSaveScreenshot: join(temporary, 'real-host-independent-save.png'), settingsScreenshot: join(temporary, 'real-host-settings.png'), dateRangeScreenshot: join(temporary, 'real-host-date-range.png'), externalLinkScreenshot: join(temporary, 'real-host-external-link.png'), hostCommit: options['host-commit'] || null, hostBinarySha256: createHash('sha256').update(readFileSync(resolve(options['host-binary']))).digest('hex'), packageSha256: sha }, null, 2));
+  writeFileSync(join(temporary, 'result.json'), JSON.stringify({ hostVersion, openExternal: expectOpenExternal, hostUrl: `http://0.0.0.0:${hostPort}`, pageUrl: `${base}/plugins/${instanceId}/${view.pages[0].id}`, reports, screenshot: 'real-host-ui.png', independentSaveScreenshot: 'real-host-independent-save.png', settingsScreenshot: 'real-host-settings.png', dateRangeScreenshot: 'real-host-date-range.png', externalLinkScreenshot: 'real-host-external-link.png', hostCommit: options['host-commit'] || null, hostBinarySha256: createHash('sha256').update(readFileSync(resolve(options['host-binary']))).digest('hex'), packageSha256: sha }, null, 2));
   console.log(`Evidence: ${temporary}`);
   if (options.keep) {
     console.log(`Remote review: http://<this-machine>:${hostPort}/plugins/${instanceId}/${view.pages[0].id}`);

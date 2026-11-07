@@ -2,12 +2,29 @@ import { execFileSync } from 'node:child_process';
 import { appendFileSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import semver from 'semver';
 
-const stableVersion = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
+function isStableVersion(value) {
+  return typeof value === 'string' && semver.valid(value) === value && semver.prerelease(value) === null && !value.includes('+');
+}
 
-export function parseReleaseMetadata({ manifest, metadata, lockfile, tag }) {
+function parseHostRange(value) {
+  if (typeof value !== 'string' || /[\r\n]/.test(value)) return null;
+  const comparators = value.split(',').map((part) => {
+    // Rust accepts one comparator per comma segment, without npm OR or hyphen ranges.
+    const match = /^(>=|<=|>|<|=|\^|~)? *([^\s|<>=~^]+)$/.exec(part.trim());
+    if (!match || match[2].startsWith('v')) return null;
+    const [, operator, version] = match;
+    const wildcard = version.split('.').some((part) => ['*', 'x', 'X'].includes(part));
+    // A bare Rust version means caret; a bare wildcard retains wildcard semantics.
+    return `${operator ?? (wildcard ? '' : '^')}${version}`;
+  });
+  return comparators.includes(null) ? null : semver.validRange(comparators.join(' '));
+}
+
+export function parseReleaseMetadata({ manifest, metadata, lockfile, compatibility, tag }) {
   const version = manifest.version;
-  if (typeof version !== 'string' || !stableVersion.test(version)) throw new Error('plugin.json version must be a stable X.Y.Z version.');
+  if (!isStableVersion(version)) throw new Error('plugin.json version must be a stable X.Y.Z version.');
   if (manifest.publisher !== 'huwei' || manifest.name !== 'prompt-audit') throw new Error('Release packaging expects plugin huwei.prompt-audit.');
   if (tag !== undefined && tag !== `v${version}`) throw new Error(`Release tag must be v${version}.`);
 
@@ -22,16 +39,34 @@ export function parseReleaseMetadata({ manifest, metadata, lockfile, tag }) {
   if (lockedVersion !== version) throw new Error('backend/Cargo.lock root package version must match plugin.json.');
 
   const sdk = backend.dependencies.filter((dependency) => dependency.name === 'gateway-plugin-sdk');
-  const hostRevision = sdk.length === 1 ? sdk[0].source?.match(/^git\+https:\/\/github\.com\/zyycn\/codex-proxy-rs\?rev=([a-f0-9]{40})$/)?.[1] : undefined;
-  if (!hostRevision) throw new Error('gateway-plugin-sdk must pin zyycn/codex-proxy-rs to a full Git revision.');
+  const sdkSource = sdk.length === 1 ? sdk[0].source : undefined;
+  const sdkRevision = typeof sdkSource === 'string' ? sdkSource.match(/^git\+https:\/\/github\.com\/zyycn\/codex-proxy-rs\?rev=([a-f0-9]{40})$/)?.[1] : undefined;
+  if (!sdkRevision || sdkSource !== `git+https://github.com/zyycn/codex-proxy-rs?rev=${sdkRevision}`) throw new Error('gateway-plugin-sdk must pin zyycn/codex-proxy-rs to a full Git revision.');
   const hostRange = manifest.engines?.['codex-proxy-rs'];
-  const hostVersion = typeof hostRange === 'string' && hostRange.startsWith('~') ? hostRange.slice(1) : '';
-  if (!stableVersion.test(hostVersion)) throw new Error('plugin.json host compatibility must use ~X.Y.Z.');
+  const parsedRange = parseHostRange(hostRange);
+  if (parsedRange === null) throw new Error('plugin.json host compatibility must be a valid Rust semver range.');
+  const minimumHost = semver.minVersion(parsedRange)?.version;
+  if (!isStableVersion(minimumHost) || minimumHost === '0.0.0' || !semver.satisfies(minimumHost, parsedRange)) throw new Error('plugin.json host compatibility must have a minimum stable Host version.');
+  if (!Array.isArray(compatibility?.hosts) || compatibility.hosts.length === 0) throw new Error('host-compatibility.json must list verified Hosts.');
+  const seenVersions = new Set();
+  const hosts = compatibility.hosts.map((host) => {
+    if (!isStableVersion(host?.version)) throw new Error('Verified Host versions must be stable X.Y.Z versions.');
+    if (seenVersions.has(host.version)) throw new Error('Verified Host versions must be unique.');
+    seenVersions.add(host.version);
+    if (typeof host.revision !== 'string' || host.revision.length !== 40 || !/^[a-f0-9]+$/.test(host.revision)) throw new Error('Verified Hosts must pin a full Git revision.');
+    if (typeof host.openExternal !== 'boolean') throw new Error('Verified Hosts must declare the expected openExternal support.');
+    if (!semver.satisfies(host.version, parsedRange)) throw new Error(`Verified Host ${host.version} is outside plugin.json host compatibility.`);
+    return { version: host.version, revision: host.revision, openExternal: host.openExternal };
+  });
+  if (!seenVersions.has(minimumHost)) throw new Error(`Verified Hosts must cover the minimum Host version ${minimumHost}.`);
+  if (!seenVersions.has(compatibility.primaryHost)) throw new Error('host-compatibility.json primaryHost must match a verified Host version.');
 
   return {
     version,
-    'host-version': hostVersion,
-    'host-revision': hostRevision,
+    'host-range': hostRange,
+    'sdk-revision': sdkRevision,
+    'primary-host': compatibility.primaryHost,
+    'host-matrix': JSON.stringify({ include: hosts }),
     archive: `huwei.prompt-audit-${version}-x86_64-unknown-linux-gnu.tar.gz`,
   };
 }
@@ -45,6 +80,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
       manifest: JSON.parse(readFileSync('plugin.json', 'utf8')),
       metadata,
       lockfile: readFileSync('backend/Cargo.lock', 'utf8'),
+      compatibility: JSON.parse(readFileSync('host-compatibility.json', 'utf8')),
       tag: args[1],
     });
     const output = Object.entries(release).map(([name, value]) => `${name}=${value}\n`).join('');
