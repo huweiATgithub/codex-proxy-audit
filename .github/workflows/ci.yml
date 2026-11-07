@@ -82,6 +82,7 @@ jobs:
           cache: npm
       - name: Install repository Rust toolchain
         run: rustup show active-toolchain
+      - run: npm ci
       - name: Check versions, SDK pin and verification hosts
         id: metadata
         env:
@@ -105,7 +106,6 @@ jobs:
             backend -> target
             _host/backend -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: npm ci
       - run: npm run build
       - run: cargo fmt --manifest-path backend/Cargo.toml --check
       - run: cargo clippy --manifest-path backend/Cargo.toml --all-targets --locked -- -D warnings
