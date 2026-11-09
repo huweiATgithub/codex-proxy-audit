@@ -98,5 +98,5 @@ export const audits = [...examples, ...workload].sort((a, b) => b.firstObservedA
 export const modelRequests = audits.filter((audit) => audit.keyId !== 'ck_legacy').map((audit) => ({
   id: audit.requestId, keyId: audit.keyId,
   userAgent: 'codex_cli_rs/0.160.1 (Linux; x86_64) xterm-256color',
-  model: 'demo-model', reasoningEffort: 'high',
+  model: 'demo-model', upstreamModel: 'demo-model', accountName: '演示上游账号', reasoningEffort: 'high',
 }));

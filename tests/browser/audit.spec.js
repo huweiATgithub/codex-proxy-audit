@@ -79,7 +79,7 @@ test('details fetch bodies lazily, preserve literal HTML, and read long input in
   expect(requested.some((url) => url.pathname.endsWith('audit-request-metadata'))).toBe(false);
   await expect(ui.locator('.request-metadata dt')).toHaveCount(0);
   await ui.getByRole('button', { name: '加载请求信息', exact: true }).click();
-  await expect(ui.locator('.metadata')).toContainText('模型、推理强度与 UA 取自宿主记录');
+  await expect(ui.locator('.metadata')).toContainText('请求信息取自宿主记录');
   await expect(ui.locator('.metadata')).toContainText('demo-model');
   await expect(ui.locator('.metadata')).toContainText('codex_cli_rs/0.160.1');
   await search(ui, '审阅要求');
@@ -129,7 +129,7 @@ test('request metadata loads once per open detail and prevents duplicate pending
     await expect(ui.locator('.request-metadata')).toHaveAttribute('aria-busy', 'true');
     expect(calls).toEqual(['PA-0018']);
   } finally { release(); }
-  await expect(ui.locator('.request-metadata dd')).toHaveText(['demo-model', 'high', 'codex_cli_rs/0.160.1 (Linux; x86_64) xterm-256color']);
+  await expect(ui.locator('.request-metadata dd')).toHaveText(['demo-model', 'high', '演示上游账号', 'codex_cli_rs/0.160.1 (Linux; x86_64) xterm-256color']);
   await expect(ui.locator('.request-metadata button')).toHaveCount(0);
   await ui.getByRole('button', { name: '关闭详情' }).click();
   await ui.locator('[data-audit="PA-0018"]').click();
@@ -141,6 +141,40 @@ test('request metadata loads once per open detail and prevents duplicate pending
   await expect(ui.locator('.request-metadata dd').first()).toHaveText('demo-model');
   expect(calls).toEqual(['PA-0018', 'PA-0018']);
 });
+
+for (const scenario of [
+  { name: 'different models', model: 'requested-model', upstreamModel: 'upstream-model', accountName: '上游账号 A', different: true },
+  { name: 'matching models', model: 'requested-model', upstreamModel: 'requested-model', accountName: '上游账号 A', different: false },
+  { name: 'unknown upstream model and account', model: 'requested-model', upstreamModel: null, accountName: null, different: false },
+  { name: 'unknown requested model', model: null, upstreamModel: 'upstream-model', accountName: '上游账号 A', different: false },
+]) {
+  test(`request metadata compares models and displays the upstream account: ${scenario.name}`, async ({ page }, testInfo) => {
+    const ui = page.frameLocator('iframe');
+    await page.route('**/__demo/api/audit-request-metadata?**', (route) => route.fulfill({ json: {
+      auditId: new URL(route.request().url()).searchParams.get('id'),
+      requestMetadata: { model: scenario.model, upstreamModel: scenario.upstreamModel, accountName: scenario.accountName, reasoningEffort: 'high', userAgent: 'test-agent' },
+    } }));
+    await page.goto('/'); await ready(ui);
+    await ui.locator('[data-audit="PA-0018"]').click();
+    await expect(ui.locator('.request-metadata dt')).toHaveCount(0);
+    await ui.getByRole('button', { name: '加载请求信息', exact: true }).click();
+    await expect(ui.locator('.request-metadata .metadata-field:has(dt:text-is("请求模型")) dd')).toHaveText(scenario.model || '未取得');
+    await expect(ui.locator('.request-metadata .metadata-field:has(dt:text-is("上游账号")) dd')).toHaveText(scenario.accountName || '未取得');
+    await expect(ui.getByText('（与请求模型不同）', { exact: true })).toHaveCount(scenario.different ? 1 : 0);
+    await expect(ui.locator('.request-metadata dt').getByText('上游模型', { exact: true })).toHaveCount(scenario.different ? 1 : 0);
+    if (scenario.different) {
+      await expect(ui.locator('.request-metadata .metadata-field:has(dt:text-is("上游模型")) dd')).toHaveText('upstream-model （与请求模型不同）');
+      await ui.locator('.request-metadata').scrollIntoViewIfNeeded();
+      await ui.locator('.detail-panel').screenshot({ path: testInfo.outputPath('request-metadata-light.png') });
+      await page.getByRole('button', { name: '切换深色主题' }).click();
+      await ui.locator('.detail-panel').screenshot({ path: testInfo.outputPath('request-metadata-dark.png') });
+      await page.setViewportSize({ width: 390, height: 844 });
+      await ui.locator('.request-metadata').scrollIntoViewIfNeeded();
+      expect(await ui.locator('.detail-scroll').evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
+      await ui.locator('.detail-panel').screenshot({ path: testInfo.outputPath('request-metadata-mobile.png') });
+    }
+  });
+}
 
 test('request metadata errors retry inline while input and context stay usable', async ({ page }) => {
   const ui = page.frameLocator('iframe');
@@ -174,9 +208,9 @@ test('late request metadata from a previous detail never appears in the current 
     calls.push(id);
     if (id === 'PA-0018') {
       await gate;
-      return route.fulfill({ json: { auditId: id, requestMetadata: { model: 'old-model', reasoningEffort: 'low', userAgent: 'old-agent' } } });
+      return route.fulfill({ json: { auditId: id, requestMetadata: { model: 'old-model', upstreamModel: 'old-upstream', accountName: 'old-account', reasoningEffort: 'low', userAgent: 'old-agent' } } });
     }
-    return route.fulfill({ json: { auditId: id, requestMetadata: { model: 'current-model', reasoningEffort: 'high', userAgent: 'current-agent' } } });
+    return route.fulfill({ json: { auditId: id, requestMetadata: { model: 'current-model', upstreamModel: 'current-model', accountName: 'current-account', reasoningEffort: 'high', userAgent: 'current-agent' } } });
   });
   await page.goto('/'); await ready(ui);
   await ui.locator('[data-audit="PA-0018"]').click();
@@ -190,11 +224,13 @@ test('late request metadata from a previous detail never appears in the current 
     await expect(ui.getByRole('button', { name: '加载请求信息', exact: true })).toBeVisible();
     expect(calls).toEqual(['PA-0018']);
     await ui.getByRole('button', { name: '加载请求信息', exact: true }).click();
-    await expect(ui.locator('.request-metadata dd')).toHaveText(['current-model', 'high', 'current-agent']);
+    await expect(ui.locator('.request-metadata dd')).toHaveText(['current-model', 'high', 'current-account', 'current-agent']);
     const complete = page.waitForResponse((response) => response.url().includes('/audit-request-metadata?') && new URL(response.url()).searchParams.get('id') === 'PA-0018');
     release(); await complete;
-    await expect(ui.locator('.request-metadata dd')).toHaveText(['current-model', 'high', 'current-agent']);
+    await expect(ui.locator('.request-metadata dd')).toHaveText(['current-model', 'high', 'current-account', 'current-agent']);
     await expect(ui.locator('.metadata')).not.toContainText('old-model');
+    await expect(ui.locator('.metadata')).not.toContainText('old-upstream');
+    await expect(ui.locator('.metadata')).not.toContainText('old-account');
     expect(calls).toEqual(['PA-0018', 'PA-0009']);
   } finally { release(); }
 });

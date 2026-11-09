@@ -271,7 +271,7 @@ async function run() {
     assert.equal(detail.threadId, null); assert.equal(detail.turnId, null);
     const forwarded = upstream.requests.findLast((body) => body.input?.some((item) => item.content?.some((part) => part.text === input)));
     assert.ok(forwarded, 'Chat traverses the host Responses normalization and upstream');
-    assert.deepEqual((await management('requestMetadata', { id: detail.id })).requestMetadata, { model: 'gpt-5.4', userAgent: 'codex-audit-integration/chat', reasoningEffort: 'low' });
+    assert.deepEqual((await management('requestMetadata', { id: detail.id })).requestMetadata, { model: 'gpt-5.4', upstreamModel: 'gpt-5.4', accountName: 'Integration controlled upstream', userAgent: 'codex-audit-integration/chat', reasoningEffort: 'low' });
   }
   report('Chat JSON/SSE reuses normalized input collection, preceding assistant context and optional host metadata');
   for (const stream of [false, true]) {
@@ -335,7 +335,7 @@ async function run() {
   assert.ok(!Object.hasOwn(continuation, 'requestMetadata'), 'ordinary audit detail contains no host request metadata');
   const additional = await management('requestMetadata', { id: continuation.id });
   assert.equal(additional.auditId, continuation.id);
-  assert.deepEqual(additional.requestMetadata, { model: 'gpt-5.4', userAgent: 'codex-audit-integration/1.0', reasoningEffort: 'low' });
+  assert.deepEqual(additional.requestMetadata, { model: 'gpt-5.4', upstreamModel: 'gpt-5.4', accountName: 'Integration controlled upstream', userAgent: 'codex-audit-integration/1.0', reasoningEffort: 'low' });
   assert.equal((await management('requestMetadata', { id: 'missing-audit' }, 404)).error.code, 'not_found');
   assert.equal((await management('requestMetadata', { id: continuation.id, extra: 'invalid' }, 400)).error.code, 'invalid_query');
   report('ordinary detail reads input and context; explicit metadata uses authenticated host dispatch without SQL grants');
@@ -647,6 +647,7 @@ async function run() {
   assert.equal(metadataRequests().length, 1, 'navigating to another record starts with metadata unloaded');
   await ui.getByRole('button', { name: '加载请求信息', exact: true }).click();
   await until(async () => { assert.ok((await ui.locator('.metadata').textContent()).includes('gpt-5.4')); }, 'real UI explicitly loads host request metadata');
+  assert.ok((await ui.locator('.request-metadata').textContent()).includes('Integration controlled upstream'), 'real UI displays the upstream account name');
   assert.equal(metadataRequests().length, 2);
   report('real host UI loads optional metadata only on clicks and resets it when switching records');
   assert.equal(await page.locator('iframe').getAttribute('sandbox'), 'allow-scripts');

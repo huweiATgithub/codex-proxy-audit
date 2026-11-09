@@ -7,6 +7,9 @@ import { useRequestMetadata } from '../state/request-metadata.js';
 
 const props = defineProps({ audit: { type: Object, required: true }, query: { type: String, default: '' } });
 const { state: requestMetadata, load: loadRequestMetadata } = useRequestMetadata(inject('auditClient'), () => props.audit.id);
+const modelsDiffer = computed(() => requestMetadata.value.kind === 'ready'
+  && requestMetadata.value.data.model && requestMetadata.value.data.upstreamModel
+  && requestMetadata.value.data.model !== requestMetadata.value.data.upstreamModel);
 const contextOpen = ref(true);
 const showEarlier = ref(false);
 const messages = computed(() => showEarlier.value ? props.audit.context : props.audit.context.slice(-3));
@@ -75,10 +78,12 @@ const metadata = computed(() => [
         <template v-else-if="requestMetadata.kind === 'ready'">
           <dl>
             <div class="metadata-field"><dt>请求模型</dt><dd>{{ requestMetadata.data.model || '未取得' }}</dd></div>
+            <div v-if="modelsDiffer" class="metadata-field"><dt>上游模型</dt><dd>{{ requestMetadata.data.upstreamModel }} <strong>（与请求模型不同）</strong></dd></div>
             <div class="metadata-field"><dt>推理强度</dt><dd>{{ requestMetadata.data.reasoningEffort || '未取得' }}</dd></div>
+            <div class="metadata-field"><dt>上游账号</dt><dd>{{ requestMetadata.data.accountName || '未取得' }}</dd></div>
             <div class="metadata-field metadata-wide"><dt>User-Agent</dt><dd>{{ requestMetadata.data.userAgent || '未取得' }}</dd></div>
           </dl>
-          <p class="metadata-note">模型、推理强度与 UA 取自宿主记录。</p>
+          <p class="metadata-note">请求信息取自宿主记录。</p>
         </template>
       </div>
     </section>

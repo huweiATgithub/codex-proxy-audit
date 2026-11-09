@@ -2123,6 +2123,30 @@
                               ],
                               "description": "Host requestedModel, not the upstream resolved model."
                             },
+                            "upstreamModel": {
+                              "anyOf": [
+                                {
+                                  "type": "string",
+                                  "pattern": "^[\\s\\S]{0,256}$"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ],
+                              "description": "Host upstreamModel; null when unavailable."
+                            },
+                            "accountName": {
+                              "anyOf": [
+                                {
+                                  "type": "string",
+                                  "pattern": "^[\\s\\S]{0,512}$"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ],
+                              "description": "Upstream account name saved in the host request record."
+                            },
                             "reasoningEffort": {
                               "anyOf": [
                                 {
@@ -2138,6 +2162,8 @@
                           "required": [
                             "userAgent",
                             "model",
+                            "upstreamModel",
+                            "accountName",
                             "reasoningEffort"
                           ]
                         },

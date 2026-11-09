@@ -17,6 +17,7 @@ fn detail() -> Value {
     json!({"code":200,"message":"success","data":{
         "id":"request/1?&", "requestId":"request/1?&", "clientApiKeyId":"key-a",
         "userAgent":"test-UA", "requestedModel":"requested-model", "model":"resolved-model",
+        "upstreamModel":"upstream-model", "accountName":"上游账号 A",
         "reasoningEffort":"high", "logicalOutcome":"running", "attempts":[]
     }})
 }
@@ -31,10 +32,16 @@ fn association_and_nullable_fields_are_parsed_before_projection() {
     .unwrap();
     assert_eq!(
         serde_json::to_value(metadata).unwrap(),
-        json!({"userAgent":"test-UA", "model":"requested-model", "reasoningEffort":"high"})
+        json!({"userAgent":"test-UA", "model":"requested-model", "upstreamModel":"upstream-model", "accountName":"上游账号 A", "reasoningEffort":"high"})
     );
     let mut nulls = detail();
-    for field in ["userAgent", "requestedModel", "reasoningEffort"] {
+    for field in [
+        "userAgent",
+        "requestedModel",
+        "upstreamModel",
+        "accountName",
+        "reasoningEffort",
+    ] {
         nulls["data"][field] = Value::Null;
     }
     assert_eq!(
@@ -43,7 +50,7 @@ fn association_and_nullable_fields_are_parsed_before_projection() {
                 .unwrap()
         )
         .unwrap(),
-        json!({"userAgent":null,"model":null,"reasoningEffort":null})
+        json!({"userAgent":null,"model":null,"upstreamModel":null,"accountName":null,"reasoningEffort":null})
     );
 }
 
@@ -63,6 +70,8 @@ fn malformed_and_mismatched_host_records_are_errors() {
         "clientApiKeyId",
         "userAgent",
         "requestedModel",
+        "upstreamModel",
+        "accountName",
         "reasoningEffort",
     ] {
         let mut missing = detail();
@@ -109,6 +118,8 @@ fn metadata_limits_count_unicode_points_and_do_not_truncate() {
     for (field, projected, limit) in [
         ("userAgent", "userAgent", 8192),
         ("requestedModel", "model", 256),
+        ("upstreamModel", "upstreamModel", 256),
+        ("accountName", "accountName", 512),
         ("reasoningEffort", "reasoningEffort", 80),
     ] {
         for length in [limit, limit + 1] {
@@ -315,7 +326,7 @@ async fn one_dispatch_reads_bounded_body_and_supports_running_and_failed_records
             host.body(chunk.to_vec(), false).await;
         }
         host.body(Vec::new(), true).await;
-        host.finish(json!({"metadata":{"userAgent":"test-UA","model":"requested-model","reasoningEffort":"high"}})).await;
+        host.finish(json!({"metadata":{"userAgent":"test-UA","model":"requested-model","upstreamModel":"upstream-model","accountName":"上游账号 A","reasoningEffort":"high"}})).await;
     }
 }
 

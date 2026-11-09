@@ -76,6 +76,8 @@ export const requestMetadata = z.object({
   requestMetadata: z.object({
     userAgent: boundedText(8192).nullable(),
     model: boundedText(256).nullable().describe('Host requestedModel, not the upstream resolved model.'),
+    upstreamModel: boundedText(256).nullable().describe('Host upstreamModel; null when unavailable.'),
+    accountName: boundedText(512).nullable().describe('Upstream account name saved in the host request record.'),
     reasoningEffort: boundedText(80).nullable(),
   }).nullable().describe('Loaded explicitly through the host request detail API matching the saved requestId and keyId; not duplicated in audit storage. Null when no matching host record exists.'),
 });

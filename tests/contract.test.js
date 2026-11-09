@@ -110,7 +110,7 @@ test('detail preserves saved metadata and only the explicit endpoint joins host 
     { kind: 'nontext', mediaType: '图片', inputKind: 'future.user_annotation' },
     { kind: 'text', text: 'unclassified' },
   ] };
-  const host = { id: record.requestId, keyId: record.keyId, userAgent: 'client/1.0', model: 'requested-model', reasoningEffort: 'high' };
+  const host = { id: record.requestId, keyId: record.keyId, userAgent: 'client/1.0', model: 'requested-model', upstreamModel: 'upstream-model', accountName: '上游账号 A', reasoningEffort: 'high' };
   const modelRequests = [{ ...host, id: 'another-request', model: 'wrong-request-model' }, host];
   const api = createAuditClient(bridge(createDemoService({ audits: [record], modelRequests })));
   const detail = await api.detail(record.id);
@@ -118,7 +118,7 @@ test('detail preserves saved metadata and only the explicit endpoint joins host 
   assert.deepEqual(detail.inputKinds, ['user.answered_question', 'future.user_annotation', null]);
   assert.deepEqual(detail.repositories, record.repositories);
   assert.equal(Object.hasOwn(detail, 'requestMetadata'), false);
-  assert.deepEqual(await api.requestMetadata(record.id), { auditId: record.id, requestMetadata: { userAgent: 'client/1.0', model: 'requested-model', reasoningEffort: 'high' } });
+  assert.deepEqual(await api.requestMetadata(record.id), { auditId: record.id, requestMetadata: { userAgent: 'client/1.0', model: 'requested-model', upstreamModel: 'upstream-model', accountName: '上游账号 A', reasoningEffort: 'high' } });
   host.keyId = 'another-key';
   await assert.rejects(api.requestMetadata(record.id), (error) => error.code === 'unavailable');
   assert.deepEqual((await api.detail(record.id)).input, detail.input);
@@ -139,23 +139,26 @@ test('detail preserves saved metadata and only the explicit endpoint joins host 
 
 test('request metadata endpoint validates its audit identity, fields, and query independently', async () => {
   const id = audits[0].id;
-  const metadata = { userAgent: 'client/1.0', model: 'requested-model', reasoningEffort: 'high' };
+  const metadata = { userAgent: 'client/1.0', model: 'requested-model', upstreamModel: 'upstream-model', accountName: '上游账号 A', reasoningEffort: 'high' };
   for (const value of [
     { auditId: 'another-audit', requestMetadata: metadata },
     { auditId: id, requestMetadata: { ...metadata, userAgent: 42 } },
     { auditId: id, requestMetadata: { ...metadata, model: 'x'.repeat(257) } },
+    { auditId: id, requestMetadata: { ...metadata, upstreamModel: 'x'.repeat(257) } },
+    { auditId: id, requestMetadata: { ...metadata, accountName: 'x'.repeat(513) } },
     { auditId: id },
   ]) await assert.rejects(createAuditClient({ version: 2, request: async () => reply(value) }).requestMetadata(id), (error) => error.code === 'invalid_response');
-  assert.deepEqual(await createAuditClient({ version: 2, request: async () => reply({ auditId: id, requestMetadata: { userAgent: null, model: null, reasoningEffort: null } }) }).requestMetadata(id), { auditId: id, requestMetadata: { userAgent: null, model: null, reasoningEffort: null } });
+  const nullMetadata = { userAgent: null, model: null, upstreamModel: null, accountName: null, reasoningEffort: null };
+  assert.deepEqual(await createAuditClient({ version: 2, request: async () => reply({ auditId: id, requestMetadata: nullMetadata }) }).requestMetadata(id), { auditId: id, requestMetadata: nullMetadata });
   await assert.rejects(client.requestMetadata('missing-audit'), (error) => error.code === 'not_found');
   assert.throws(() => parseQuery('requestMetadata', new URLSearchParams('id=a&id=b')));
   assert.throws(() => parseQuery('requestMetadata', new URLSearchParams('id=a&extra=b')));
   const record = audits[0];
-  const host = { id: record.requestId, keyId: record.keyId, userAgent: '😀'.repeat(8193), model: '界'.repeat(257), reasoningEffort: 'x'.repeat(81) };
+  const host = { id: record.requestId, keyId: record.keyId, userAgent: '😀'.repeat(8193), model: '界'.repeat(257), upstreamModel: '界'.repeat(257), accountName: '😀'.repeat(513), reasoningEffort: 'x'.repeat(81) };
   const api = createAuditClient(bridge(createDemoService({ audits: [record], modelRequests: [host] })));
-  assert.deepEqual((await api.requestMetadata(id)).requestMetadata, { userAgent: null, model: null, reasoningEffort: null });
-  host.userAgent = '😀'.repeat(8192); host.model = '界'.repeat(256); host.reasoningEffort = 'x'.repeat(80);
-  assert.deepEqual((await api.requestMetadata(id)).requestMetadata, { userAgent: host.userAgent, model: host.model, reasoningEffort: host.reasoningEffort });
+  assert.deepEqual((await api.requestMetadata(id)).requestMetadata, nullMetadata);
+  host.userAgent = '😀'.repeat(8192); host.model = '界'.repeat(256); host.upstreamModel = '界'.repeat(256); host.accountName = '😀'.repeat(512); host.reasoningEffort = 'x'.repeat(80);
+  assert.deepEqual((await api.requestMetadata(id)).requestMetadata, { userAgent: host.userAgent, model: host.model, upstreamModel: host.upstreamModel, accountName: host.accountName, reasoningEffort: host.reasoningEffort });
 });
 
 test('content rejects overlaps, gaps, changed totals, and a false end', () => {

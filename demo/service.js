@@ -77,7 +77,7 @@ export function createDemoService({ audits = fixtureAudits, keys = fixtureKeys, 
     const audit = getAudit(query.id);
     const request = modelRequests.find((row) => row.id === audit.requestId);
     if (request && request.keyId !== audit.keyId) fail('unavailable', 503, '宿主请求信息暂时不可用，请重试。');
-    return { auditId: audit.id, requestMetadata: request ? { userAgent: boundedMetadata(request.userAgent, 8192), model: boundedMetadata(request.model, 256), reasoningEffort: boundedMetadata(request.reasoningEffort, 80) } : null };
+    return { auditId: audit.id, requestMetadata: request ? { userAgent: boundedMetadata(request.userAgent, 8192), model: boundedMetadata(request.model, 256), upstreamModel: boundedMetadata(request.upstreamModel, 256), accountName: boundedMetadata(request.accountName, 512), reasoningEffort: boundedMetadata(request.reasoningEffort, 80) } : null };
   }
   function content(query) {
     const audit = getAudit(query.id);

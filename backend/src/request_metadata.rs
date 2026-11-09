@@ -21,6 +21,8 @@ pub(crate) struct RequestMetadataError;
 pub(crate) struct RequestMetadata {
     user_agent: Option<String>,
     model: Option<String>,
+    upstream_model: Option<String>,
+    account_name: Option<String>,
     reasoning_effort: Option<String>,
 }
 
@@ -45,6 +47,10 @@ struct HostRequestDetail {
     user_agent: Option<String>,
     #[serde(deserialize_with = "nullable_string")]
     requested_model: Option<String>,
+    #[serde(deserialize_with = "nullable_string")]
+    upstream_model: Option<String>,
+    #[serde(deserialize_with = "nullable_string")]
+    account_name: Option<String>,
     #[serde(deserialize_with = "nullable_string")]
     reasoning_effort: Option<String>,
 }
@@ -116,6 +122,8 @@ impl RequestMetadata {
         Ok(Self {
             user_agent: bounded(detail.user_agent, 8192),
             model: bounded(detail.requested_model, 256),
+            upstream_model: bounded(detail.upstream_model, 256),
+            account_name: bounded(detail.account_name, 512),
             reasoning_effort: bounded(detail.reasoning_effort, 80),
         })
     }
