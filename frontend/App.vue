@@ -1,7 +1,7 @@
 <script setup>
 import { computed, inject, nextTick, onMounted, onUnmounted, reactive, ref } from 'vue';
 import { BaseButton, BaseIconButton, BaseInput, BaseSelect, BaseTable, BaseToast, defineTableColumns, toast } from '@codex-proxy/ui';
-import { ArrowDown, ArrowUp, ArrowDownWideNarrow, Copy, FileSearch, LoaderCircle, RefreshCw, Search, Settings, X } from '@lucide/vue';
+import { ArrowDown, ArrowUp, ArrowDownWideNarrow, Copy, LoaderCircle, RefreshCw, Search, Settings, X } from '@lucide/vue';
 import { PAGE_SIZES } from './audit.js';
 import { useAudits } from './state/audits.js';
 import { useDateRange } from './state/date-range.js';
@@ -115,10 +115,6 @@ onUnmounted(() => {
 
 <template>
   <div class="audit-app">
-    <header class="topbar">
-      <div class="brand"><span class="brand-icon"><FileSearch :size="19" /></span><span>Codex Proxy</span><span class="brand-divider">/</span><h1>Prompt 审计</h1></div>
-      <BaseButton size="sm" variant="secondary" aria-haspopup="dialog" :aria-expanded="settingsOpen" @click="settingsOpen = true"><Settings :size="15" />设置</BaseButton>
-    </header>
     <main>
       <div class="filters" role="search" aria-label="筛选审计记录">
         <BaseInput id="query" v-model="filters.q" class="search-field" size="sm" type="search" aria-label="搜索用户输入正文" placeholder="搜索用户输入正文…" autocomplete="off" :maxlength="400" @keydown.enter.prevent="applyFilters()">
@@ -134,7 +130,13 @@ onUnmounted(() => {
       </div>
       <div class="results-heading">
         <div class="results-summary"><h2>用户输入</h2><span id="result-count" class="count" role="status">{{ total }} 条</span><span v-if="query.q" class="active-filter">正文包含“{{ query.q }}”</span></div>
-        <div class="table-options"><span class="timezone">记录时间<template v-if="listTimeZone"> · {{ listTimeZone }}</template> · 最新在前</span><BaseIconButton label="刷新列表" size="sm" :disabled="list.kind === 'loading'" @click="refreshList"><RefreshCw :size="14" /></BaseIconButton></div>
+        <div class="table-options">
+          <span class="timezone">记录时间<template v-if="listTimeZone"> · {{ listTimeZone }}</template> · 最新在前</span>
+          <div class="toolbar-actions">
+            <BaseIconButton label="设置" size="sm" aria-haspopup="dialog" :aria-expanded="settingsOpen" @click="settingsOpen = true"><Settings :size="15" /></BaseIconButton>
+            <BaseIconButton label="刷新列表" size="sm" :disabled="list.kind === 'loading'" @click="refreshList"><RefreshCw :size="14" /></BaseIconButton>
+          </div>
+        </div>
       </div>
       <div class="workspace" :class="{ 'detail-open': selectedId }">
         <section ref="recordsPanel" class="records-panel" :class="{ 'compact-columns': compactColumns }" aria-label="用户输入列表">

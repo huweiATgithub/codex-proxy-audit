@@ -1,5 +1,5 @@
 {
-  "primaryHost": "3.42.1",
+  "primaryHost": "3.44.0",
   "hosts": [
     {
       "version": "3.41.2",
@@ -9,6 +9,11 @@
     {
       "version": "3.42.1",
       "revision": "e0a3dc20dd907071fc78f81cfba9a58f00a27521",
+      "openExternal": true
+    },
+    {
+      "version": "3.44.0",
+      "revision": "c622f085748f812936a7371fcc85d1621fa72ca8",
       "openExternal": true
     }
   ]

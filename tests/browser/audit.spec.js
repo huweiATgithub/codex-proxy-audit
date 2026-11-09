@@ -12,6 +12,7 @@ test.afterEach(async ({ page }) => { expect(errors.get(page)).toEqual([]); });
 const ready = async (page, count = '494 条') => expect(page.locator('#result-count')).toHaveText(count);
 const search = async (page, text) => { await page.getByRole('searchbox').fill(text); await page.getByRole('button', { name: '检索', exact: true }).click(); };
 const serviceError = (code, message) => ({ error: { code, message } });
+const rgb = (hex) => `rgb(${[1, 3, 5].map((offset) => Number.parseInt(hex.slice(offset, offset + 2), 16)).join(', ')})`;
 
 test('dense search, current Key selection, cursor pages, and plugin-only navigation', async ({ page }) => {
   const ui = page.frameLocator('iframe');
@@ -288,11 +289,64 @@ test('a slow old query never replaces newer results', async ({ page }) => {
   await expect(ui.locator('.active-filter')).toHaveText('正文包含“CI”');
 });
 
-test('host theme propagation and mobile detail remain usable', async ({ page }) => {
+test('settings sits beside refresh without duplicating the host title and stays accessible on narrow screens', async ({ page }) => {
   const ui = page.frameLocator('iframe');
   await page.goto('/'); await ready(ui);
+  await expect(ui.getByRole('heading', { level: 1 })).toHaveCount(0);
+  await expect(ui.getByRole('heading', { name: 'Prompt 审计', exact: true })).toHaveCount(0);
+  await expect(ui.getByText('Codex Proxy', { exact: true })).toHaveCount(0);
+  const settings = ui.getByRole('button', { name: '设置', exact: true });
+  const refresh = ui.getByRole('button', { name: '刷新列表', exact: true });
+  const dialog = ui.getByRole('dialog', { name: '设置', exact: true });
+  for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 }]) {
+    await page.setViewportSize(viewport);
+    await expect(settings).toBeInViewport();
+    await expect(refresh).toBeInViewport();
+    const gear = await settings.boundingBox(), reload = await refresh.boundingBox();
+    const gap = reload.x - (gear.x + gear.width);
+    expect(gap).toBeGreaterThanOrEqual(0);
+    expect(gap).toBeLessThanOrEqual(12);
+    expect(Math.abs(gear.y + gear.height / 2 - reload.y - reload.height / 2)).toBeLessThanOrEqual(2);
+    expect(Math.abs(gear.width - reload.width)).toBeLessThanOrEqual(2);
+    await settings.focus();
+    await settings.press('Enter');
+    await expect(dialog).toBeVisible();
+    await expect(dialog.getByRole('heading', { name: '显示设置', exact: true })).toBeVisible();
+    await dialog.getByRole('button', { name: '关闭', exact: true }).click();
+    await expect(settings).toBeFocused();
+    await refresh.focus();
+    const refreshed = page.waitForResponse((response) => new URL(response.url()).pathname === '/__demo/api/audits');
+    await refresh.press('Enter'); await refreshed; await ready(ui);
+  }
+});
+
+test('host theme colors reach the page, table and settings modal while mobile layouts remain usable', async ({ page, request }) => {
+  const ui = page.frameLocator('iframe');
+  const { themes } = await (await request.get('/plugin.json')).json();
+  const dialog = ui.getByRole('dialog', { name: '设置', exact: true });
+  const checkColors = async (theme) => {
+    const tokens = themes[theme].tokens;
+    await expect(ui.locator('html')).toHaveCSS('color', rgb(tokens['--cp-color-text']));
+    await expect(ui.locator('html')).toHaveCSS('background-color', rgb(tokens['--cp-color-bg-layout']));
+    await expect(ui.locator('body')).toHaveCSS('background-color', rgb(tokens['--cp-color-bg-layout']));
+    await expect(ui.locator('.records-panel')).toHaveCSS('background-color', rgb(tokens['--cp-color-bg-container']));
+    await expect(ui.locator('table')).toHaveCSS('color', rgb(tokens['--cp-color-text']));
+    if (await dialog.count()) {
+      await expect(dialog).toBeVisible();
+      await expect(dialog).toHaveCSS('background-color', rgb(tokens['--cp-modal-bg']));
+      await expect(dialog).toHaveCSS('color', rgb(tokens['--cp-color-text']));
+    }
+  };
+  await page.goto('/'); await ready(ui);
+  await checkColors('light');
+  await ui.getByRole('button', { name: '设置', exact: true }).click();
+  await expect(dialog).toBeVisible();
+  await checkColors('light');
   await page.getByRole('button', { name: '切换深色主题' }).click();
-  await expect(ui.locator('html')).toHaveAttribute('data-theme', 'dark');
+  await checkColors('dark');
+  await page.getByRole('button', { name: '切换浅色主题' }).click();
+  await checkColors('light');
+  await dialog.getByRole('button', { name: '关闭', exact: true }).click();
   await page.setViewportSize({ width: 390, height: 844 });
   expect(await ui.locator('html').evaluate((root) => root.scrollWidth <= innerWidth)).toBe(true);
   await ui.locator('[data-audit="PA-0018"]').click();
@@ -302,6 +356,34 @@ test('host theme propagation and mobile detail remain usable', async ({ page }) 
   expect(await ui.locator('.detail-scroll').evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
   await ui.getByRole('button', { name: '关闭详情' }).click();
   await expect(ui.locator('.detail-panel')).toHaveCount(0);
+  await ui.getByRole('button', { name: '设置', exact: true }).click();
+  await expect(dialog).toBeVisible();
+  await checkColors('light');
+  const bounds = await dialog.boundingBox();
+  const viewport = await ui.locator('html').evaluate(() => ({ width: innerWidth, height: innerHeight }));
+  expect(bounds.width).toBeGreaterThan(250);
+  expect(bounds.height).toBeGreaterThan(250);
+  expect(bounds.x).toBeGreaterThanOrEqual(0);
+  expect(bounds.y).toBeGreaterThanOrEqual(0);
+  expect(bounds.x + bounds.width).toBeLessThanOrEqual(viewport.width);
+  expect(bounds.y + bounds.height).toBeLessThanOrEqual(viewport.height);
+});
+
+test('the Demo follows the Host default theme prefix when a page omits its declaration', async ({ page, request }) => {
+  const { themes } = await (await request.get('/plugin.json')).json();
+  await page.route('**/plugin.json', async (route) => {
+    const bundle = await (await route.fetch()).json();
+    const entry = bundle.registration.pages[0].entry;
+    const html = Buffer.from(bundle.resources[entry].body, 'base64').toString('utf8')
+      .replace(/<meta\b[^>]*\bname=["']codex-proxy-ui-theme-prefix["'][^>]*>/gi, '');
+    bundle.resources[entry].body = Buffer.from(html).toString('base64');
+    await route.fulfill({ json: bundle });
+  });
+  const ui = page.frameLocator('iframe');
+  await page.goto('/'); await ready(ui);
+  await page.getByRole('button', { name: '切换深色主题' }).click();
+  await expect.poll(() => ui.locator('html').evaluate((root) => root.style.getPropertyValue('--z-color-text'))).toBe(themes.dark.tokens['--cp-color-text']);
+  expect(await ui.locator('html').evaluate((root) => root.style.getPropertyValue('--cp-color-text'))).toBe('');
 });
 
 test('demo loads exact production resources in isolation and uses server time facts', async ({ page, request }) => {

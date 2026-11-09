@@ -8,15 +8,18 @@ const matches = (message) => message && Object.entries(envelope).every(([key, va
 function installBridge(initial) {
   let sequence = 0, theme = initial.theme.name;
   const pending = new Map();
+  const themePrefix = document.querySelector('meta[name="codex-proxy-ui-theme-prefix"]')?.content ?? 'z';
   const matches = (message) => message && ['target', 'version', 'channel', 'session'].every((key) => message[key] === initial[key]);
   function applyTheme(value) {
     theme = value.name;
     document.documentElement.dataset.theme = theme;
     document.documentElement.style.colorScheme = theme;
-    for (const [key, token] of Object.entries(value.tokens)) document.documentElement.style.setProperty(key, token);
+    for (const [name, token] of Object.entries(value.tokens)) {
+      if (/^[a-z][a-z0-9-]*$/.test(name) && typeof token === 'string') document.documentElement.style.setProperty(`--${themePrefix}-${name}`, token);
+    }
     window.dispatchEvent(new CustomEvent('codex-proxy-themechange', { detail: { theme } }));
   }
-  function layout(height) { document.documentElement.style.setProperty('--cp-plugin-viewport-height', `${height}px`); }
+  function layout(height) { document.documentElement.style.setProperty('--plugin-viewport-height', `${height}px`); }
   window.addEventListener('message', (event) => {
     if (event.source !== parent || event.origin !== initial.parentOrigin || !matches(event.data)) return;
     const message = event.data;
@@ -54,7 +57,11 @@ function installBridge(initial) {
 async function start() {
   const response = await fetch('/plugin.json');
   if (!response.ok) throw new Error('无法加载插件资源');
-  const { registration, resources, themes } = await response.json();
+  const { registration, resources, themes: resolvedThemes } = await response.json();
+  // Host bridge messages carry token names without the UI library's CSS prefix.
+  const themes = Object.fromEntries(Object.entries(resolvedThemes).map(([name, theme]) => [name, {
+    name, tokens: Object.fromEntries(Object.entries(theme.tokens).map(([key, value]) => [key.replace(/^--cp-/, ''), value])),
+  }]));
   const resourceUrls = Object.fromEntries(Object.entries(resources).map(([path, resource]) => [path, `data:${resource.contentType};base64,${resource.body}`]));
   const page = registration.pages[0];
   const send = (type, payload) => frame.contentWindow.postMessage({ ...envelope, type, payload }, '*');
@@ -76,7 +83,7 @@ async function start() {
   let theme = 'light';
   const applyTheme = () => {
     document.documentElement.dataset.theme = theme;
-    for (const [key, value] of Object.entries(themes[theme].tokens)) document.documentElement.style.setProperty(key, value);
+    for (const [name, value] of Object.entries(themes[theme].tokens)) document.documentElement.style.setProperty(`--cp-${name}`, value);
     button.textContent = theme === 'light' ? '切换深色主题' : '切换浅色主题';
     send('theme', themes[theme]);
   };
@@ -118,7 +125,8 @@ async function start() {
   });
   const initial = { ...envelope, parentOrigin: location.origin, plugin: { name: 'prompt-audit' }, page: { id: page.id, title: page.title }, theme: themes[theme], viewportHeight: frame.clientHeight, resourceUrls };
   const csp = "default-src 'none'; script-src 'unsafe-inline' data:; style-src 'unsafe-inline' data:; img-src data:; font-src data:; media-src data:; connect-src 'none'; worker-src 'none'; child-src 'none'; frame-src 'none'; object-src 'none'; manifest-src 'none'; base-uri 'none'; form-action 'none'";
-  html = html.replace('<head>', `<head><meta http-equiv="Content-Security-Policy" content="${csp}"><style>html{overflow:hidden}body{min-height:var(--cp-plugin-viewport-height,0px)}</style><script>(${installBridge.toString()})(${JSON.stringify(initial).replace(/</g, '\\u003c')})</script>`);
+  html = html.replace('<head>', `<head><meta http-equiv="Content-Security-Policy" content="${csp}"><style>html{overflow:hidden}body{min-height:var(--plugin-viewport-height,0px)}</style>`);
+  html = html.replace('</head>', `<script>(${installBridge.toString()})(${JSON.stringify(initial).replace(/</g, '\\u003c')})</script></head>`);
   frame.srcdoc = html;
   new ResizeObserver(() => send('layout', { viewportHeight: frame.clientHeight })).observe(frame);
 }
