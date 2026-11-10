@@ -6,7 +6,7 @@ Codex Proxy RS 的 Prompt 审计插件：按 Client Key 记录经过网关的用
 
 审计元数据保留 thread/session ID、消息级 turn ID、逐块输入类型及来源请求报告的仓库根路径、remote URLs。UA、请求模型、上游模型、上游账号名称与 reasoning effort 仅在管理员点击“加载请求信息”后，通过来源请求 ID 和 Key ID 查询宿主已有记录，不重复存入审计数据库；打开详情和读取正文不查询这些信息。请求模型与上游模型均可用且不同时，详情标记差异并显示上游模型。宿主请求记录清理后这些信息不可用，输入和前序对话按审计自身的 72 小时保留期清理。详情优先展示用户输入和前序对话，“记录信息”在其后默认显示，Client Key 与其他元数据同级排列；请求信息独立显示加载、失败及重试状态，不影响正文阅读。外层表格保持记录时间、Client Key 与用户输入三列。具体取值和排除范围见采集行为，宿主查询接口与边界见总体设计 §4。
 
-本仓库包含 [Rust 插件后端](backend/)、[前后端查询契约](contracts/openapi.json)和按契约读取数据的 [UI](frontend/)。后端在 request 阶段观察 Responses HTTP／WebSocket 和 Chat Completions HTTP 请求，检查最后一个输入项，仅为可采集的用户消息提交审计任务；Chat 请求使用宿主规范化后的 Responses 正文，前序对话只取本次请求自带的内容。任务进入固定容量、满时覆盖最旧任务的环形缓冲区，由 worker 异步写入 SQLite，不等待写入确认。重复请求分别记录，后续失败或取消的请求也可能留下记录，尚未落库的任务可能丢失。后端自管数据库初始化、管理查询及共享时区与 UA 排除设置接口。UI 支持高密度表格、用户输入正文关键词与时间、Key 组合筛选、游标分页及按需读取的详情和前序对话。[Demo](demo/)默认提供 500 条虚构输入，也可加载脱敏 Session 样本，供独立审阅页面；模拟服务不承担真实后端验收。
+本仓库包含 [Rust 插件后端](backend/)、[前后端查询契约](contracts/openapi.json)和按契约读取数据的 [UI](frontend/)。后端在 request 阶段观察 Responses HTTP／WebSocket 和 Chat Completions HTTP 请求，按[末尾规则及明确例外](docs/collection.md#4-识别用户输入)选择输入，仅为可采集的用户消息提交审计任务；Chat 请求使用宿主规范化后的 Responses 正文，前序对话只取本次请求自带的内容。任务进入固定容量、满时覆盖最旧任务的环形缓冲区，由 worker 异步写入 SQLite，不等待写入确认。重复请求分别记录，后续失败或取消的请求也可能留下记录，尚未落库的任务可能丢失。后端自管数据库初始化、管理查询及共享时区与 UA 排除设置接口。UI 支持高密度表格、用户输入正文关键词与时间、Key 组合筛选、游标分页及按需读取的详情和前序对话。[Demo](demo/)默认提供 500 条虚构输入，也可加载脱敏 Session 样本，供独立审阅页面；模拟服务不承担真实后端验收。
 
 管理员可点击记录列表右侧、刷新按钮旁的“设置”齿轮，在“排除规则”分区编辑“UA 排除规则”，按行填写 [Rust regex](https://docs.rs/regex/latest/regex/#syntax) 正则表达式并显式保存。任一规则匹配入站 User-Agent 时，本插件跳过该请求的审计记录和前序对话保存；原请求照常转发，headers 与正文保持原样。点击设置中的“Rust regex 语法”帮助后，由宿主确认打开新标签页、复制链接或取消；旧版页桥缺少此能力时显示可复制的文档地址。规则默认空列表，保存在插件私有数据库；保存空列表清除自定义规则，保存失败保留已生效规则。设置与既有来源过滤共同决定采集资格，适用于后续采集，已排队任务及已有记录保持各自原有决定。具体匹配语义与限制见[采集行为 §3.2](docs/collection.md#32-整条请求过滤)。
 
@@ -27,11 +27,11 @@ npm run plugin:build
 CPR_PLUGIN=../codex-proxy-audit-host/backend/target/debug/cpr-plugin npm run plugin:package
 ```
 
-正式安装包与校验文件从 [GitHub Releases](https://github.com/huweiATgithub/codex-proxy-audit/releases) 下载；本地构建输出 `dist/packages/huwei.prompt-audit-0.1.19-x86_64-unknown-linux-gnu.tar.gz`。宿主 CLI 生成资源声明、规范化能力和文件摘要，包内包含 MIT 许可证。同一版本的平台产物在宿主中不可变，修改后发布新的插件版本并使用实例的版本切换入口升级；升级保留原实例的 configuration 和 binding，审计事实继续保存在数据库中。正式包支持 Linux x86_64 GNU，要求 glibc 2.34 或更新版本；其他目标先通过 Cargo 的 `--target` 构建，再用 `AUDIT_TARGET`、`AUDIT_BINARY` 指定目标和二进制。`plugin.json` 声明 middleware v6／management v2／maintenance v1。宿主安装页面上传此包，接受受信任进程，configuration 保持 `{}`，secrets 保持为空。启用 request binding，order 必须小于所有会改写输入的 request 插件；建议 `-1000000`，failurePolicy 使用 `delegate`。管理页面、接口和维护回调自动激活，不配置 management 或 maintenance binding。
+正式安装包与校验文件从 [GitHub Releases](https://github.com/huweiATgithub/codex-proxy-audit/releases) 下载；本地构建输出 `dist/packages/huwei.prompt-audit-0.1.20-x86_64-unknown-linux-gnu.tar.gz`。宿主 CLI 生成资源声明、规范化能力和文件摘要，包内包含 MIT 许可证。同一版本的平台产物在宿主中不可变，修改后发布新的插件版本并使用实例的版本切换入口升级；升级保留原实例的 configuration 和 binding，审计事实继续保存在数据库中。正式包支持 Linux x86_64 GNU，要求 glibc 2.34 或更新版本；其他目标先通过 Cargo 的 `--target` 构建，再用 `AUDIT_TARGET`、`AUDIT_BINARY` 指定目标和二进制。`plugin.json` 声明 middleware v6／management v2／maintenance v1。宿主安装页面上传此包，接受受信任进程，configuration 保持 `{}`，secrets 保持为空。启用 request binding，order 必须小于所有会改写输入的 request 插件；建议 `-1000000`，failurePolicy 使用 `delegate`。管理页面、接口和维护回调自动激活，不配置 management 或 maintenance binding。
 
 [CI](.github/workflows/ci.yml) 在 pull request 和 `main` 推送时自动执行契约检查、JavaScript 与浏览器测试、Rust fmt／Clippy／测试、正式插件打包及真实宿主验收（含 125 秒下游等待）。构建只生成一份正式插件包，再按 [host-compatibility.json](host-compatibility.json) 的 `hosts` 列表分别在 Host 3.41.2、3.42.1 和 3.44.0 验收；`primaryHost` 指定 3.44.0 为截图与主要验收展示基线，宿主条目的 `openExternal` 布尔值指定页桥接口预期，分别验证旧宿主显示可复制文档地址与新宿主的打开／复制／取消确认流程。打包 CLI 使用 Cargo 中固定的 SDK 提交，各验收宿主使用列表中自己的版本与源码提交；验收前分别核对 tag 和提交并校验下载的宿主包。构建检查 ELF 架构与 glibc 要求，安装包和各宿主的独立验收结果保存在 Actions artifacts。工作流也可通过 `workflow_dispatch` 手动运行兼容性验收，不触发发布。
 
-正式发布由 [Release](.github/workflows/release.yml) 自动完成：更新 `plugin.json`、`backend/Cargo.toml` 及 `backend/Cargo.lock` 中的插件版本，提交到 `main` 后，推送匹配的稳定版 tag（`vX.Y.Z`）。例如下一个版本为 `0.1.19` 时，执行 `git tag -a v0.1.19 -m "Release v0.1.19"` 和 `git push origin v0.1.19`。版本不一致会停止构建；全部 CI 检查通过后，工作流使用同次运行验收过的安装包，创建带自动生成说明的 GitHub Release，上传安装包、校验文件、MIT 许可证、三个宿主的独立验收结果及主宿主 3.44.0 的五张截图，再验证公开下载。工作流只需 GitHub 自动提供的 `GITHUB_TOKEN`；构建与测试只有读取权限，发布 job 才有 `contents: write`。失败后可在 Actions 中重跑；已发布的附件只校验，不覆盖。发布不安装或升级生产实例。
+正式发布由 [Release](.github/workflows/release.yml) 自动完成：更新 `plugin.json`、`backend/Cargo.toml` 及 `backend/Cargo.lock` 中的插件版本，提交到 `main` 后，推送匹配的稳定版 tag（`vX.Y.Z`）。例如下一个版本为 `0.1.20` 时，执行 `git tag -a v0.1.20 -m "Release v0.1.20"` 和 `git push origin v0.1.20`。版本不一致会停止构建；全部 CI 检查通过后，工作流使用同次运行验收过的安装包，创建带自动生成说明的 GitHub Release，上传安装包、校验文件、MIT 许可证、三个宿主的独立验收结果及主宿主 3.44.0 的五张截图，再验证公开下载。工作流只需 GitHub 自动提供的 `GITHUB_TOKEN`；构建与测试只有读取权限，发布 job 才有 `contents: write`。失败后可在 Actions 中重跑；已发布的附件只校验，不覆盖。发布不安装或升级生产实例。
 
 插件初始化时自动创建 `<宿主持久数据目录>/huwei.prompt-audit/audit.sqlite3` 及所需表。数据根目录由宿主设定的启动目录 `<宿主持久数据目录>/plugins/plugin-*` 向上两级定位，数据库位于固定子目录，重启和重新解包均复用同一文件。目录不可配置；安装无需准备数据库角色、连接串或额外数据库服务。该目录应随宿主持久数据区一起保留。
 
@@ -44,7 +44,7 @@ node scripts/integration.js \
   --host-web ../codex-proxy-audit-host/frontend/dist \
   --host-version 3.42.1 \
   --expect-open-external true \
-  --package dist/packages/huwei.prompt-audit-0.1.19-x86_64-unknown-linux-gnu.tar.gz \
+  --package dist/packages/huwei.prompt-audit-0.1.20-x86_64-unknown-linux-gnu.tar.gz \
   --next-wait-ms 125000 \
   --keep
 ```
@@ -76,7 +76,7 @@ npm run preview -- --fixtures .local/session-fixtures.json
 mkdir -p .local
 node scripts/seed-session-fixtures.js --base-url http://127.0.0.1:4180 --fixture tests/fixtures/codex-sessions.json > .local/seed-result.json
 node tests/integration/verify-session-fixtures.js .local/seed-result.json
-node tests/integration/update-review-host.js dist/packages/huwei.prompt-audit-0.1.19-x86_64-unknown-linux-gnu.tar.gz .local/seed-result.json
+node tests/integration/update-review-host.js dist/packages/huwei.prompt-audit-0.1.20-x86_64-unknown-linux-gnu.tar.gz .local/seed-result.json
 ```
 
 查询契约的语义见[设计文档 §5.3](docs/design.md#53-管理-api)，字段以 `contracts/audit.js` 为源；修改后运行 `npm run contract:export` 更新 OpenAPI。前端验证命令为 `npm run contract:check`、`npm test` 和 `npm run test:ui`。浏览器验证首次运行需执行 `npx playwright install chromium`，也可通过 `PLAYWRIGHT_CHROMIUM_EXECUTABLE` 指定已有 Chromium；测试自动使用 4174 端口，不占用供审阅的 4173。这组浏览器测试使用模拟服务；正式宿主验收使用上面的 `scripts/integration.js`。

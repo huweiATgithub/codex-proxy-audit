@@ -376,9 +376,9 @@ async function run() {
   report('hidden title generation is excluded while identical genuine user text is preserved');
   await requestModel(key, [message('integration-skill-input', 'INTEGRATION-skill-tail earlier user'), message('integration-skill-injection', 'INTEGRATION-skill-tail injected instructions', 'same-turn', ['skills.selected_skill_instructions'])], 'thread-skill-tail');
   const skillTail = await listCount('INTEGRATION-skill-tail', 1), skillDetail = await management('audit', { id: skillTail.items[0].id });
-  assert.equal(await textContent(skillDetail.id, skillDetail.input), 'INTEGRATION-skill-tail injected instructions');
-  assert.deepEqual(skillDetail.inputKinds, ['skills.selected_skill_instructions']); assert.equal(skillDetail.context.length, 1);
-  report('skill instructions carried after user input do not suppress the audit');
+  assert.equal(await textContent(skillDetail.id, skillDetail.input), 'INTEGRATION-skill-tail earlier user');
+  assert.deepEqual(skillDetail.inputKinds, ['user.text']); assert.equal(skillDetail.context.length, 0);
+  report('same-turn skill instructions after user input preserve the original user message as the audit');
   await requestModel(key, [message('integration-daemon-prompt', 'INTEGRATION-prompt-only daemon continuation', 'same-turn', ['daemon_recovery.internal_context'])], 'thread-daemon-prompt', { purpose: { turn_trigger: 'daemon_recovery' } });
   await requestModel(key, [message('integration-recap-prompt', 'INTEGRATION-prompt-only classified recap', 'same-turn', ['recap.prompt'])], 'thread-recap-prompt');
   await requestModel(key, [message('integration-goal-steering', 'INTEGRATION-goal-steering after user goal edit', 'same-turn', ['goal.internal_context'])], 'thread-goal-steering', { purpose: { turn_trigger: 'goal' } });
@@ -433,6 +433,45 @@ async function run() {
   await json('/api/admin/accounts/import', { provider: 'openai', data: { provider: 'openai', authentication_kind: 'api_key', name: 'Integration WebSocket upstream', base_url: `${upstream.url}/v1`, api_key: 'sk-integration-websocket-only', transport: 'prefer_websocket' } }, 201);
   const ws = await connectWebSocket(base.replace('http:', 'ws:') + '/v1/responses', { authorization: `Bearer ${key.plaintextKey}`, 'user-agent': 'codex-audit-integration/ws' });
   const wsCall = async (input, extra = {}, connection = ws) => { connection.send({ type: 'response.create', model: 'gpt-5.4', input, client_metadata: metadata('thread-ws'), store: false, ...extra }); for (;;) { const event = await connection.receive(); assert.notEqual(event.type, 'error', JSON.stringify(event)); if (event.type === 'response.completed') return event.response; } };
+  const updates = [{ type: 'configuration_update', reasoning: { effort: 'high' } }, { type: 'configuration_update', reasoning: { effort: 'xhigh' } }];
+  const supplements = [
+    ['developer', 'hooks.additional_context'], ['user', 'skills.selected_skill_instructions'],
+    ['developer', 'plugins.instructions'], ['developer', 'rollout_budget.remaining_tokens'],
+    ['developer', 'current_time.reminder'], ['developer', 'current_time.unavailable'],
+    ['user', 'agents_md.instructions'], ['user', 'environments.environment_context'],
+  ].map(([role, kind]) => ({ ...message(`supplement-${kind}`, kind, 'configuration-user-turn', [kind]), role }));
+  for (const transport of ['http-json', 'http-sse', 'websocket']) {
+    const marker = `INTEGRATION-configuration-${transport}`;
+    const send = (input) => transport === 'websocket' ? wsCall(input) : requestModel(key, input, `thread-${marker}`, { stream: transport === 'http-sse' });
+    const current = message(marker, marker, 'configuration-user-turn');
+    const prior = { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'configuration prior context' }] };
+    assert.equal((await send([prior, current, ...supplements, ...updates])).status, 'completed');
+    const page = await listCount(marker, 1);
+    const detail = await management('audit', { id: page.items[0].id });
+    assert.equal(await textContent(detail.id, detail.input), marker);
+    assert.equal(detail.turnId, 'configuration-user-turn');
+    assert.deepEqual(detail.inputKinds, ['user.text']);
+    assert.equal(detail.context.length, 1);
+    assert.equal(await textContent(detail.id, detail.context[0].content), 'configuration prior context');
+    const tail = [{ type: 'function_call', call_id: `${marker}-call`, name: 'test_tool', arguments: '{}' }, { type: 'function_call_output', call_id: `${marker}-call`, output: 'done' }];
+    assert.equal((await send([current, ...tail, ...supplements, ...updates])).status, 'completed');
+    const crossTurn = `INTEGRATION-cross-turn-${transport}`;
+    await send([message(crossTurn, crossTurn, 'different-user-turn'), ...supplements, ...updates]);
+    const barrier = `INTEGRATION-after-configuration-${transport}`;
+    await send([message(barrier, barrier, 'configuration-user-turn'), ...supplements, ...updates]);
+    await listCount(barrier, 1);
+    await listCount(marker, 1);
+    await listCount(crossTurn, 0);
+    const selection = `INTEGRATION-skill-only-${transport}`;
+    const empty = message(`${selection}-empty`, '', 'configuration-user-turn', []);
+    empty.content = [];
+    await send([empty, message(selection, selection, 'configuration-user-turn', ['skills.selected_skill_instructions']), ...updates]);
+    const selected = await listCount(selection, 1);
+    const selectedDetail = await management('audit', { id: selected.items[0].id });
+    assert.equal(await textContent(selectedDetail.id, selectedDetail.input), selection);
+    assert.deepEqual(selectedDetail.inputKinds, ['skills.selected_skill_instructions']);
+  }
+  report('explicit same-turn supplements preserve HTTP JSON/SSE and WebSocket user input without crossing tools or turn boundaries');
   const warmup = await wsCall([message('integration-warmup', 'INTEGRATION-warmup input')], { generate: false }); await listCount('INTEGRATION-warmup', 1);
   const generated = await wsCall([], { previous_response_id: warmup.id });
   await wsCall([message('integration-ws-next', 'INTEGRATION-ws-next incremental')], { previous_response_id: generated.id });

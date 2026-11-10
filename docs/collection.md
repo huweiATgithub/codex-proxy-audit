@@ -4,11 +4,11 @@
 
 本文定义 Prompt 审计“记录哪些最新输入、带上哪些上文、任务如何写入”。它是采集规则的独立维护入口；PG、插件接入和 UI 见[总体设计](design.md)。
 
-一条审计记录描述：某个 Client Key 的请求中，网关观察到的最后一个输入项中的可采集用户消息，以及该请求携带的有限前序对话。目标是帮助审阅用户意图，例如将“请继续”与 Agent 此前的方案一起展示。
+一条审计记录描述：某个 Client Key 的请求中，按第 4 节末尾规则及明确例外选出的可采集用户消息，以及该请求携带的有限前序对话。目标是帮助审阅用户意图，例如将“请继续”与 Agent 此前的方案一起展示。
 
 观察边界是网关 `request` 中间件，不是客户端输入框。客户端尚未发出的输入、到达该阶段之前就被拒绝的请求、客户端在发送前移除的历史，都不在插件可见范围内。页面将时间称为“记录时间”，其值为本次请求经过采集边界时的时间，存储字段沿用 `first_observed_at`。相同请求重传会分别记录，各自使用本次观察时间；该时间不等于客户端提交时间，也不等于异步写入数据库完成的时间。
 
-最后一个输入项是可采集的用户消息时才提交审计任务，也允许保留来源尚不明确的 `user` 消息。请求用途与来源用于决定是否采集，判定后不将这些字段或分类快照落库。已识别的子代理请求整体排除。插件不保存完整请求转储、工具过程或推理轨迹。
+默认只在最后一个输入项是可采集的用户消息时提交审计任务；已确认的尾部补充项按第 4 节逐项处理，也允许保留来源尚不明确的 `user` 消息。请求用途与来源用于决定是否采集，判定后不将这些字段或分类快照落库。已识别的子代理请求整体排除。插件不保存完整请求转储、工具过程或推理轨迹。
 
 ## 2. 采集阶段
 
@@ -77,7 +77,23 @@ UA 规则采用 [Rust regex 语法](https://docs.rs/regex/latest/regex/#syntax)�
 
 ## 4. 识别用户输入
 
-对通过来源筛选的请求，先检查 Responses `input` 的最后一个原始输入项。只有它是可采集的 `user` 消息，才读取其中的内容块并构造一条审计任务。最后一项是 assistant、工具调用或工具结果时跳过整次采集，即使前面仍携带历史用户输入也不回头取它。字符串形式的 `input` 按一条用户文本处理。`role=user` 只是候选条件：Codex 也使用该角色承载 AGENTS.md、环境信息和运行期通知。
+对通过来源筛选的请求，默认只检查 Responses `input` 的最后一个原始输入项。只有它是可采集的 `user` 消息，才读取其中的内容块并构造一条审计任务；不向前搜索任意历史用户消息。字符串形式的 `input` 按一条用户文本处理。`role=user` 只是候选条件：Codex 也使用该角色承载 AGENTS.md、环境信息和运行期通知。
+
+这个默认规则只有以下明确的尾部例外。已按官方 Codex `0.167.0` 的请求构造路径核对：它们可在接受用户输入后、发起模型请求前追加，不表示 Agent 已继续对话或执行工具。[输入与补充项顺序][tail-order]
+
+| 尾部项 | 例外的依据与处理 |
+| --- | --- |
+| `type=configuration_update` | 客户端在已接受的输入后记录推理强度覆盖；跳过该控制项。[配置追加][tail-configuration] |
+| `role=user`，全部块为 `skills.selected_skill_instructions` | 按本轮输入加载的 skill 正文在输入后追加；作为附加说明跳过，不冒充用户原文。[Skill 分类][tail-skill] |
+| `role=developer`，全部块为 `plugins.instructions` 或 `hooks.additional_context` | 插件指令和 prompt hook 的补充上下文在接受输入后追加。[插件分类][tail-plugin]、[Hook 追加][tail-hook] |
+| `role=developer`，全部块为 `current_time.reminder`、`current_time.unavailable` 或 `rollout_budget.remaining_tokens` | 请求前追加的时钟或预算提醒，不是新一轮用户发言。[时钟分类][tail-clock]、[预算追加][tail-budget] |
+| `role=user`，全部块为 `agents_md.instructions` 或 `environments.environment_context` | 每步 world state 更新可在已接受的输入后追加这些已知上下文。[World state 追加][tail-world-state] |
+
+消息级例外必须是非空的纯 `input_text` 内容数组，且 `content_item_kinds` 为长度完全对齐、全部匹配对应角色清单的字符串数组；允许同一角色的多个已列分类组合。所有被跳过消息及最终候选用户消息必须带有相同、有效的消息级 `turn_id`，不使用请求级 turn ID 补值。配置控制项本身没有消息级 turn ID，不参与这项比较。[客户端消息归属][tail-stamp]
+
+从末尾连续跳过符合上述条件的补充项后，只检查紧邻的一个剩余项。遇到 assistant、工具调用、工具结果、reasoning、压缩项、未知类型或不能证明是补充项的非用户消息就停止，本次不采集；不跨越它们寻找用户输入。只剩补充项、或已识别补充消息的 turn ID 与候选输入不同，也不采集。分类缺失、不完整或混合真实用户块时，不把该消息作为例外跳过，继续使用默认的角色与内容规则。
+
+不能仅凭“不是用户输入”扩大尾部例外。当前客户端的 `additional_tools` 放在请求前缀，没有新增尾部跳过规则的依据；`compaction_trigger` 虽然会追加在末尾，但属于独立压缩请求，应阻断采集。其他 world state 或扩展生成的类型也不按前缀、角色或来源统一跳过。[工具声明位置][tail-tools]、[压缩控制项][tail-compaction]
 
 可用时，读取 `input[i].internal_chat_message_metadata_passthrough.content_item_kinds[j]`，与 `input[i].content[j]` 按位置对应。它是字符串数组，分类的是内容块而非整个请求。[消息类型][message-type]、[内容分类类型][content-kind]
 
@@ -88,7 +104,7 @@ UA 规则采用 [Rust regex 语法](https://docs.rs/regex/latest/regex/#syntax)�
 | 已标注的 [`multi_agent.subagent_notification`][notification-kind] | 排除该通知片段，不过滤同请求中的真实输入 |
 | 已标注的 [`user.heartbeat`][heartbeat-kind] 等自动触发内容 | 区分为自动事件，不当作新的人类输入 |
 | 最后输入项仅由 [`recap.prompt`][recap-kind] / [`daemon_recovery.internal_context`][daemon-recovery] 自动提示组成 | 跳过本次审计；同一消息含用户或未知分类的块时仍保留完整候选输入，前序对话中的这些提示也保留 |
-| 请求携带的 skill、摘要、运行期通知、额外上下文和内部证据 | 不凭这些内容分类排除审计或剥离文本；它们的存在不证明请求由自动提示发起 |
+| 请求携带的 skill、摘要、运行期通知、额外上下文和内部证据 | 不凭这些内容分类排除整条请求；独立尾部消息仅按上面的明确例外处理，混合用户消息中的这些文本仍保留 |
 | 未标注或尚未识别的 `user` 内容块 | 允许保留，不能认定为已确认的真人输入；后续在本文细化分类 |
 | 工具调用、工具返回、reasoning、system / developer 指令 | 不形成审计输入，也不作为普通对话上文 |
 
@@ -100,7 +116,7 @@ Stop hook 的自动继续消息也可能使用 `role=user`，却没有内容分�
 
 Realtime handoff 将用户语音和转录包装为普通用户文本，不保留专用内容分类。会话结束时的 transcript-tail flush 还加入生成的交接提示，但该路径只写入历史，不发起模型推理；这些混合文本可出现在后续请求的上文中。插件不按 `realtime` trigger 或文本标签排除整个包装，以保留其中的真实语音输入。[语音包装渲染][realtime-wrapper]、[结束时保存历史][realtime-tail-history]
 
-客户端可在真实输入之后追加 [`skills.selected_skill_instructions`][skill-kind]。该分类表示随用户请求加载的 skill 正文，不表示一个独立的自动任务；即使它是最后一个原始输入项，也不因这项分类跳过审计。采集仍以最后一个原始输入项为准，不回头取前面的用户消息。[输入与注入顺序][skill-injection-order]
+客户端可在真实输入之后追加 [`skills.selected_skill_instructions`][skill-kind]。该分类表示随用户请求加载的 skill 正文，不表示一个独立的自动任务。独立尾部 skill 消息满足上表的完整分类与同轮条件时，采集它之前紧邻的用户输入；补充说明位于用户输入之后，不放入该输入的前序对话。仅选择 skill、没有文字或媒体时，客户端会先记录空的用户内容数组，再追加 skill 正文；遇到这个同轮空输入时，保留末尾 skill 正文作为既有候选输入，不越过空输入寻找历史发言。skill 与真实用户块混在同一消息、或缺少分类证据时，保留该候选消息，不通过文本标签猜测边界。[输入与注入顺序][skill-injection-order]、[Skill 选择的输入表示][tail-skill-selection]
 
 [`compaction.summary`][summary-kind]、[`generic.turn_aborted`][aborted-kind]、[`additional_content.<key>`][additional-context-kind]、memory / guardian 证据和兼容警告可作为用户请求携带的内容保留；独立的 compaction、memory 或 guardian 请求仍由 §3.2 的来源规则排除。不能把内容由客户端生成等同于请求由客户端自动发起。[Memory 证据][memory-evidence-kind]、[Guardian 指令][guardian-retained-kind]、[兼容警告][legacy-warning-kind]
 
@@ -225,3 +241,15 @@ Agent 工具循环携带早先的用户输入时，最后一个输入项通常�
 [media-placeholder-kind]: https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/core/src/context/unsupported_media.rs#L8
 
 [model-request]: https://github.com/zyycn/codex-proxy-rs/blob/e0a3dc20dd907071fc78f81cfba9a58f00a27521/backend/crates/gateway-plugin/sdk/docs/capabilities.md#L458
+[tail-order]: https://github.com/openai/codex/blob/086ccc833bc9cf01024ad2dd6af7dbd421b6bf9a/codex-rs/core/src/session/turn.rs#L404
+[tail-configuration]: https://github.com/openai/codex/blob/086ccc833bc9cf01024ad2dd6af7dbd421b6bf9a/codex-rs/core/src/session/reasoning_effort.rs#L28
+[tail-skill]: https://github.com/openai/codex/blob/086ccc833bc9cf01024ad2dd6af7dbd421b6bf9a/codex-rs/ext/skills/src/fragments.rs#L87
+[tail-plugin]: https://github.com/openai/codex/blob/086ccc833bc9cf01024ad2dd6af7dbd421b6bf9a/codex-rs/core/src/context/plugin_instructions.rs#L17
+[tail-hook]: https://github.com/openai/codex/blob/086ccc833bc9cf01024ad2dd6af7dbd421b6bf9a/codex-rs/core/src/hook_runtime.rs#L750
+[tail-clock]: https://github.com/openai/codex/blob/086ccc833bc9cf01024ad2dd6af7dbd421b6bf9a/codex-rs/core/src/context/current_time_reminder.rs#L27
+[tail-budget]: https://github.com/openai/codex/blob/086ccc833bc9cf01024ad2dd6af7dbd421b6bf9a/codex-rs/core/src/session/rollout_budget.rs#L7
+[tail-world-state]: https://github.com/openai/codex/blob/086ccc833bc9cf01024ad2dd6af7dbd421b6bf9a/codex-rs/core/src/session/mod.rs#L4011
+[tail-stamp]: https://github.com/openai/codex/blob/086ccc833bc9cf01024ad2dd6af7dbd421b6bf9a/codex-rs/core/src/session/mod.rs#L3718
+[tail-tools]: https://github.com/openai/codex/blob/086ccc833bc9cf01024ad2dd6af7dbd421b6bf9a/codex-rs/core/src/client.rs#L1062
+[tail-compaction]: https://github.com/openai/codex/blob/086ccc833bc9cf01024ad2dd6af7dbd421b6bf9a/codex-rs/core/src/compact_remote_v2_attempt.rs#L177
+[tail-skill-selection]: https://github.com/openai/codex/blob/086ccc833bc9cf01024ad2dd6af7dbd421b6bf9a/codex-rs/protocol/src/models.rs#L2231

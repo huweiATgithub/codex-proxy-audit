@@ -77,7 +77,7 @@ struct Metadata {
     repositories: Option<Vec<Repository>>,
 }
 
-/// Only the last raw input item can introduce a new audit
+/// Only the last input item, apart from proven trailing supplements, can introduce an audit.
 pub fn collect(observation: &RequestObservation, policy: &ExclusionPolicy) -> Option<AuditDraft> {
     let mut input_kinds = Vec::new();
     let (blocks, turn_id, earlier) = match observation.body.get("input")? {
@@ -87,19 +87,12 @@ pub fn collect(observation: &RequestObservation, policy: &ExclusionPolicy) -> Op
             &[][..],
         ),
         Value::Array(items) => {
-            let (latest, earlier) = items.split_last()?;
-            if message_role(latest) != Some("user") {
-                return None;
-            }
+            let LatestUserInput {
+                message: latest,
+                earlier,
+            } = latest_user_input(items)?;
             let blocks = parse_blocks(latest, Some(&mut input_kinds));
-            let turn_id = bounded(
-                latest
-                    .get("internal_chat_message_metadata_passthrough")
-                    .and_then(|value| value.get("turn_id"))
-                    .and_then(Value::as_str),
-                256,
-            )
-            .filter(|value| !value.is_empty());
+            let turn_id = message_turn_id(latest).map(str::to_owned);
             (blocks, turn_id, earlier)
         }
         _ => return None,
@@ -157,6 +150,120 @@ pub fn collect(observation: &RequestObservation, policy: &ExclusionPolicy) -> Op
         repositories: metadata.repositories,
         context: limit_window(context),
     })
+}
+
+struct LatestUserInput<'a> {
+    message: &'a Value,
+    earlier: &'a [Value],
+}
+
+enum InputSupplement<'a> {
+    Configuration,
+    Message {
+        turn_id: &'a str,
+        selected_skill: bool,
+    },
+}
+
+fn latest_user_input(mut items: &[Value]) -> Option<LatestUserInput<'_>> {
+    let mut supplement_turn = None;
+    let mut skill_selection = None;
+    loop {
+        let (latest, earlier) = items.split_last()?;
+        match input_supplement(latest) {
+            Some(InputSupplement::Configuration) => {}
+            Some(InputSupplement::Message {
+                turn_id,
+                selected_skill,
+            }) => {
+                if supplement_turn.is_some_and(|previous| previous != turn_id) {
+                    return None;
+                }
+                supplement_turn = Some(turn_id);
+                if selected_skill && skill_selection.is_none() {
+                    skill_selection = Some(LatestUserInput {
+                        message: latest,
+                        earlier,
+                    });
+                }
+            }
+            None => {
+                if message_role(latest) != Some("user")
+                    || supplement_turn.is_some_and(|turn| message_turn_id(latest) != Some(turn))
+                {
+                    return None;
+                }
+                // Skill-only submissions have an empty user message followed by the skill body.
+                if latest
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(Vec::is_empty)
+                    && let Some(selection) = skill_selection
+                {
+                    return Some(selection);
+                }
+                return Some(LatestUserInput {
+                    message: latest,
+                    earlier,
+                });
+            }
+        }
+        items = earlier;
+    }
+}
+
+fn input_supplement(item: &Value) -> Option<InputSupplement<'_>> {
+    if item.get("type").and_then(Value::as_str) == Some("configuration_update") {
+        return Some(InputSupplement::Configuration);
+    }
+    let role = message_role(item)?;
+    let content = item.get("content")?.as_array()?;
+    let metadata = item.get("internal_chat_message_metadata_passthrough")?;
+    let kinds = metadata.get("content_item_kinds")?.as_array()?;
+    // Only complete, text-only messages with exact known classifications are supplements.
+    if content.is_empty()
+        || kinds.len() != content.len()
+        || !content.iter().zip(kinds).all(|(block, kind)| {
+            block.get("type").and_then(Value::as_str) == Some("input_text")
+                && block.get("text").is_some_and(Value::is_string)
+                && matches!(
+                    (role, kind.as_str()),
+                    (
+                        "user",
+                        Some(
+                            "skills.selected_skill_instructions"
+                                | "agents_md.instructions"
+                                | "environments.environment_context"
+                        )
+                    ) | (
+                        "developer",
+                        Some(
+                            "plugins.instructions"
+                                | "hooks.additional_context"
+                                | "current_time.reminder"
+                                | "current_time.unavailable"
+                                | "rollout_budget.remaining_tokens"
+                        )
+                    )
+                )
+        })
+    {
+        return None;
+    }
+    Some(InputSupplement::Message {
+        turn_id: message_turn_id(item)?,
+        selected_skill: role == "user"
+            && kinds
+                .iter()
+                .all(|kind| kind.as_str() == Some("skills.selected_skill_instructions")),
+    })
+}
+
+fn message_turn_id(item: &Value) -> Option<&str> {
+    item.get("internal_chat_message_metadata_passthrough")?
+        .get("turn_id")?
+        .as_str()
+        .filter(|value| !value.is_empty() && !value.contains('\0') && value.chars().count() <= 256)
 }
 
 fn message_role(item: &Value) -> Option<&str> {
@@ -637,6 +744,233 @@ mod tests {
         for input in [Value::Null, json!([])] {
             assert!(collect(&observation(input)).is_none());
         }
+    }
+
+    #[test]
+    fn trailing_configuration_update_preserves_the_latest_user_input() {
+        let mut latest = user("implement the backend concurrency change");
+        latest["internal_chat_message_metadata_passthrough"] = json!({
+            "turn_id":"user-turn", "content_item_kinds":["user.text"]
+        });
+        let request = observation(json!([
+            user("previous question"), assistant("previous answer"), latest,
+            {"type":"configuration_update","reasoning":{"effort":"xhigh"}}
+        ]));
+        let original = request.body.clone();
+        let draft = collect(&request).expect("configuration updates must not hide user input");
+        assert_eq!(
+            draft.blocks,
+            vec![ContentBlock::Text {
+                text: "implement the backend concurrency change".into()
+            }]
+        );
+        assert_eq!(draft.turn_id.as_deref(), Some("user-turn"));
+        assert_eq!(draft.input_kinds, vec![Some("user.text".into())]);
+        assert_eq!(
+            draft.context.iter().map(text).collect::<Vec<_>>(),
+            vec!["previous question", "previous answer"]
+        );
+        assert_eq!(request.body, original);
+    }
+
+    fn classified_message(role: &str, text: &str, kinds: Value, turn: Value) -> Value {
+        json!({"type":"message","role":role,"content":[{"type":"input_text","text":text}],
+            "internal_chat_message_metadata_passthrough":{"content_item_kinds":kinds,"turn_id":turn}})
+    }
+
+    #[test]
+    fn known_turn_supplements_preserve_the_user_message_they_follow() {
+        for (role, kind) in [
+            ("user", "skills.selected_skill_instructions"),
+            ("user", "agents_md.instructions"),
+            ("user", "environments.environment_context"),
+            ("developer", "plugins.instructions"),
+            ("developer", "hooks.additional_context"),
+            ("developer", "current_time.reminder"),
+            ("developer", "current_time.unavailable"),
+            ("developer", "rollout_budget.remaining_tokens"),
+        ] {
+            let request = observation(json!([
+                assistant("preceding answer"),
+                classified_message("user", "actual question", json!(["user.text"]), json!("turn-a")),
+                classified_message(role, "supplement", json!([kind]), json!("turn-a")),
+                {"type":"configuration_update","reasoning":{"effort":"xhigh"}}
+            ]));
+            let original = request.body.clone();
+            let draft = collect(&request).unwrap_or_else(|| panic!("{kind}"));
+            assert_eq!(
+                draft.blocks,
+                vec![ContentBlock::Text {
+                    text: "actual question".into()
+                }]
+            );
+            assert_eq!(draft.input_kinds, vec![Some("user.text".into())]);
+            assert_eq!(draft.turn_id.as_deref(), Some("turn-a"));
+            assert_eq!(
+                draft.context.iter().map(text).collect::<Vec<_>>(),
+                vec!["preceding answer"]
+            );
+            assert_eq!(request.body, original);
+        }
+    }
+
+    #[test]
+    fn message_supplements_require_complete_classification_and_the_same_turn() {
+        let input = classified_message(
+            "user",
+            "actual question",
+            json!(["user.text"]),
+            json!("turn-a"),
+        );
+        for (kinds, turn) in [
+            (json!(["current_time.reminder"]), json!("turn-b")),
+            (json!(["current_time.reminder"]), Value::Null),
+            (json!(["current_time.reminder"]), json!("")),
+            (
+                json!(["current_time.reminder", "current_time.unavailable"]),
+                json!("turn-a"),
+            ),
+            (json!([null]), json!("turn-a")),
+            (json!(["unknown.future_context"]), json!("turn-a")),
+            (Value::Null, json!("turn-a")),
+        ] {
+            let supplement = classified_message("developer", "context", kinds, turn);
+            assert!(collect(&observation(json!([input, supplement]))).is_none());
+        }
+        let first = classified_message(
+            "developer",
+            "first",
+            json!(["current_time.reminder"]),
+            json!("turn-b"),
+        );
+        let last = classified_message(
+            "developer",
+            "last",
+            json!(["plugins.instructions"]),
+            json!("turn-a"),
+        );
+        assert!(collect(&observation(json!([input, first, last]))).is_none());
+        let only_supplement = classified_message(
+            "user",
+            "skill",
+            json!(["skills.selected_skill_instructions"]),
+            json!("turn-a"),
+        );
+        assert!(collect(&observation(json!([only_supplement]))).is_none());
+    }
+
+    #[test]
+    fn unknown_or_mixed_user_messages_are_inputs_instead_of_tail_exceptions() {
+        for kinds in [
+            Value::Null,
+            json!(["unknown.future_context"]),
+            json!(["skills.selected_skill_instructions", "user.text"]),
+        ] {
+            let latest = classified_message("user", "keep this input", kinds, json!("turn-a"));
+            let draft = collect(&observation(json!([user("earlier input"), latest]))).unwrap();
+            assert_eq!(
+                draft.blocks,
+                vec![ContentBlock::Text {
+                    text: "keep this input".into()
+                }]
+            );
+        }
+        let mut mixed = classified_message(
+            "user",
+            "skill",
+            json!(["skills.selected_skill_instructions", "user.text"]),
+            json!("turn-a"),
+        );
+        mixed["content"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"input_text","text":"actual user addition"}));
+        let draft = collect(&observation(json!([user("earlier input"), mixed]))).unwrap();
+        assert_eq!(
+            draft.blocks,
+            vec![
+                ContentBlock::Text {
+                    text: "skill".into()
+                },
+                ContentBlock::Text {
+                    text: "actual user addition".into()
+                }
+            ]
+        );
+        let mut media = classified_message(
+            "user",
+            "placeholder",
+            json!(["skills.selected_skill_instructions"]),
+            json!("turn-a"),
+        );
+        media["content"] =
+            json!([{"type":"input_image","image_url":"https://example.invalid/image"}]);
+        let draft = collect(&observation(json!([user("earlier input"), media]))).unwrap();
+        assert!(
+            matches!(&draft.blocks[..], [ContentBlock::Nontext { media_type, .. }] if media_type == "input_image")
+        );
+    }
+
+    #[test]
+    fn skill_only_submission_retains_its_existing_candidate_input() {
+        let mut empty_input = classified_message("user", "", json!([]), json!("turn-a"));
+        empty_input["content"] = json!([]);
+        let skill = classified_message(
+            "user",
+            "selected skill instructions",
+            json!(["skills.selected_skill_instructions"]),
+            json!("turn-a"),
+        );
+        let draft = collect(&observation(json!([
+            assistant("previous answer"), empty_input, skill,
+            classified_message("developer", "clock", json!(["current_time.reminder"]), json!("turn-a")),
+            {"type":"configuration_update","reasoning":{"effort":"xhigh"}}
+        ]))).unwrap();
+        assert_eq!(
+            draft.blocks,
+            vec![ContentBlock::Text {
+                text: "selected skill instructions".into()
+            }]
+        );
+        assert_eq!(
+            draft.input_kinds,
+            vec![Some("skills.selected_skill_instructions".into())]
+        );
+        assert_eq!(
+            draft.context.iter().map(text).collect::<Vec<_>>(),
+            vec!["previous answer"]
+        );
+    }
+
+    #[test]
+    fn supplements_do_not_cross_conversation_progress_or_unknown_items() {
+        for latest in [
+            assistant("working"),
+            json!({"type":"function_call","call_id":"call","name":"tool","arguments":"{}"}),
+            json!({"type":"function_call_output","call_id":"call","output":"done"}),
+            json!({"type":"reasoning","summary":[]}),
+            json!({"type":"unknown_future_item"}),
+            json!({"type":"additional_tools","role":"developer","tools":[]}),
+            json!({"type":"compaction_trigger"}),
+            json!({"type":"context_compaction","encrypted_content":"summary"}),
+            json!({"type":"agent_message","author":"agent","recipient":"parent","content":[]}),
+            json!({"role":"user","content":[]}),
+        ] {
+            let request = observation(json!([
+                classified_message("user", "historical input", json!(["user.text"]), json!("turn-a")), latest,
+                {"type":"configuration_update","reasoning":{"effort":"high"}},
+                classified_message("user", "skill", json!(["skills.selected_skill_instructions"]), json!("turn-a")),
+                classified_message("developer", "clock", json!(["current_time.reminder"]), json!("turn-a")),
+                {"type":"configuration_update","reasoning":{"effort":"xhigh"}}
+            ]));
+            assert!(collect(&request).is_none());
+        }
+        assert!(
+            collect(&observation(json!([
+                {"type":"configuration_update","reasoning":{"effort":"xhigh"}}
+            ])))
+            .is_none()
+        );
     }
 
     #[test]
